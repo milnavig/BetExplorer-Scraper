@@ -23,6 +23,9 @@ class BetExplorerTransport:
     async def fetch_live_results(self) -> RawResponse:
         raise NotImplementedError
 
+    async def fetch_match_page(self, match_url: str) -> RawResponse:
+        raise NotImplementedError
+
     async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:
         raise NotImplementedError
 
@@ -59,6 +62,9 @@ class HttpBetExplorerTransport(BetExplorerTransport):
             {"Accept": "application/json, text/javascript, */*; q=0.01", "X-Requested-With": "XMLHttpRequest"},
         )
 
+    async def fetch_match_page(self, match_url: str) -> RawResponse:
+        return await self._get(match_url, {"Accept": "text/html,*/*"})
+
     async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:
         url = f"{self.base_url}/match-odds/{event_id}/0/{market}/bestOdds/?lang=en"
         return await self._get(
@@ -86,6 +92,9 @@ class BrowserFallbackTransport(BetExplorerTransport):
         raise NotImplementedError("Browser fallback transport is reserved for a future Playwright implementation.")
 
     async def fetch_live_results(self) -> RawResponse:
+        raise NotImplementedError("Browser fallback transport is reserved for a future Playwright implementation.")
+
+    async def fetch_match_page(self, match_url: str) -> RawResponse:
         raise NotImplementedError("Browser fallback transport is reserved for a future Playwright implementation.")
 
     async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:

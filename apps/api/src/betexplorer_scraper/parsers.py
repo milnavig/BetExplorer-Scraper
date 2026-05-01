@@ -15,6 +15,16 @@ _EVENT_ID_RE = re.compile(r"/([A-Za-z0-9]{8})/$")
 
 
 class OddsParser:
+    def parse_available_markets(self, html: str) -> list[str]:
+        soup = BeautifulSoup(html, "lxml")
+        markets: list[str] = []
+        for node in soup.select("[data-tab]"):
+            market = str(node.get("data-tab", "")).strip().lower()
+            if not market or market in markets:
+                continue
+            markets.append(market)
+        return markets
+
     def parse_match_odds_payload(self, payload: str) -> list[BookmakerOdds]:
         data = json.loads(payload)
         odds_html = data.get("odds", "")
@@ -23,20 +33,18 @@ class OddsParser:
     def parse_match_odds_html(self, odds_html: str) -> list[BookmakerOdds]:
         soup = BeautifulSoup(odds_html, "lxml")
         rows: list[BookmakerOdds] = []
-        seen: set[str] = set()
 
         for tr in soup.select("tr"):
             odd_cells = tr.select("td[data-odd]")
-            if len(odd_cells) < 3:
+            if len(odd_cells) < 2:
                 continue
             bookmaker = self._bookmaker_name(tr, odd_cells[0])
             if not bookmaker:
                 continue
             normalized = normalize_bookmaker_name(bookmaker)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
             values = [parse_float(cell.get("data-odd")) for cell in odd_cells[:3]]
+            while len(values) < 3:
+                values.append(None)
             rows.append(
                 BookmakerOdds(
                     bookmaker=bookmaker,
@@ -73,7 +81,13 @@ class OddsParser:
         return cleaned or None
 
     def _attrs(self, tr: Tag) -> dict[str, Any]:
-        return {key: value for key, value in tr.attrs.items() if isinstance(key, str)}
+        attrs = {key: value for key, value in tr.attrs.items() if isinstance(key, str)}
+        line = tr.select_one(".table-main__doubleparameter")
+        if line:
+            text = line.get_text(" ", strip=True)
+            if text:
+                attrs["market_line"] = text
+        return attrs
 
 
 class DiscoveryParser:

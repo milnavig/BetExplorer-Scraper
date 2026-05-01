@@ -131,6 +131,78 @@ small {
   font-size: 13px;
 }
 
+.scheduler-state {
+  display: inline-flex;
+  width: fit-content;
+  padding: 4px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.scheduler-state.active {
+  background: rgba(38, 166, 91, 0.18);
+  color: #bdf3d4;
+}
+
+.scheduler-state.idle {
+  background: rgba(120, 184, 200, 0.16);
+  color: #bfe8f1;
+}
+
+.scheduler-state.stale {
+  background: rgba(228, 170, 47, 0.18);
+  color: #ffe1a0;
+}
+
+.side-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.progress-line {
+  display: grid;
+  gap: 5px;
+}
+
+.progress-line > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.progress-track {
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: #78b8c8;
+  transition: width 240ms ease;
+}
+
+.progress-track span.good {
+  background: #6fd59a;
+}
+
+.progress-track span.warn {
+  background: #e4aa2f;
+}
+
+.progress-track span.idle {
+  background: #78b8c8;
+}
+
+.progress-track span.bad {
+  background: #d76c6c;
+}
+
 .workspace {
   min-width: 0;
   padding: 22px;
@@ -636,6 +708,46 @@ tbody tr:hover td {
 td.odd {
   color: var(--accent-2);
   font-weight: 800;
+}
+
+.line-pill {
+  display: inline-flex;
+  align-items: center;
+  min-width: 42px;
+  justify-content: center;
+  border-radius: 6px;
+  padding: 3px 7px;
+  background: #edf3f5;
+  color: #31424d;
+  font-weight: 800;
+}
+
+.price-set {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 150px;
+}
+
+.price-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid #d6e0e4;
+  border-radius: 6px;
+  padding: 4px 7px;
+  background: #fff;
+}
+
+.price-chip small {
+  color: #6c7b84;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.price-chip strong {
+  color: var(--accent-2);
+  font-size: 13px;
 }
 
 code {

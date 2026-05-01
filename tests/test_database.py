@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from betexplorer_scraper.database import Database
@@ -244,6 +244,44 @@ def test_database_status_reports_final_snapshots_separately_from_attempts() -> N
     assert status["skipped_out_of_window_matches"] == 1
     assert status["last_run"] is not None
     assert "next_capture" in status
+
+
+def test_database_status_ignores_prior_day_stale_next_capture() -> None:
+    db_path = Path("data/test_tmp/test_status_next_capture.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+    now = datetime.now()
+    stale_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="stale123",
+            source_url="https://www.betexplorer.com/football/test/stale123/",
+            league="Test League",
+            home_team="Stale",
+            away_team="Away",
+            kickoff_time=now - timedelta(days=1),
+            timing_status=TimingStatus.UNKNOWN,
+        )
+    )
+    fresh_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="fresh123",
+            source_url="https://www.betexplorer.com/football/test/fresh123/",
+            league="Test League",
+            home_team="Fresh",
+            away_team="Away",
+            kickoff_time=now + timedelta(hours=2),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    fresh_next_capture = now + timedelta(hours=1)
+    db.update_match_schedule(stale_id, "MONITORING", now - timedelta(days=1))
+    db.update_match_schedule(fresh_id, "WAITING", fresh_next_capture)
+
+    status = db.status()
+
+    assert status["next_capture"] == fresh_next_capture.isoformat()
 
 
 def test_database_migrates_old_matches_table_without_positional_insert_breakage() -> None:

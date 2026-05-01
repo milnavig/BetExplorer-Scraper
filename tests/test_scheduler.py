@@ -23,8 +23,10 @@ def _scheduler() -> Scheduler:
         SchedulerConfig(
             upcoming_window_minutes=30,
             recently_started_window_minutes=10,
-            max_match_age_after_kickoff_minutes=10,
-            final_capture_poll_interval_seconds=10,
+            max_match_age_after_kickoff_minutes=5,
+            monitoring_capture_poll_interval_seconds=120,
+            final_capture_poll_interval_seconds=20,
+            final_capture_fast_window_minutes=3,
             discovery_poll_interval_seconds=60,
         )
     )
@@ -41,11 +43,20 @@ def test_far_future_match_waits_until_upcoming_window() -> None:
 
 def test_upcoming_match_is_due_when_no_next_capture_exists() -> None:
     now = datetime(2026, 4, 28, 16, 0)
-    decision = _scheduler().plan(_match(now + timedelta(minutes=5)), now)
+    decision = _scheduler().plan(_match(now + timedelta(minutes=2)), now)
 
     assert decision.phase == "MONITORING"
     assert decision.should_capture is True
-    assert decision.next_capture_at == now + timedelta(seconds=10)
+    assert decision.next_capture_at == now + timedelta(seconds=20)
+
+
+def test_early_capture_window_uses_slower_monitoring_interval() -> None:
+    now = datetime(2026, 4, 28, 16, 0)
+    decision = _scheduler().plan(_match(now + timedelta(minutes=20)), now)
+
+    assert decision.phase == "MONITORING"
+    assert decision.should_capture is True
+    assert decision.next_capture_at == now + timedelta(seconds=120)
 
 
 def test_due_match_is_skipped_until_next_capture_time() -> None:
@@ -67,12 +78,12 @@ def test_recently_started_match_enters_finalizing_phase() -> None:
 
     assert decision.phase == "FINALIZING"
     assert decision.should_capture is True
-    assert decision.next_capture_at == now + timedelta(seconds=10)
+    assert decision.next_capture_at == now + timedelta(seconds=20)
 
 
 def test_match_is_finalized_after_post_kickoff_capture_window() -> None:
     now = datetime(2026, 4, 28, 16, 0)
-    decision = _scheduler().plan(_match(now - timedelta(minutes=11)), now)
+    decision = _scheduler().plan(_match(now - timedelta(minutes=6)), now)
 
     assert decision.phase == "FINALIZED"
     assert decision.should_capture is False

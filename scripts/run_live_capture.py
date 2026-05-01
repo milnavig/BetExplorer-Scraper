@@ -20,7 +20,7 @@ async def main() -> None:
         return
 
     while True:
-        print(await service.run_once())
+        print(await service.run_once(trigger="cli_scheduler", force_discovery=False))
         await asyncio.sleep(service.settings.scheduler_tick_seconds)
 
 

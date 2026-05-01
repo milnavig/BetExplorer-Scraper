@@ -39,9 +39,47 @@ type Status = {
   next_capture: string | null;
   betexplorer_timezone_offset: string;
   scheduler_tick_seconds: number;
+  monitoring_capture_poll_interval_seconds: number;
   final_capture_poll_interval_seconds: number;
+  final_capture_fast_window_minutes: number;
+  discovery_poll_interval_seconds: number;
   upcoming_window_minutes: number;
   max_concurrent_captures: number;
+  max_concurrent_markets_per_match: number;
+  market_discovery_cache_seconds: number;
+  scheduler: SchedulerRuntime;
+  capture_progress: CaptureProgress;
+};
+
+type SchedulerRuntime = {
+  enabled: boolean;
+  running: boolean;
+  started_at: string | null;
+  cycle_started_at: string | null;
+  next_run_at: string | null;
+  last_error: string | null;
+};
+
+type CaptureProgress = {
+  running: boolean;
+  trigger: string | null;
+  phase: string;
+  started_at: string | null;
+  finished_at: string | null;
+  discovered: number;
+  due: number;
+  queued: number;
+  active: number;
+  completed: number;
+  captured: number;
+  failed: number;
+  skipped: number;
+  finalized: number;
+  waiting: number;
+  current_event_id: string | null;
+  last_error: string | null;
+  last_discovery_at: string | null;
+  next_discovery_at: string | null;
 };
 
 type MatchRow = {
@@ -62,6 +100,7 @@ type MatchRow = {
   snapshot_id: string | null;
   quality_status: string | null;
   captured_at: string | null;
+  final_snapshot_age_to_kickoff_seconds: number | null;
   bookmaker_count: number;
   has_bwin: boolean;
   has_unibet: boolean;
@@ -82,6 +121,7 @@ type BookmakerOdds = {
   raw_row_text: string | null;
   raw_attributes_json: string | null;
   created_at: string;
+  market: string;
   snapshot_captured_at: string | null;
   snapshot_quality_status: string | null;
 };
@@ -104,6 +144,7 @@ type SnapshotRow = {
   home_team?: string | null;
   away_team?: string | null;
   bookmaker_count?: number;
+  final_snapshot_age_to_kickoff_seconds?: number | null;
 };
 
 type AttemptRow = {
@@ -189,6 +230,8 @@ type MatchFilter =
   | "finalized"
   | "new";
 type SortMode = "capture_desc" | "kickoff_asc" | "bookmakers_desc" | "attempts_desc";
+type ProgressState = { label: string; value: number; detail: string; tone?: "good" | "warn" | "bad" | "idle" };
+type SchedulerState = { className: "active" | "idle" | "stale"; label: string; detail: string };
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -220,6 +263,7 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const load = async () => {
     setError(null);
@@ -252,6 +296,12 @@ export default function Dashboard() {
   useEffect(() => {
     setClientTimezone(clientTimezoneLabel());
     void load();
+    const clock = window.setInterval(() => setNowMs(Date.now()), 1000);
+    const refresh = window.setInterval(() => void load(), 5000);
+    return () => {
+      window.clearInterval(clock);
+      window.clearInterval(refresh);
+    };
   }, []);
 
   useEffect(() => {
@@ -310,7 +360,7 @@ export default function Dashboard() {
       const requiredOk = !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
       const queryOk =
         !query ||
-        [row.bookmaker, row.normalized_bookmaker, row.bookmaker_id, row.betexplorer_bookmaker_id, row.raw_row_text]
+        [row.market, marketLabel(row.market), marketLine(row), row.bookmaker, row.normalized_bookmaker, row.bookmaker_id, row.betexplorer_bookmaker_id]
           .filter(Boolean)
           .join(" ")
           .toLowerCase()
@@ -321,6 +371,11 @@ export default function Dashboard() {
 
   const selectedMatch = detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
   const latestExport = exports[0];
+  const progressItems = useMemo(
+    () => buildProgress(status, selectedMatch, nowMs),
+    [nowMs, selectedMatch, status]
+  );
+  const schedulerStateValue = useMemo(() => schedulerState(status, nowMs), [nowMs, status]);
 
   const runCapture = () => {
     startTransition(async () => {
@@ -372,13 +427,24 @@ export default function Dashboard() {
         </nav>
         <div className="side-note">
           <span>Last run</span>
-          <strong>{formatDate(status?.last_run)}</strong>
-          <small>Next run {formatDate(status?.next_run)}</small>
-          <small>Next capture {formatDate(status?.next_capture)}</small>
-          <small>Last odds {formatDate(status?.last_capture)}</small>
-          <small>Browser TZ {clientTimezone}</small>
-          <small>BetExplorer TZ UTC{status?.betexplorer_timezone_offset ?? "-"}</small>
+          <strong title={tooltipFor("Last run")}>{formatUtcDate(status?.last_run, true)}</strong>
+          <small title={tooltipFor("Next run")}>
+            Next run {status?.capture_progress?.running ? "after current cycle" : formatUtcDate(status?.next_run, true)}
+          </small>
+          <small title={tooltipFor("Next capture")}>Next capture {formatScheduleDate(status?.next_capture, true)}</small>
+          <small title={tooltipFor("Last odds")}>Last odds {formatUtcDate(status?.last_capture, true)}</small>
+          <small title={tooltipFor("Discovery")}>Discovery {formatScheduleDate(status?.capture_progress?.next_discovery_at, true)}</small>
+          <small title={tooltipFor("Browser TZ")}>Browser TZ {clientTimezone}</small>
+          <small title={tooltipFor("BetExplorer TZ")}>BetExplorer TZ UTC{status?.betexplorer_timezone_offset ?? "-"}</small>
           <small>{latestExport ? `Latest export ${latestExport.filename}` : "No exports yet"}</small>
+          <span className={`scheduler-state ${schedulerStateValue.className}`} title={schedulerStateValue.detail}>
+            {schedulerStateValue.label}
+          </span>
+          <div className="side-progress">
+            {progressItems.map((item) => (
+              <ProgressBar key={item.label} {...item} />
+            ))}
+          </div>
         </div>
       </aside>
 
@@ -445,10 +511,10 @@ export default function Dashboard() {
 
         <section className="coverage-strip">
           {bookmakers.slice(0, 12).map((bookmaker) => (
-            <div className={REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker) ? "coverage required" : "coverage"} key={bookmaker.normalized_bookmaker}>
+            <div className={REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker) ? "coverage required" : "coverage"} key={bookmaker.normalized_bookmaker} title={`${bookmaker.bookmaker}: seen in ${bookmaker.matches} matches and ${bookmaker.rows} final odds rows.`}>
               <span>{bookmaker.bookmaker}</span>
               <strong>{bookmaker.matches}</strong>
-              <small>{formatDate(bookmaker.last_seen)}</small>
+              <small>{formatUtcDate(bookmaker.last_seen)}</small>
             </div>
           ))}
         </section>
@@ -504,7 +570,7 @@ export default function Dashboard() {
                   </span>
                   <span>
                     <em>{match.league ?? "Unknown league"}</em>
-                    <small>{formatDate(match.kickoff_time)} · {match.capture_phase ?? "DISCOVERED"} · {match.attempt_count} tries</small>
+                    <small>{formatScheduleDate(match.kickoff_time)} · {match.capture_phase ?? "DISCOVERED"} · {match.attempt_count} tries</small>
                   </span>
                   <span className="required-pair">
                     <Badge label="B" active={match.has_bwin} />
@@ -549,15 +615,16 @@ export default function Dashboard() {
                 </div>
 
                 <div className="info-grid">
-                  <Info label="Kickoff" value={formatDate(selectedMatch.kickoff_time)} />
+                  <Info label="Kickoff" value={formatScheduleDate(selectedMatch.kickoff_time)} />
                   <Info label="Capture phase" value={selectedMatch.capture_phase ?? "DISCOVERED"} />
                   <Info label="Timing" value={displayTiming(selectedMatch)} />
                   <Info label="Bookmakers" value={String(selectedMatch.bookmaker_count)} />
                   <Info label="Required" value={requiredAvailability(selectedMatch)} />
                   <Info label="Attempts" value={String(selectedMatch.attempt_count)} />
-                  <Info label="Next capture" value={formatDate(selectedMatch.next_capture_at)} />
-                  <Info label="Last capture" value={formatDate(selectedMatch.last_capture_at)} />
-                  <Info label="Finalized" value={formatDate(selectedMatch.finalized_at)} />
+                  <Info label="Next capture" value={formatScheduleDate(selectedMatch.next_capture_at)} />
+                  <Info label="Last capture" value={formatUtcDate(selectedMatch.last_capture_at)} />
+                  <Info label="Final snapshot age" value={formatAgeToKickoff(selectedMatch.final_snapshot_age_to_kickoff_seconds)} />
+                  <Info label="Finalized" value={formatScheduleDate(selectedMatch.finalized_at)} />
                   <Info label="Live score" value={selectedMatch.live_score ?? "-"} />
                 </div>
 
@@ -569,16 +636,18 @@ export default function Dashboard() {
                         <th>Quality</th>
                         <th>Final</th>
                         <th>Rows</th>
+                        <th>To kickoff</th>
                         <th>Raw payload</th>
                       </tr>
                     </thead>
                     <tbody>
                       {(detail?.snapshots ?? []).map((snapshot) => (
                         <tr key={snapshot.id}>
-                          <td>{formatDate(snapshot.captured_at)}</td>
+                          <td>{formatUtcDate(snapshot.captured_at)}</td>
                           <td><span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span></td>
                           <td>{snapshot.is_final ? "yes" : "no"}</td>
                           <td>{snapshot.bookmaker_count ?? "-"}</td>
+                          <td>{formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</td>
                           <td><code>{snapshot.raw_payload_path ?? "-"}</code></td>
                         </tr>
                       ))}
@@ -600,7 +669,7 @@ export default function Dashboard() {
                         <tr key={attempt.id}>
                           <td>{attempt.attempt_number}</td>
                           <td><span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span></td>
-                          <td>{formatDate(attempt.started_at)}</td>
+                          <td>{formatUtcDate(attempt.started_at)}</td>
                           <td><code>{formatRequiredJson(attempt.required_found_json)}</code></td>
                           <td>{attempt.error_message ?? "-"}</td>
                         </tr>
@@ -628,7 +697,7 @@ export default function Dashboard() {
               </label>
               <label className="search">
                 <Filter size={15} />
-                <input value={bookmakerQuery} onChange={(event) => setBookmakerQuery(event.target.value)} placeholder="Filter bookmakers, IDs, raw text" />
+                <input value={bookmakerQuery} onChange={(event) => setBookmakerQuery(event.target.value)} placeholder="Filter market, bookmakers, IDs" />
               </label>
             </div>
           </div>
@@ -637,28 +706,26 @@ export default function Dashboard() {
               <thead>
                 <tr>
                   <th>Bookmaker</th>
+                  <th>Market</th>
+                  <th>Line</th>
                   <th>Bookmaker ID</th>
                   <th>BE ID</th>
-                  <th>1</th>
-                  <th>X</th>
-                  <th>2</th>
+                  <th>Prices</th>
                   <th>Status</th>
                   <th>Snapshot</th>
-                  <th>Raw row</th>
                 </tr>
               </thead>
               <tbody>
                 {filteredBookmakers.map((row) => (
                   <tr key={row.id} className={REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker) ? "required" : ""}>
                     <td>{row.bookmaker}</td>
+                    <td>{marketLabel(row.market)}</td>
+                    <td><span className="line-pill">{marketLine(row)}</span></td>
                     <td>{row.bookmaker_id ?? "-"}</td>
                     <td>{row.betexplorer_bookmaker_id ?? "-"}</td>
-                    <td className="odd">{formatOdd(row.home_odds)}</td>
-                    <td className="odd">{formatOdd(row.draw_odds)}</td>
-                    <td className="odd">{formatOdd(row.away_odds)}</td>
+                    <td><PriceSet row={row} /></td>
                     <td>{row.is_available ? "available" : "missing"}</td>
-                    <td>{formatDate(row.snapshot_captured_at)}</td>
-                    <td><code>{row.raw_row_text ?? "-"}</code></td>
+                    <td>{formatUtcDate(row.snapshot_captured_at)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -674,7 +741,7 @@ export default function Dashboard() {
                 <div className="compact-row" key={attempt.id}>
                   <span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span>
                   <strong>{attempt.home_team ?? attempt.event_id} {attempt.away_team ? `- ${attempt.away_team}` : ""}</strong>
-                  <small>#{attempt.attempt_number} · {formatDate(attempt.started_at)}</small>
+                  <small>#{attempt.attempt_number} · {formatUtcDate(attempt.started_at)}</small>
                   {attempt.error_message ? <code>{attempt.error_message}</code> : <code>{formatRequiredJson(attempt.required_found_json)}</code>}
                 </div>
               ))}
@@ -688,7 +755,8 @@ export default function Dashboard() {
                 <div className="compact-row" key={snapshot.id}>
                   <span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span>
                   <strong>{snapshot.home_team ?? snapshot.event_id} {snapshot.away_team ? `- ${snapshot.away_team}` : ""}</strong>
-                  <small>{formatDate(snapshot.captured_at)} · {snapshot.market} · {snapshot.bookmaker_count ?? 0} rows</small>
+                  <small>{formatUtcDate(snapshot.captured_at)} · {snapshot.market} · {snapshot.bookmaker_count ?? 0} rows</small>
+                  <small>To kickoff {formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</small>
                   <code>{snapshot.raw_payload_path ?? "-"}</code>
                 </div>
               ))}
@@ -702,7 +770,7 @@ export default function Dashboard() {
                 <div className="compact-row" key={log.id}>
                   <span className={log.level}>{log.level}</span>
                   <strong>{log.event}</strong>
-                  <small>{formatDate(log.timestamp)} · {log.event_id ?? "-"}</small>
+                  <small>{formatUtcDate(log.timestamp)} · {log.event_id ?? "-"}</small>
                   <code>{log.details_json}</code>
                 </div>
               ))}
@@ -735,7 +803,7 @@ export default function Dashboard() {
                       <td>{formatOdd(bookmaker.avg_home_odds)}</td>
                       <td>{formatOdd(bookmaker.avg_draw_odds)}</td>
                       <td>{formatOdd(bookmaker.avg_away_odds)}</td>
-                      <td>{formatDate(bookmaker.last_seen)}</td>
+                      <td>{formatUtcDate(bookmaker.last_seen)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -751,7 +819,7 @@ export default function Dashboard() {
                   <Download size={15} />
                   <span>
                     <strong>{file.filename}</strong>
-                    <small>{formatBytes(file.size_bytes)} · {formatDate(file.modified_at)}</small>
+                    <small>{formatBytes(file.size_bytes)} · {formatScheduleDate(file.modified_at)}</small>
                   </span>
                 </a>
               ))}
@@ -766,7 +834,7 @@ export default function Dashboard() {
 
 function Metric({ label, value, tone }: { label: string; value?: number; tone?: "good" | "warn" | "bad" }) {
   return (
-    <div className={`metric ${tone ?? ""}`}>
+    <div className={`metric ${tone ?? ""}`} title={tooltipFor(label)}>
       <span>{label}</span>
       <strong>{value ?? 0}</strong>
     </div>
@@ -775,7 +843,7 @@ function Metric({ label, value, tone }: { label: string; value?: number; tone?: 
 
 function Info({ label, value }: { label: string; value: string }) {
   return (
-    <div className="info-cell">
+    <div className="info-cell" title={`${tooltipFor(label)} Current value: ${value}`}>
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -783,12 +851,12 @@ function Info({ label, value }: { label: string; value: string }) {
 }
 
 function Badge({ label, active }: { label: string; active: boolean }) {
-  return <span className={active ? "mini-badge active" : "mini-badge"}>{label}</span>;
+  return <span className={active ? "mini-badge active" : "mini-badge"} title={`${label === "B" ? "Bwin" : "Unibet"} required bookmaker ${active ? "is present" : "is missing"}`}>{label}</span>;
 }
 
 function SelectFilter({ value, onChange, options }: { value: string; onChange: (value: string) => void; options: string[] }) {
   return (
-    <label className="select-filter">
+    <label className="select-filter" title={tooltipFor(value)}>
       <Filter size={14} />
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {options.map((option) => (
@@ -801,7 +869,7 @@ function SelectFilter({ value, onChange, options }: { value: string; onChange: (
 
 function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div className="panel-head compact-head">
+    <div className="panel-head compact-head" title={subtitle}>
       <div>
         <h3>{title}</h3>
         <p>{subtitle}</p>
@@ -813,7 +881,7 @@ function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
 
 function MiniTable({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
   return (
-    <div className="mini-table">
+    <div className="mini-table" title={tooltipFor(title)}>
       <div className="mini-title">
         {icon}
         <strong>{title}</strong>
@@ -825,19 +893,125 @@ function MiniTable({ title, icon, children }: { title: string; icon: ReactNode; 
   );
 }
 
-function formatDate(value: string | null | undefined) {
+function PriceSet({ row }: { row: BookmakerOdds }) {
+  return (
+    <div className="price-set">
+      {priceItems(row).map((item) => (
+        <span key={item.label} className="price-chip">
+          <small>{item.label}</small>
+          <strong>{item.value}</strong>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function ProgressBar({ label, value, detail, tone }: ProgressState) {
+  return (
+    <div className="progress-line" title={`${label}: ${detail}`}>
+      <div>
+        <span>{label}</span>
+        <small>{detail}</small>
+      </div>
+      <div className="progress-track">
+        <span className={tone ?? ""} style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function formatScheduleDate(value: string | null | undefined, withSeconds = false) {
   if (!value) return "-";
-  return new Intl.DateTimeFormat("en", {
+  const options: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     timeZone: "Europe/Kyiv"
-  }).format(parseApiDate(value));
+  };
+  if (withSeconds) options.second = "2-digit";
+  return new Intl.DateTimeFormat("en", options).format(parseLocalApiDate(value));
+}
+
+function formatUtcDate(value: string | null | undefined, withSeconds = false) {
+  if (!value) return "-";
+  const options: Intl.DateTimeFormatOptions = {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Europe/Kyiv"
+  };
+  if (withSeconds) options.second = "2-digit";
+  return new Intl.DateTimeFormat("en", options).format(parseUtcApiDate(value));
 }
 
 function formatOdd(value: number | null) {
   return value == null ? "-" : value.toFixed(2);
+}
+
+function formatAgeToKickoff(value: number | null | undefined) {
+  if (value == null) return "-";
+  const prefix = value >= 0 ? "before" : "after";
+  const abs = Math.abs(value);
+  const minutes = Math.floor(abs / 60);
+  const seconds = abs % 60;
+  if (minutes < 1) return `${prefix} ${seconds}s`;
+  if (minutes < 60) return `${prefix} ${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${prefix} ${hours}h ${minutes % 60}m`;
+}
+
+function marketLabel(market: string | null | undefined) {
+  const labels: Record<string, string> = {
+    "1x2": "1X2",
+    ou: "Over/Under",
+    ah: "Asian Handicap",
+    dc: "Double Chance",
+    bts: "Both Teams To Score",
+    dnb: "Draw No Bet"
+  };
+  return labels[(market ?? "").toLowerCase()] ?? (market ? market.toUpperCase() : "-");
+}
+
+function marketLine(row: BookmakerOdds) {
+  const attrs = parseRawAttributes(row.raw_attributes_json);
+  const explicit = attrs.market_line ?? attrs.line ?? attrs.handicap ?? attrs.total;
+  if (explicit != null && String(explicit).trim()) return String(explicit).trim();
+  const raw = (row.raw_row_text ?? "").trim();
+  const bookmaker = row.bookmaker.trim();
+  const withoutBookmaker = raw.toLowerCase().startsWith(bookmaker.toLowerCase())
+    ? raw.slice(bookmaker.length).trim()
+    : raw;
+  const line = withoutBookmaker.match(/^[+-]?\d+(?:\.\d+)?/);
+  return line ? line[0] : "-";
+}
+
+function priceItems(row: BookmakerOdds) {
+  const market = row.market.toLowerCase();
+  const labels =
+    market === "ou"
+      ? ["Over", "Under", ""]
+      : market === "bts"
+        ? ["Yes", "No", ""]
+        : market === "dc"
+          ? ["1X", "12", "X2"]
+          : market === "ah"
+            ? ["1", "2", ""]
+            : ["1", "X", "2"];
+  return [row.home_odds, row.draw_odds, row.away_odds]
+    .map((value, index) => ({ label: labels[index], value: formatOdd(value) }))
+    .filter((item) => item.label && item.value !== "-");
+}
+
+function parseRawAttributes(value: string | null | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function qualityClass(value: string | null) {
@@ -877,6 +1051,59 @@ function filterLabel(value: string) {
   return labels[value] ?? value;
 }
 
+function tooltipFor(label: string) {
+  const text: Record<string, string> = {
+    Matches: "Total matches currently stored in the local database.",
+    Captured: "Matches with at least one final odds snapshot.",
+    "Capture miss": "Finalized matches where capture attempts ran but no bookmaker rows were saved.",
+    "Skipped old": "Finalized matches that moved out of the capture window before any attempt ran.",
+    "Due now": "Matches whose next scheduled capture time is now or already overdue.",
+    "Final snapshots": "Final snapshots currently selected for export and match summaries. With all markets, each market can have its own final snapshot.",
+    Attempts: "HTTP/parser attempts recorded for odds capture.",
+    "Bookmaker rows": "Bookmaker odds rows in current final snapshots.",
+    "Row attempts": "All bookmaker odds rows saved across all attempts and snapshots.",
+    "Req complete": "Final snapshots where every required bookmaker was present.",
+    "Req partial": "Final snapshots where at least one required bookmaker was present.",
+    "Req missing": "Final snapshots where none of the required bookmakers were present.",
+    Bookmakers: "Distinct bookmakers seen in final odds rows.",
+    "Poll seconds": "How often an in-window match is scheduled for another odds request.",
+    Discovery: "Next full BetExplorer discovery. Due captures can still run between discovery cycles.",
+    Concurrency: "Maximum due matches captured in parallel.",
+    "Last run": "Most recent completed scheduler heartbeat.",
+    "Next run": "Expected next scheduler heartbeat based on configured tick seconds.",
+    "Next capture": "Earliest scheduled odds capture among non-finalized matches.",
+    "Last odds": "Most recent saved odds snapshot.",
+    "Final snapshot age": "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
+    "Browser TZ": "Timezone reported by this browser.",
+    "BetExplorer TZ": "Timezone offset sent to BetExplorer via the my_timezone cookie.",
+    Kickoff: "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
+    "Capture phase": "Scheduler state for this match.",
+    Timing: "Timing classification relative to kickoff and live status.",
+    Required: "Presence of required bookmakers in final odds rows.",
+    Finalized: "Time when the scheduler closed the capture window.",
+    "Live score": "Live/recent score from BetExplorer live-results enrichment.",
+    Snapshots: "Saved odds payloads for this match.",
+    "Match attempts": "Capture attempts for this match.",
+    all: "Show every match.",
+    with_odds: "Only matches with saved bookmaker rows.",
+    req_full: "Only matches with all required bookmakers present.",
+    req_partial: "Only matches with at least one required bookmaker present.",
+    req_missing: "Only matches missing all required bookmakers.",
+    missing_bwin: "Only matches where Bwin is missing but odds exist.",
+    missing_unibet: "Only matches where Unibet is missing but odds exist.",
+    capture_miss: "Finalized matches where capture attempted but saved no odds rows.",
+    skipped_old: "Finalized matches skipped because the capture window was already over.",
+    due: "Matches currently scheduled for capture.",
+    finalized: "Matches whose capture window is closed.",
+    new: "Discovered matches without any final snapshot.",
+    capture_desc: "Sort by latest saved snapshot first.",
+    kickoff_asc: "Sort by kickoff time ascending.",
+    bookmakers_desc: "Sort by most bookmaker rows.",
+    attempts_desc: "Sort by most capture attempts."
+  };
+  return text[label] ?? label;
+}
+
 function requiredAvailability(match: MatchRow) {
   return `Bwin:${match.has_bwin ? "yes" : "no"} Unibet:${match.has_unibet ? "yes" : "no"}`;
 }
@@ -891,7 +1118,7 @@ function displayTiming(match: MatchRow) {
 
 function timestamp(value: string | null | undefined) {
   if (!value) return 0;
-  const parsed = parseApiDate(value).getTime();
+  const parsed = parseLocalApiDate(value).getTime();
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -914,8 +1141,162 @@ function clientTimezoneLabel() {
   return `${zone} UTC${offset}`;
 }
 
-function parseApiDate(value: string) {
+function parseUtcApiDate(value: string) {
   return new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`);
+}
+
+function parseLocalApiDate(value: string) {
+  return new Date(value);
+}
+
+function schedulerFresh(status: Status | null, nowMs: number) {
+  if (!status?.last_run) return false;
+  if (status.running || status.scheduler?.running || status.capture_progress?.running) return true;
+  const allowedLag = Math.max(30000, (status.scheduler_tick_seconds ?? 10) * 4000);
+  return nowMs - parseUtcApiDate(status.last_run).getTime() < allowedLag;
+}
+
+function schedulerState(status: Status | null, nowMs: number): SchedulerState {
+  if (status?.capture_progress?.running) {
+    const progress = status.capture_progress;
+    return {
+      className: "active",
+      label: `Capture ${progress.phase}`,
+      detail: `${progress.completed}/${progress.queued} capture jobs completed. Active: ${progress.active}. Trigger: ${progress.trigger ?? "-"}`
+    };
+  }
+  if (status?.scheduler?.running) {
+    return {
+      className: "active",
+      label: "Scheduler active",
+      detail: `API scheduler is running. Tick interval: ${status.scheduler_tick_seconds}s.`
+    };
+  }
+  if (status?.scheduler && !status.scheduler.enabled) {
+    return {
+      className: "idle",
+      label: "Scheduler disabled",
+      detail: "ENABLE_API_SCHEDULER is false. Start scripts/run_live_capture.py for continuous capture."
+    };
+  }
+  if (!status?.last_run) {
+    return {
+      className: "idle",
+      label: "Scheduler idle",
+      detail: "No capture heartbeat has completed yet."
+    };
+  }
+  if (schedulerFresh(status, nowMs)) {
+    return {
+      className: "active",
+      label: "Scheduler active",
+      detail: `Heartbeat is fresh. Tick interval: ${status.scheduler_tick_seconds}s.`
+    };
+  }
+  const overdue = status.next_run ? relativeTime(parseUtcApiDate(status.next_run).getTime() - nowMs) : "unknown";
+  if (status.due_matches > 0) {
+    return {
+      className: "stale",
+      label: "Scheduler idle: due queue",
+      detail: `${status.due_matches} match(es) are due, but no scheduler heartbeat has run (${overdue}). Run once is only a manual one-cycle capture.`
+    };
+  }
+  return {
+    className: "idle",
+    label: "Scheduler idle",
+    detail: `No continuous scheduler heartbeat is running (${overdue}). Run once is only a manual one-cycle capture.`
+  };
+}
+
+function buildProgress(status: Status | null, match: MatchRow | null, nowMs: number): ProgressState[] {
+  const items: ProgressState[] = [];
+  const progress = status?.capture_progress;
+  if (progress) {
+    const hasQueue = progress.queued > 0;
+    const value = progress.running
+      ? hasQueue
+        ? (progress.completed / progress.queued) * 100
+        : phaseProgress(progress.phase)
+      : progress.queued > 0
+        ? 100
+        : 0;
+    items.push({
+      label: progress.running ? `Capture ${progress.phase}` : "Last capture cycle",
+      value,
+      detail: hasQueue
+        ? `${progress.completed}/${progress.queued} jobs, ${progress.captured} ok, ${progress.failed} failed`
+        : `${progress.discovered} discovered, ${progress.due} due`,
+      tone: progress.failed > 0 ? "warn" : progress.running ? "good" : "idle"
+    });
+  }
+  if (status?.last_run && status.next_run) {
+    const start = parseUtcApiDate(status.last_run).getTime();
+    const end = parseUtcApiDate(status.next_run).getTime();
+    items.push({
+      label: "Next heartbeat",
+      value: percentBetween(start, end, nowMs),
+      detail: relativeTime(end - nowMs),
+      tone: nowMs > end + Math.max(15000, (status.scheduler_tick_seconds ?? 10) * 1000) ? "bad" : "good"
+    });
+  }
+  if (status?.next_capture) {
+    const target = parseLocalApiDate(status.next_capture).getTime();
+    items.push({
+      label: "Global next capture",
+      value: target <= nowMs ? 100 : 0,
+      detail: target <= nowMs ? "due now" : relativeTime(target - nowMs),
+      tone: target <= nowMs ? "warn" : "good"
+    });
+  }
+  if (match?.kickoff_time) {
+    const kickoff = parseLocalApiDate(match.kickoff_time).getTime();
+    const windowStart = kickoff - (status?.upcoming_window_minutes ?? 30) * 60 * 1000;
+    items.push({
+      label: "Selected kickoff",
+      value: percentBetween(windowStart, kickoff, nowMs),
+      detail: kickoff <= nowMs ? "started" : relativeTime(kickoff - nowMs),
+      tone: kickoff <= nowMs ? "warn" : "good"
+    });
+  }
+  if (match?.next_capture_at) {
+    const target = parseLocalApiDate(match.next_capture_at).getTime();
+    items.push({
+      label: "Selected capture",
+      value: target <= nowMs ? 100 : 0,
+      detail: target <= nowMs ? "due now" : relativeTime(target - nowMs),
+      tone: target <= nowMs ? "warn" : "good"
+    });
+  }
+  return items;
+}
+
+function phaseProgress(phase: string) {
+  const values: Record<string, number> = {
+    idle: 0,
+    discovery: 15,
+    due_scan: 40,
+    live_results: 35,
+    planning: 55,
+    capturing: 75,
+    completed: 100
+  };
+  return values[phase] ?? 50;
+}
+
+function percentBetween(start: number, end: number, now: number) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  return ((now - start) / (end - start)) * 100;
+}
+
+function relativeTime(ms: number) {
+  const overdue = ms < 0;
+  const abs = Math.abs(Math.round(ms / 1000));
+  if (abs < 60) return overdue ? `overdue ${abs}s` : `${abs}s`;
+  const minutes = Math.floor(abs / 60);
+  const seconds = abs % 60;
+  const value = minutes < 60 ? `${minutes}m ${seconds}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  if (overdue) return `overdue ${value}`;
+  return value;
 }
 
 function formatBytes(value: number) {

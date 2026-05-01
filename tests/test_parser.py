@@ -34,3 +34,24 @@ def test_parse_unibet_when_bwin_missing() -> None:
 
     assert "unibet" in names
     assert "bwin" not in names
+
+
+def test_parse_market_line_from_modified_market_rows() -> None:
+    payload = json.dumps(
+        {
+            "odds": """
+            <table><tbody>
+              <tr data-bid="847" data-bookie-id="1082">
+                <td><a class="in-bookmaker-logo-link">Duelbits</a></td>
+                <td class="table-main__doubleparameter">2.5</td>
+                <td data-odd="1.90" data-bookie="Duelbits"></td>
+                <td data-odd="1.85" data-bookie="Duelbits"></td>
+              </tr>
+            </tbody></table>
+            """
+        }
+    )
+
+    rows = OddsParser().parse_match_odds_payload(payload)
+
+    assert rows[0].raw_attributes["market_line"] == "2.5"

@@ -16,7 +16,13 @@ def main() -> None:
 
     settings = get_settings()
     database = Database(settings.database_path)
-    path = export_final_odds(database.final_snapshot_items(), settings.export_dir, args.date, args.format)
+    path = export_final_odds(
+        database.final_snapshot_items(),
+        settings.export_dir,
+        args.date,
+        args.format,
+        settings.betexplorer_timezone_offset,
+    )
     print(path)
 
 

@@ -12,15 +12,20 @@ class Settings(BaseSettings):
     betexplorer_base_url: str = "https://www.betexplorer.com"
     betexplorer_timezone_offset: str = "+3"
     target_bookmakers: str = "Bwin,Unibet"
-    capture_market: str = "1x2"
+    capture_market: str = "all"
     upcoming_window_minutes: int = 30
     recently_started_window_minutes: int = 10
-    max_match_age_after_kickoff_minutes: int = 10
-    final_capture_poll_interval_seconds: int = 2
+    max_match_age_after_kickoff_minutes: int = 5
+    monitoring_capture_poll_interval_seconds: int = 120
+    final_capture_poll_interval_seconds: int = 20
+    final_capture_fast_window_minutes: int = 3
     discovery_poll_interval_seconds: int = 60
     discovery_days_ahead: int = 1
-    scheduler_tick_seconds: int = 1
+    scheduler_tick_seconds: int = 10
+    enable_api_scheduler: bool = True
     max_concurrent_captures: int = 6
+    max_concurrent_markets_per_match: int = 3
+    market_discovery_cache_seconds: int = 600
     max_retries_per_match: int = 3
     retry_delay_seconds: int = 1
     database_path: Path = Field(default=Path("data/betexplorer.duckdb"))

@@ -16,3 +16,5 @@ target/
 
 out/
 har/
+
+.venv/

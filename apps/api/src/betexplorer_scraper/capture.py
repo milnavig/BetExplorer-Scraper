@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from .clock import utc_now
 from .config import Settings
 from .database import Database
-from .models import OddsSnapshot
+from .models import DiscoveredMatch, OddsSnapshot
 from .parsers import DiscoveryParser, OddsParser
 from .scheduler import Scheduler, SchedulerConfig
 from .timing import classify_timing
@@ -35,19 +36,92 @@ class CaptureService:
                 upcoming_window_minutes=settings.upcoming_window_minutes,
                 recently_started_window_minutes=settings.recently_started_window_minutes,
                 max_match_age_after_kickoff_minutes=settings.max_match_age_after_kickoff_minutes,
+                monitoring_capture_poll_interval_seconds=settings.monitoring_capture_poll_interval_seconds,
                 final_capture_poll_interval_seconds=settings.final_capture_poll_interval_seconds,
+                final_capture_fast_window_minutes=settings.final_capture_fast_window_minutes,
                 discovery_poll_interval_seconds=settings.discovery_poll_interval_seconds,
             )
         )
+        self._run_lock = asyncio.Lock()
+        self._last_discovery_at: datetime | None = None
+        self._markets_cache: dict[str, tuple[datetime, list[str]]] = {}
+        self._progress: dict[str, Any] = self._idle_progress()
 
-    async def run_once(self, now: datetime | None = None) -> dict[str, int]:
+    def progress_status(self) -> dict[str, Any]:
+        return dict(self._progress)
+
+    def _idle_progress(self) -> dict[str, Any]:
+        return {
+            "running": False,
+            "trigger": None,
+            "phase": "idle",
+            "started_at": None,
+            "finished_at": None,
+            "discovered": 0,
+            "due": 0,
+            "queued": 0,
+            "active": 0,
+            "completed": 0,
+            "captured": 0,
+            "failed": 0,
+            "skipped": 0,
+            "finalized": 0,
+            "waiting": 0,
+            "current_event_id": None,
+            "last_error": None,
+            "last_discovery_at": None,
+            "next_discovery_at": None,
+        }
+
+    def _set_progress(self, **values: Any) -> None:
+        self._progress = {**self._progress, **values}
+
+    async def run_once(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
+        async with self._run_lock:
+            try:
+                return await self._run_once_locked(now, trigger, force_discovery)
+            except Exception as exc:
+                self._set_progress(
+                    running=False,
+                    phase="error",
+                    finished_at=utc_now().isoformat(),
+                    last_error=str(exc),
+                )
+                raise
+
+    async def _run_once_locked(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
         now = now or datetime.now()
-        matches = await self._discover_matches(now)
-        try:
-            live = await self.transport.fetch_live_results()
-            matches = self.discovery_parser.apply_live_results(matches, live.text)
-        except Exception as exc:
-            self.database.log("warning", "capture", "live_results_failed", details={"error": str(exc)})
+        next_discovery = self._next_discovery_at()
+        self._progress = {
+            **self._idle_progress(),
+            "running": True,
+            "trigger": trigger,
+            "phase": "starting",
+            "started_at": utc_now().isoformat(),
+            "last_discovery_at": self._last_discovery_at.isoformat() if self._last_discovery_at else None,
+            "next_discovery_at": next_discovery.isoformat() if next_discovery else None,
+        }
+        should_discover = force_discovery or self._discovery_due(now)
+        if should_discover:
+            self._set_progress(phase="discovery")
+            matches = await self._discover_matches(now)
+            self._last_discovery_at = now
+            next_discovery = self._next_discovery_at()
+            self._set_progress(
+                discovered=len(matches),
+                phase="live_results",
+                last_discovery_at=self._last_discovery_at.isoformat(),
+                next_discovery_at=next_discovery.isoformat() if next_discovery else None,
+            )
+            try:
+                live = await self.transport.fetch_live_results()
+                matches = self.discovery_parser.apply_live_results(matches, live.text)
+            except Exception as exc:
+                self.database.log("warning", "capture", "live_results_failed", details={"error": str(exc)})
+                self._set_progress(last_error=str(exc))
+        else:
+            matches = []
+            self._set_progress(phase="due_scan", discovered=0)
 
         captured = 0
         failed = 0
@@ -56,17 +130,12 @@ class CaptureService:
         finalized = 0
         waiting = 0
         capture_jobs: list[tuple[str, str, str, datetime | None, str, datetime | None]] = []
-        for match in matches:
-            match.timing_status = classify_timing(
-                match.kickoff_time,
-                now,
-                self.settings.upcoming_window_minutes,
-                self.settings.recently_started_window_minutes,
-                is_live=match.timing_status.value == "LIVE",
-                is_finished=match.timing_status.value == "FINISHED",
-            )
-            match_id = self.database.upsert_match(match)
-            schedule_state = self.database.get_match_schedule(match_id)
+        self._set_progress(phase="planning")
+
+        seen_match_ids: set[str] = set()
+
+        def schedule_match(match_id: str, match: DiscoveredMatch, schedule_state: dict[str, datetime | str | None]) -> None:
+            nonlocal due, skipped, finalized, waiting
             decision = self.scheduler.plan(
                 match,
                 now,
@@ -78,22 +147,66 @@ class CaptureService:
                 skipped += 1
                 finalized += 1 if decision.phase == "FINALIZED" else 0
                 waiting += 1 if decision.phase in {"WAITING", "DISCOVERY_ONLY"} else 0
-                continue
+                return
             due += 1
             capture_jobs.append((match_id, match.event_id, match.source_url, decision.next_capture_at, decision.phase, decision.finalized_at))
+            self._set_progress(due=due, queued=len(capture_jobs), skipped=skipped, finalized=finalized, waiting=waiting)
+
+        for match in matches:
+            match.timing_status = classify_timing(
+                match.kickoff_time,
+                now,
+                self.settings.upcoming_window_minutes,
+                self.settings.recently_started_window_minutes,
+                is_live=match.timing_status.value == "LIVE",
+                is_finished=match.timing_status.value == "FINISHED",
+            )
+            match_id = self.database.upsert_match(match)
+            seen_match_ids.add(match_id)
+            schedule_state = self.database.get_match_schedule(match_id)
+            schedule_match(match_id, match, schedule_state)
+
+        for match_id, match, schedule_state in self.database.list_due_scheduled_matches(now):
+            if match_id in seen_match_ids:
+                continue
+            match.timing_status = classify_timing(
+                match.kickoff_time,
+                now,
+                self.settings.upcoming_window_minutes,
+                self.settings.recently_started_window_minutes,
+                is_live=match.timing_status.value == "LIVE",
+                is_finished=match.timing_status.value == "FINISHED",
+            )
+            schedule_match(match_id, match, schedule_state)
+
+        self._set_progress(due=due, queued=len(capture_jobs), skipped=skipped, finalized=finalized, waiting=waiting)
         if capture_jobs:
+            self._set_progress(phase="capturing", queued=len(capture_jobs), active=0, completed=0)
             semaphore = asyncio.Semaphore(max(1, self.settings.max_concurrent_captures))
 
             async def run_capture(job: tuple[str, str, str, datetime | None, str, datetime | None]) -> bool:
+                nonlocal captured, failed
                 match_id, event_id, source_url, next_capture_at, phase, finalized_at = job
                 async with semaphore:
+                    self._set_progress(active=self._progress["active"] + 1, current_event_id=event_id)
                     ok = await self.capture_match(match_id, event_id, source_url)
                     self.database.mark_match_captured(match_id, utc_now(), next_capture_at, phase, finalized_at)
+                    captured += 1 if ok else 0
+                    failed += 0 if ok else 1
+                    self._set_progress(
+                        active=max(0, self._progress["active"] - 1),
+                        completed=self._progress["completed"] + 1,
+                        captured=captured,
+                        failed=failed,
+                        current_event_id=event_id,
+                    )
                     return ok
 
             results = await asyncio.gather(*(run_capture(job) for job in capture_jobs))
             captured = sum(1 for ok in results if ok)
             failed = len(results) - captured
+        else:
+            self._set_progress(phase="completed", queued=0, active=0, completed=0)
         result = {
             "discovered": len(matches),
             "due": due,
@@ -104,7 +217,34 @@ class CaptureService:
             "waiting": waiting,
         }
         self.database.log("info", "capture", "run_once_completed", details=result)
+        self._set_progress(
+            running=False,
+            phase="completed",
+            finished_at=utc_now().isoformat(),
+            discovered=result["discovered"],
+            due=result["due"],
+            queued=len(capture_jobs),
+            active=0,
+            completed=len(capture_jobs),
+            captured=result["captured"],
+            failed=result["failed"],
+            skipped=result["skipped"],
+            finalized=result["finalized"],
+            waiting=result["waiting"],
+            last_discovery_at=self._last_discovery_at.isoformat() if self._last_discovery_at else None,
+            next_discovery_at=self._next_discovery_at().isoformat() if self._next_discovery_at() else None,
+        )
         return result
+
+    def _discovery_due(self, now: datetime) -> bool:
+        if self._last_discovery_at is None:
+            return True
+        return now - self._last_discovery_at >= timedelta(seconds=self.settings.discovery_poll_interval_seconds)
+
+    def _next_discovery_at(self) -> datetime | None:
+        if self._last_discovery_at is None:
+            return None
+        return self._last_discovery_at + timedelta(seconds=self.settings.discovery_poll_interval_seconds)
 
     async def _discover_matches(self, now: datetime) -> list:
         pages = [await self.transport.fetch_homepage()]
@@ -129,17 +269,30 @@ class CaptureService:
         return list(matches_by_event_id.values())
 
     async def capture_match(self, match_id: str, event_id: str, source_url: str) -> bool:
+        markets = await self._markets_for_match(source_url)
+        market_semaphore = asyncio.Semaphore(max(1, self.settings.max_concurrent_markets_per_match))
+
+        async def capture_market(market: str) -> tuple[bool, bool]:
+            async with market_semaphore:
+                return await self.capture_match_market(match_id, event_id, source_url, market)
+
+        results = await asyncio.gather(*(capture_market(market) for market in markets))
+        saved_any = any(saved for saved, _complete in results)
+        return saved_any
+
+    async def capture_match_market(self, match_id: str, event_id: str, source_url: str, market: str) -> tuple[bool, bool]:
+        saved = False
         for attempt in range(1, self.settings.max_retries_per_match + 1):
             started = utc_now()
             try:
-                response = await self.transport.fetch_match_odds(event_id, source_url, self.settings.capture_market)
-                raw_path = self._save_raw_payload(event_id, attempt, response.text)
+                response = await self.transport.fetch_match_odds(event_id, source_url, market)
+                raw_path = self._save_raw_payload(event_id, attempt, market, response.text)
                 odds = self.odds_parser.parse_match_odds_payload(response.text)
                 quality = classify_snapshot_quality(odds, self.settings.required_bookmakers)
                 presence = required_bookmaker_presence(odds, self.settings.required_bookmakers)
                 snapshot = OddsSnapshot(
                     event_id=event_id,
-                    market=self.settings.capture_market,
+                    market=market,
                     captured_at=utc_now(),
                     quality_status=quality,
                     required_bookmakers=self.settings.required_bookmakers,
@@ -147,20 +300,47 @@ class CaptureService:
                     raw_payload_path=str(raw_path),
                 )
                 self.database.save_snapshot(match_id, snapshot)
+                saved = saved or bool(odds)
                 self.database.save_attempt(match_id, event_id, source_url, attempt, quality.value, None, presence, started, utc_now())
-                self.database.log("info", "capture", "snapshot_saved", event_id, {"quality": quality.value, "bookmakers": len(odds)})
-                if quality.value == "COMPLETE":
-                    return True
+                self.database.log(
+                    "info",
+                    "capture",
+                    "snapshot_saved",
+                    event_id,
+                    {"market": market, "quality": quality.value, "bookmakers": len(odds)},
+                )
+                if odds:
+                    return True, quality.value == "COMPLETE"
             except Exception as exc:
                 self.database.save_attempt(match_id, event_id, source_url, attempt, "ERROR", str(exc), {}, started, utc_now())
-                self.database.log("error", "capture", "capture_failed", event_id, {"attempt": attempt, "error": str(exc)})
+                self.database.log("error", "capture", "capture_failed", event_id, {"market": market, "attempt": attempt, "error": str(exc)})
             if attempt < self.settings.max_retries_per_match:
                 await asyncio.sleep(self.settings.retry_delay_seconds)
-        return False
+        return saved, False
 
-    def _save_raw_payload(self, event_id: str, attempt: int, payload: str) -> Path:
+    async def _markets_for_match(self, source_url: str) -> list[str]:
+        configured = self.settings.capture_market.strip().lower()
+        if configured and configured != "all":
+            return [configured]
+        cached = self._markets_cache.get(source_url)
+        now = utc_now()
+        if cached and cached[0] > now:
+            return cached[1]
+        try:
+            page = await self.transport.fetch_match_page(source_url)
+            markets = self.odds_parser.parse_available_markets(page.text)
+            resolved = markets or ["1x2"]
+            expires_at = now + timedelta(seconds=self.settings.market_discovery_cache_seconds)
+            self._markets_cache[source_url] = (expires_at, resolved)
+            return resolved
+        except Exception as exc:
+            self.database.log("warning", "capture", "market_discovery_failed", details={"source_url": source_url, "error": str(exc)})
+            return ["1x2"]
+
+    def _save_raw_payload(self, event_id: str, attempt: int, market: str, payload: str) -> Path:
         self.settings.raw_snapshot_dir.mkdir(parents=True, exist_ok=True)
         timestamp = utc_now().strftime("%Y%m%dT%H%M%S%f")
-        path = self.settings.raw_snapshot_dir / f"{event_id}_{timestamp}_attempt{attempt}.json"
+        safe_market = "".join(char if char.isalnum() else "_" for char in market)
+        path = self.settings.raw_snapshot_dir / f"{event_id}_{safe_market}_{timestamp}_attempt{attempt}.json"
         path.write_text(payload, encoding="utf-8")
         return path

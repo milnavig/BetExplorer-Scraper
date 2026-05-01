@@ -37,6 +37,8 @@ class DiscoveredMatch:
     timing_status: TimingStatus = TimingStatus.UNKNOWN
     status: str = "scheduled"
     live_score: str | None = None
+    capture_phase: str | None = None
+    finalized_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -53,7 +55,7 @@ class BookmakerOdds:
 
     @property
     def is_available(self) -> bool:
-        return self.home_odds is not None and self.draw_odds is not None and self.away_odds is not None
+        return self.home_odds is not None and self.draw_odds is not None
 
 
 @dataclass(slots=True)

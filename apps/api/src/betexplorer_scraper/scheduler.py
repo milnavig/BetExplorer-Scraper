@@ -11,7 +11,9 @@ class SchedulerConfig:
     upcoming_window_minutes: int
     recently_started_window_minutes: int
     max_match_age_after_kickoff_minutes: int
+    monitoring_capture_poll_interval_seconds: int
     final_capture_poll_interval_seconds: int
+    final_capture_fast_window_minutes: int
     discovery_poll_interval_seconds: int
 
 
@@ -47,7 +49,7 @@ class Scheduler:
 
         upcoming_start = match.kickoff_time - timedelta(minutes=self.config.upcoming_window_minutes)
         final_end = match.kickoff_time + timedelta(minutes=self.config.max_match_age_after_kickoff_minutes)
-        interval = timedelta(seconds=self.config.final_capture_poll_interval_seconds)
+        interval = self._capture_interval(match.kickoff_time, now)
 
         if now < upcoming_start:
             return CaptureDecision("WAITING", False, upcoming_start)
@@ -57,3 +59,9 @@ class Scheduler:
         phase = "FINALIZING" if now > match.kickoff_time or match.timing_status == TimingStatus.LIVE else "MONITORING"
         due = next_capture_at is None or next_capture_at <= now
         return CaptureDecision(phase, due, now + interval if due else next_capture_at)
+
+    def _capture_interval(self, kickoff_time: datetime, now: datetime) -> timedelta:
+        fast_window_start = kickoff_time - timedelta(minutes=self.config.final_capture_fast_window_minutes)
+        if now < fast_window_start:
+            return timedelta(seconds=self.config.monitoring_capture_poll_interval_seconds)
+        return timedelta(seconds=self.config.final_capture_poll_interval_seconds)

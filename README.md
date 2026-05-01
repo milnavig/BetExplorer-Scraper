@@ -1,6 +1,6 @@
 # BetExplorer Final Odds Monitor
 
-Local API-first system for tracking BetExplorer football matches, capturing final 1X2 pre-match odds, storing all bookmaker rows, and monitoring capture state from a Next.js/Tauri UI.
+Local API-first system for tracking BetExplorer football matches, capturing final pre-match odds markets, storing all bookmaker rows, and monitoring capture state from a Next.js/Tauri UI.
 
 ## What It Does
 
@@ -10,7 +10,7 @@ Local API-first system for tracking BetExplorer football matches, capturing fina
   - `MONITORING`: match is inside the pre-kickoff capture window.
   - `FINALIZING`: match has started but is still inside the post-kickoff capture window.
   - `FINALIZED`: capture window is over.
-- Captures all available 1X2 bookmaker rows from BetExplorer direct HTTP endpoints.
+- Captures all available bookmaker rows from BetExplorer direct HTTP endpoints for every market tab exposed on the match page.
 - Uses Bwin and Unibet as required bookmaker quality checks by default.
 - Saves matches, snapshots, bookmaker odds, attempts, logs, and scheduler state to DuckDB.
 - Exports CSV/XLSX.
@@ -60,12 +60,15 @@ Adjust `.env` if needed. Useful defaults:
 
 ```env
 TARGET_BOOKMAKERS=Bwin,Unibet
+CAPTURE_MARKET=all
 BETEXPLORER_TIMEZONE_OFFSET=+3
 UPCOMING_WINDOW_MINUTES=30
-MAX_MATCH_AGE_AFTER_KICKOFF_MINUTES=10
-FINAL_CAPTURE_POLL_INTERVAL_SECONDS=2
+MAX_MATCH_AGE_AFTER_KICKOFF_MINUTES=5
+MONITORING_CAPTURE_POLL_INTERVAL_SECONDS=120
+FINAL_CAPTURE_POLL_INTERVAL_SECONDS=20
+FINAL_CAPTURE_FAST_WINDOW_MINUTES=3
 DISCOVERY_DAYS_AHEAD=1
-SCHEDULER_TICK_SECONDS=1
+SCHEDULER_TICK_SECONDS=10
 MAX_CONCURRENT_CAPTURES=6
 RETRY_DELAY_SECONDS=1
 DATABASE_PATH=data/betexplorer.duckdb
@@ -80,6 +83,8 @@ Terminal 1:
 ```powershell
 uv run uvicorn betexplorer_scraper.api:app --host 127.0.0.1 --port 8000
 ```
+
+By default the FastAPI process also starts the continuous scheduler heartbeat (`ENABLE_API_SCHEDULER=true`). The UI `Run once` button is only a manual extra cycle; it is not required for normal monitoring while the API is running.
 
 Check:
 
@@ -123,7 +128,15 @@ Continuous scheduler loop:
 uv run python scripts/run_live_capture.py
 ```
 
-The continuous loop does discovery repeatedly, updates scheduler state, and only captures odds for matches that are due. With the default fast-capture settings, the loop wakes every 1 second, checks due matches concurrently, and polls final-window odds every 2 seconds.
+Use this external loop only when `ENABLE_API_SCHEDULER=false` or when the API is not running. Do not run both schedulers against the same DuckDB file unless you intentionally want duplicate capture pressure.
+
+The continuous loop checks due matches every `SCHEDULER_TICK_SECONDS`, but full BetExplorer discovery is throttled by `DISCOVERY_POLL_INTERVAL_SECONDS`. Odds polling is adaptive: normal capture-window polling uses `MONITORING_CAPTURE_POLL_INTERVAL_SECONDS`, then switches to `FINAL_CAPTURE_POLL_INTERVAL_SECONDS` during the last `FINAL_CAPTURE_FAST_WINDOW_MINUTES` before kickoff and shortly after kickoff. Current defaults are intentionally moderate for `CAPTURE_MARKET=all`: every 120 seconds in the early window, every 20 seconds in the last 3 minutes, and up to 5 minutes after kickoff.
+
+Performance notes:
+- `MAX_CONCURRENT_CAPTURES` controls how many due matches run in parallel.
+- `MAX_CONCURRENT_MARKETS_PER_MATCH` controls how many market endpoints run in parallel inside a single match.
+- `MARKET_DISCOVERY_CACHE_SECONDS` caches the match-page market tab list so repeated final-window captures do not reload the match page every time.
+- A market payload with bookmaker rows is saved once per cycle even when Bwin/Unibet are missing; retries are reserved for errors or empty payloads.
 
 ## Export Results
 
@@ -144,6 +157,13 @@ Exports are written to:
 ```text
 data/exports/
 ```
+
+Export status fields:
+
+- `status`: practical export status, using `capture_phase` first, then finalized/live timing, and never `UNKNOWN` for captured rows.
+- `timing_status`: raw timing classifier stored by the scraper; this can still be `UNKNOWN` for diagnostics.
+- `match_status`: raw discovered/live status.
+- `capture_phase`: scheduler phase such as `MONITORING`, `FINALIZING`, or `FINALIZED`.
 
 ## Run Tauri Desktop Shell
 
@@ -209,5 +229,6 @@ npm --prefix apps/desktop audit
 ## Notes
 
 - The scraper is HTTP-first. Browser automation is intentionally left as a fallback interface, not the default.
-- “All bookmakers” currently means all available bookmaker rows for the 1X2 market.
+- `CAPTURE_MARKET=all` discovers BetExplorer market tabs from the match page, for example `1x2`, `ou`, `ah`, `dc`, and `bts`. Set it to a single market id like `1x2` to restrict capture.
+- Odds rows use generic `Odd 1`, `Odd 2`, `Odd 3` columns because markets can be two-outcome or three-outcome.
 - Matching against the client historical database is not implemented yet.

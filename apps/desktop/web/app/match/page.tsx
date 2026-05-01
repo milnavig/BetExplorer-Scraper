@@ -34,6 +34,7 @@ type MatchRow = {
   snapshot_id: string | null;
   quality_status: string | null;
   captured_at: string | null;
+  final_snapshot_age_to_kickoff_seconds: number | null;
   bookmaker_count: number;
   has_bwin: boolean;
   has_unibet: boolean;
@@ -54,6 +55,7 @@ type BookmakerOdds = {
   raw_row_text: string | null;
   raw_attributes_json: string | null;
   created_at: string;
+  market: string;
   snapshot_captured_at: string | null;
   snapshot_quality_status: string | null;
 };
@@ -73,6 +75,7 @@ type SnapshotRow = {
   required_bookmakers_json: string;
   created_at: string;
   bookmaker_count?: number;
+  final_snapshot_age_to_kickoff_seconds?: number | null;
 };
 
 type AttemptRow = {
@@ -99,9 +102,14 @@ type MatchDetail = {
 type Status = {
   betexplorer_timezone_offset: string;
   scheduler_tick_seconds: number;
+  monitoring_capture_poll_interval_seconds: number;
   final_capture_poll_interval_seconds: number;
+  final_capture_fast_window_minutes: number;
+  discovery_poll_interval_seconds: number;
   upcoming_window_minutes: number;
   max_concurrent_captures: number;
+  max_concurrent_markets_per_match: number;
+  market_discovery_cache_seconds: number;
 };
 
 async function api<T>(path: string): Promise<T> {
@@ -175,13 +183,13 @@ export default function MatchPage() {
       const queryOk =
         !query ||
         [
+          row.market,
+          marketLabel(row.market),
+          marketLine(row),
           row.bookmaker,
           row.normalized_bookmaker,
           row.bookmaker_id,
-          row.betexplorer_bookmaker_id,
-          row.raw_row_text,
-          row.raw_attributes_json,
-          row.snapshot_quality_status
+          row.betexplorer_bookmaker_id
         ]
           .filter(Boolean)
           .join(" ")
@@ -226,7 +234,7 @@ export default function MatchPage() {
             <button key={item.id} className={item.id === selectedId ? "picker-row selected" : "picker-row"} onClick={() => selectMatch(item.id)}>
               <span className={`quality ${qualityClass(item.quality_status)}`}>{qualityLabel(item.quality_status)}</span>
               <strong>{item.home_team} - {item.away_team}</strong>
-              <small>{formatDate(item.kickoff_time)} · {item.bookmaker_count} bookmakers · {item.attempt_count} tries</small>
+              <small>{formatScheduleDate(item.kickoff_time)} · {item.bookmaker_count} bookmakers · {item.attempt_count} tries</small>
             </button>
           ))}
         </div>
@@ -256,12 +264,14 @@ export default function MatchPage() {
         </header>
 
         <section className="capture-config-strip">
-          <span>Browser TZ <strong>{clientTimezone}</strong></span>
-          <span>BetExplorer TZ <strong>UTC{status?.betexplorer_timezone_offset ?? "-"}</strong></span>
-          <span>Poll <strong>{status?.final_capture_poll_interval_seconds ?? "-"}s</strong></span>
-          <span>Heartbeat <strong>{status?.scheduler_tick_seconds ?? "-"}s</strong></span>
-          <span>Concurrency <strong>{status?.max_concurrent_captures ?? "-"}</strong></span>
-          <span>Window <strong>{status?.upcoming_window_minutes ?? "-"}m</strong></span>
+          <span title={tooltipFor("Browser TZ")}>Browser TZ <strong>{clientTimezone}</strong></span>
+          <span title={tooltipFor("BetExplorer TZ")}>BetExplorer TZ <strong>UTC{status?.betexplorer_timezone_offset ?? "-"}</strong></span>
+          <span title={tooltipFor("Poll")}>Poll <strong>{status?.monitoring_capture_poll_interval_seconds ?? "-"}s / {status?.final_capture_poll_interval_seconds ?? "-"}s</strong></span>
+          <span title={tooltipFor("Discovery")}>Discovery <strong>{status?.discovery_poll_interval_seconds ?? "-"}s</strong></span>
+          <span title={tooltipFor("Heartbeat")}>Heartbeat <strong>{status?.scheduler_tick_seconds ?? "-"}s</strong></span>
+          <span title={tooltipFor("Concurrency")}>Concurrency <strong>{status?.max_concurrent_captures ?? "-"}</strong></span>
+          <span title={tooltipFor("Market concurrency")}>Markets <strong>{status?.max_concurrent_markets_per_match ?? "-"}</strong></span>
+          <span title={tooltipFor("Window")}>Window <strong>{status?.upcoming_window_minutes ?? "-"}m</strong></span>
         </section>
 
         {error ? <div className="error">{error}</div> : null}
@@ -278,16 +288,17 @@ export default function MatchPage() {
             </section>
 
             <section className="detail-metrics">
-              <Info label="Kickoff" value={formatDate(match.kickoff_time)} />
+              <Info label="Kickoff" value={formatScheduleDate(match.kickoff_time)} />
               <Info label="Status" value={match.status ?? "-"} />
               <Info label="Timing" value={displayTiming(match)} />
               <Info label="Capture phase" value={match.capture_phase ?? "DISCOVERED"} />
-              <Info label="Next capture" value={formatDate(match.next_capture_at)} />
-              <Info label="Last capture" value={formatDate(match.last_capture_at)} />
-              <Info label="Finalized" value={formatDate(match.finalized_at)} />
+              <Info label="Next capture" value={formatScheduleDate(match.next_capture_at)} />
+              <Info label="Last capture" value={formatUtcDate(match.last_capture_at)} />
+              <Info label="Finalized" value={formatScheduleDate(match.finalized_at)} />
               <Info label="Live score" value={match.live_score ?? "-"} />
               <Info label="Snapshot ID" value={match.snapshot_id ?? "-"} />
-              <Info label="Snapshot captured" value={formatDate(match.captured_at)} />
+              <Info label="Snapshot captured" value={formatUtcDate(match.captured_at)} />
+              <Info label="Final snapshot age" value={formatAgeToKickoff(match.final_snapshot_age_to_kickoff_seconds)} />
               <Info label="Bookmakers" value={String(match.bookmaker_count)} />
               <Info label="Attempts" value={String(match.attempt_count)} />
             </section>
@@ -320,7 +331,7 @@ export default function MatchPage() {
                 </label>
                 <label className="search">
                   <Filter size={15} />
-                  <input value={oddsQuery} onChange={(event) => setOddsQuery(event.target.value)} placeholder="Filter bookmaker, IDs, raw fields" />
+                  <input value={oddsQuery} onChange={(event) => setOddsQuery(event.target.value)} placeholder="Filter market, bookmaker, IDs" />
                 </label>
               </div>
               <div className="table-wrap full-table">
@@ -328,36 +339,30 @@ export default function MatchPage() {
                   <thead>
                     <tr>
                       <th>Bookmaker</th>
+                      <th>Market</th>
+                      <th>Line</th>
                       <th>Normalized</th>
                       <th>Bookmaker ID</th>
                       <th>BE ID</th>
-                      <th>1</th>
-                      <th>X</th>
-                      <th>2</th>
+                      <th>Prices</th>
                       <th>Available</th>
-                      <th>Snapshot quality</th>
                       <th>Snapshot captured</th>
                       <th>Created</th>
-                      <th>Raw row</th>
-                      <th>Raw attributes</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredOdds.map((row) => (
                       <tr key={row.id} className={REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker) ? "required" : ""}>
                         <td>{row.bookmaker}</td>
+                        <td>{marketLabel(row.market)}</td>
+                        <td><span className="line-pill">{marketLine(row)}</span></td>
                         <td>{row.normalized_bookmaker}</td>
                         <td>{row.bookmaker_id ?? "-"}</td>
                         <td>{row.betexplorer_bookmaker_id ?? "-"}</td>
-                        <td className="odd">{formatOdd(row.home_odds)}</td>
-                        <td className="odd">{formatOdd(row.draw_odds)}</td>
-                        <td className="odd">{formatOdd(row.away_odds)}</td>
+                        <td><PriceSet row={row} /></td>
                         <td>{row.is_available ? "yes" : "no"}</td>
-                        <td><span className={`quality ${qualityClass(row.snapshot_quality_status)}`}>{qualityLabel(row.snapshot_quality_status)}</span></td>
-                        <td>{formatDate(row.snapshot_captured_at)}</td>
-                        <td>{formatDate(row.created_at)}</td>
-                        <td><code>{row.raw_row_text ?? "-"}</code></td>
-                        <td><code>{row.raw_attributes_json ?? "-"}</code></td>
+                        <td>{formatUtcDate(row.snapshot_captured_at)}</td>
+                        <td>{formatUtcDate(row.created_at)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -381,6 +386,7 @@ export default function MatchPage() {
                         <th>Final</th>
                         <th>Source page</th>
                         <th>Rows</th>
+                        <th>To kickoff</th>
                         <th>Required JSON</th>
                         <th>Raw payload</th>
                         <th>Created</th>
@@ -390,7 +396,7 @@ export default function MatchPage() {
                       {(detail?.snapshots ?? []).map((snapshot) => (
                         <tr key={snapshot.id}>
                           <td><code>{snapshot.id}</code></td>
-                          <td>{formatDate(snapshot.captured_at)}</td>
+                          <td>{formatUtcDate(snapshot.captured_at)}</td>
                           <td>{snapshot.market}</td>
                           <td>{snapshot.capture_type}</td>
                           <td><span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span></td>
@@ -398,9 +404,10 @@ export default function MatchPage() {
                           <td>{snapshot.is_final ? "yes" : "no"}</td>
                           <td>{snapshot.source_page_type}</td>
                           <td>{snapshot.bookmaker_count ?? "-"}</td>
+                          <td>{formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</td>
                           <td><code>{formatRequiredJson(snapshot.required_bookmakers_json)}</code></td>
                           <td><code>{snapshot.raw_payload_path ?? "-"}</code></td>
-                          <td>{formatDate(snapshot.created_at)}</td>
+                          <td>{formatUtcDate(snapshot.created_at)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -430,8 +437,8 @@ export default function MatchPage() {
                           <td><code>{attempt.id}</code></td>
                           <td>{attempt.attempt_number}</td>
                           <td><span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span></td>
-                          <td>{formatDate(attempt.started_at)}</td>
-                          <td>{formatDate(attempt.finished_at)}</td>
+                          <td>{formatUtcDate(attempt.started_at)}</td>
+                          <td>{formatUtcDate(attempt.finished_at)}</td>
                           <td><code>{formatRequiredJson(attempt.required_found_json)}</code></td>
                           <td>{attempt.error_message ?? "-"}</td>
                           <td><code>{attempt.source_url}</code></td>
@@ -466,7 +473,7 @@ function PanelHeader({ title, subtitle }: { title: string; subtitle: string }) {
 
 function PanelTitle({ title, subtitle, icon }: { title: string; subtitle: string; icon: ReactNode }) {
   return (
-    <div className="panel-head compact-head">
+    <div className="panel-head compact-head" title={subtitle}>
       <div>
         <h3>{title}</h3>
         <p>{subtitle}</p>
@@ -478,7 +485,7 @@ function PanelTitle({ title, subtitle, icon }: { title: string; subtitle: string
 
 function Info({ label, value }: { label: string; value: string }) {
   return (
-    <div className="info-cell">
+    <div className="info-cell" title={`${tooltipFor(label)} Current value: ${value}`}>
       <span>{label}</span>
       <strong title={value}>{value}</strong>
     </div>
@@ -487,7 +494,7 @@ function Info({ label, value }: { label: string; value: string }) {
 
 function RequiredCard({ label, ok, rows }: { label: string; ok: boolean; rows: number }) {
   return (
-    <div className={ok ? "required-card ok" : "required-card missing"}>
+    <div className={ok ? "required-card ok" : "required-card missing"} title={`${label} required bookmaker ${ok ? "is present" : "is missing"} in final odds rows.`}>
       <span>{label}</span>
       <strong>{ok ? "present" : "missing"}</strong>
       <small>{rows} odds rows</small>
@@ -495,7 +502,20 @@ function RequiredCard({ label, ok, rows }: { label: string; ok: boolean; rows: n
   );
 }
 
-function formatDate(value?: string | null) {
+function PriceSet({ row }: { row: BookmakerOdds }) {
+  return (
+    <div className="price-set">
+      {priceItems(row).map((item) => (
+        <span key={item.label} className="price-chip">
+          <small>{item.label}</small>
+          <strong>{item.value}</strong>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function formatScheduleDate(value?: string | null) {
   return value
     ? new Intl.DateTimeFormat("en", {
         month: "short",
@@ -503,12 +523,88 @@ function formatDate(value?: string | null) {
         hour: "2-digit",
         minute: "2-digit",
         timeZone: "Europe/Kyiv"
-      }).format(parseApiDate(value))
+      }).format(parseLocalApiDate(value))
+    : "-";
+}
+
+function formatUtcDate(value?: string | null) {
+  return value
+    ? new Intl.DateTimeFormat("en", {
+        month: "short",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Europe/Kyiv"
+      }).format(parseUtcApiDate(value))
     : "-";
 }
 
 function formatOdd(value: number | null) {
   return value == null ? "-" : value.toFixed(2);
+}
+
+function formatAgeToKickoff(value: number | null | undefined) {
+  if (value == null) return "-";
+  const prefix = value >= 0 ? "before" : "after";
+  const abs = Math.abs(value);
+  const minutes = Math.floor(abs / 60);
+  const seconds = abs % 60;
+  if (minutes < 1) return `${prefix} ${seconds}s`;
+  if (minutes < 60) return `${prefix} ${minutes}m ${seconds}s`;
+  const hours = Math.floor(minutes / 60);
+  return `${prefix} ${hours}h ${minutes % 60}m`;
+}
+
+function marketLabel(market: string | null | undefined) {
+  const labels: Record<string, string> = {
+    "1x2": "1X2",
+    ou: "Over/Under",
+    ah: "Asian Handicap",
+    dc: "Double Chance",
+    bts: "Both Teams To Score",
+    dnb: "Draw No Bet"
+  };
+  return labels[(market ?? "").toLowerCase()] ?? (market ? market.toUpperCase() : "-");
+}
+
+function marketLine(row: BookmakerOdds) {
+  const attrs = parseRawAttributes(row.raw_attributes_json);
+  const explicit = attrs.market_line ?? attrs.line ?? attrs.handicap ?? attrs.total;
+  if (explicit != null && String(explicit).trim()) return String(explicit).trim();
+  const raw = (row.raw_row_text ?? "").trim();
+  const bookmaker = row.bookmaker.trim();
+  const withoutBookmaker = raw.toLowerCase().startsWith(bookmaker.toLowerCase())
+    ? raw.slice(bookmaker.length).trim()
+    : raw;
+  const line = withoutBookmaker.match(/^[+-]?\d+(?:\.\d+)?/);
+  return line ? line[0] : "-";
+}
+
+function priceItems(row: BookmakerOdds) {
+  const market = row.market.toLowerCase();
+  const labels =
+    market === "ou"
+      ? ["Over", "Under", ""]
+      : market === "bts"
+        ? ["Yes", "No", ""]
+        : market === "dc"
+          ? ["1X", "12", "X2"]
+          : market === "ah"
+            ? ["1", "2", ""]
+            : ["1", "X", "2"];
+  return [row.home_odds, row.draw_odds, row.away_odds]
+    .map((value, index) => ({ label: labels[index], value: formatOdd(value) }))
+    .filter((item) => item.label && item.value !== "-");
+}
+
+function parseRawAttributes(value: string | null | undefined): Record<string, unknown> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 function qualityClass(value?: string | null) {
@@ -524,6 +620,37 @@ function qualityLabel(value?: string | null) {
   if (value === "FAILED") return "REQ MISSING";
   if (value === "ERROR") return "ERROR";
   return "NO SNAPSHOT";
+}
+
+function tooltipFor(label: string) {
+  const text: Record<string, string> = {
+    "Browser TZ": "Timezone reported by this browser.",
+    "BetExplorer TZ": "Timezone offset sent to BetExplorer via the my_timezone cookie.",
+    Poll: "Odds polling cadence: normal capture window / final fast window.",
+    Discovery: "How often the app refreshes the BetExplorer match list.",
+    Heartbeat: "How often the scheduler loop wakes up.",
+    Concurrency: "Maximum due matches captured in parallel.",
+    "Market concurrency": "Maximum market endpoints captured in parallel inside one match.",
+    Window: "Minutes before kickoff when active odds capture begins.",
+    Kickoff: "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
+    Status: "Raw match status persisted from discovery/live enrichment.",
+    Timing: "Timing classification relative to kickoff and live status.",
+    "Capture phase": "Scheduler state for this match.",
+    "Next capture": "Next scheduled odds request for this match.",
+    "Last capture": "Most recent saved odds snapshot timestamp.",
+    Finalized: "Time when the scheduler closed the capture window.",
+    "Live score": "Live/recent score from BetExplorer live-results enrichment.",
+    "Snapshot ID": "Latest final snapshot id used for summary display.",
+    "Snapshot captured": "Timestamp for the latest final snapshot.",
+    "Final snapshot age": "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
+    Bookmakers: "Bookmaker odds rows in final snapshots for this match.",
+    Attempts: "HTTP/parser attempts recorded for this match.",
+    "Match row ID": "Local database id for this match row.",
+    "Event ID": "BetExplorer/Flashscore event id.",
+    "Source URL": "BetExplorer match page URL.",
+    "Timing raw": "Raw timing_status stored in the database."
+  };
+  return text[label] ?? label;
 }
 
 function displayTiming(match: MatchRow) {
@@ -553,6 +680,10 @@ function clientTimezoneLabel() {
   return `${zone} UTC${offset}`;
 }
 
-function parseApiDate(value: string) {
+function parseUtcApiDate(value: string) {
   return new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`);
+}
+
+function parseLocalApiDate(value: string) {
+  return new Date(value);
 }

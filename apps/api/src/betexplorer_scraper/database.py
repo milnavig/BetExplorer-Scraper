@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, time
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -11,6 +11,7 @@ import duckdb
 
 from .clock import utc_now
 from .models import BookmakerOdds, CaptureType, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
+from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
 
 
 def _locked(method):
@@ -23,8 +24,9 @@ def _locked(method):
 
 
 class Database:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, timezone_offset: str = "+0") -> None:
         self.path = path
+        self.timezone_offset = timezone_offset
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
         self.connection = duckdb.connect(str(path))
@@ -222,6 +224,48 @@ class Database:
         }
 
     @_locked
+    def list_due_scheduled_matches(self, now: datetime) -> list[tuple[str, DiscoveredMatch, dict[str, datetime | str | None]]]:
+        rows = self.connection.execute(
+            """
+            SELECT id, betexplorer_match_id, source_url, league, home_team, away_team, kickoff_time,
+                   timing_status, status, live_score, capture_phase, next_capture_at, last_capture_at, finalized_at
+            FROM matches
+            WHERE finalized_at IS NULL
+              AND next_capture_at IS NOT NULL
+              AND next_capture_at <= ?
+            """,
+            [now],
+        ).fetchall()
+        items: list[tuple[str, DiscoveredMatch, dict[str, datetime | str | None]]] = []
+        for row in rows:
+            match = DiscoveredMatch(
+                event_id=row[1],
+                source_url=row[2],
+                league=row[3],
+                home_team=row[4],
+                away_team=row[5],
+                kickoff_time=row[6],
+                timing_status=TimingStatus(row[7] or TimingStatus.UNKNOWN.value),
+                status=row[8] or "scheduled",
+                live_score=row[9],
+                capture_phase=row[10],
+                finalized_at=row[13],
+            )
+            items.append(
+                (
+                    row[0],
+                    match,
+                    {
+                        "capture_phase": row[10],
+                        "next_capture_at": row[11],
+                        "last_capture_at": row[12],
+                        "finalized_at": row[13],
+                    },
+                )
+            )
+        return items
+
+    @_locked
     def update_match_schedule(
         self,
         match_id: str,
@@ -261,7 +305,7 @@ class Database:
     def save_snapshot(self, match_id: str, snapshot: OddsSnapshot) -> str:
         snapshot_id = str(uuid.uuid4())
         now = utc_now()
-        self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ?", [match_id])
+        self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ? AND market = ?", [match_id, snapshot.market])
         self.connection.execute(
             """
             INSERT INTO odds_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -349,7 +393,8 @@ class Database:
         )
 
     @_locked
-    def status(self) -> dict[str, object]:
+    def status(self, now: datetime | None = None) -> dict[str, object]:
+        now = now or datetime.now()
         match_count = self.connection.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
         snapshot_attempts = self.connection.execute("SELECT COUNT(*) FROM odds_snapshots").fetchone()[0]
         final_snapshot_count = self.connection.execute("SELECT COUNT(*) FROM odds_snapshots WHERE is_final = TRUE").fetchone()[0]
@@ -371,12 +416,20 @@ class Database:
         last_run = self.connection.execute(
             "SELECT MAX(timestamp) FROM logs WHERE module = 'capture' AND event = 'run_once_completed'"
         ).fetchone()[0]
+        today_start = datetime.combine(now.date(), time.min)
         next_capture = self.connection.execute(
-            "SELECT MIN(next_capture_at) FROM matches WHERE finalized_at IS NULL AND next_capture_at IS NOT NULL"
+            """
+            SELECT MIN(next_capture_at)
+            FROM matches
+            WHERE finalized_at IS NULL
+              AND next_capture_at IS NOT NULL
+              AND next_capture_at >= ?
+            """,
+            [today_start],
         ).fetchone()[0]
         due_count = self.connection.execute(
             "SELECT COUNT(*) FROM matches WHERE finalized_at IS NULL AND next_capture_at IS NOT NULL AND next_capture_at <= ?",
-            [utc_now()],
+            [now],
         ).fetchone()[0]
         finalized_count = self.connection.execute("SELECT COUNT(*) FROM matches WHERE finalized_at IS NOT NULL").fetchone()[0]
         captured_match_count = self.connection.execute(
@@ -435,17 +488,28 @@ class Database:
     def list_matches(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
             """
+            WITH final_snapshot_summary AS (
+                SELECT
+                    match_id,
+                    arg_max(id, captured_at) AS snapshot_id,
+                    arg_max(quality_status, captured_at) AS quality_status,
+                    MAX(captured_at) AS captured_at
+                FROM odds_snapshots
+                WHERE is_final = TRUE
+                GROUP BY match_id
+            )
             SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
                    m.status, m.timing_status, m.source_url, m.live_score,
                    m.capture_phase, m.next_capture_at, m.last_capture_at, m.finalized_at,
-                   s.id, s.quality_status, s.captured_at,
+                   s.snapshot_id, s.quality_status, s.captured_at,
                    COUNT(o.id) AS bookmaker_count,
                    COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'bwin' THEN 1 ELSE 0 END), 0) > 0 AS has_bwin,
                    COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'unibet' THEN 1 ELSE 0 END), 0) > 0 AS has_unibet,
                    COALESCE(a.attempt_count, 0) AS attempt_count
             FROM matches m
-            LEFT JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE
-            LEFT JOIN bookmaker_odds o ON o.snapshot_id = s.id
+            LEFT JOIN final_snapshot_summary s ON s.match_id = m.id
+            LEFT JOIN odds_snapshots fs ON fs.match_id = m.id AND fs.is_final = TRUE
+            LEFT JOIN bookmaker_odds o ON o.snapshot_id = fs.id
             LEFT JOIN (
                 SELECT match_id, COUNT(*) AS attempt_count
                 FROM scrape_attempts
@@ -453,9 +517,9 @@ class Database:
             ) a ON a.match_id = m.id
             GROUP BY m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
                      m.status, m.timing_status, m.source_url, m.live_score, m.capture_phase,
-                     m.next_capture_at, m.last_capture_at, m.finalized_at, s.id, s.quality_status, s.captured_at,
+                     m.next_capture_at, m.last_capture_at, m.finalized_at, s.snapshot_id, s.quality_status, s.captured_at,
                      a.attempt_count
-            ORDER BY (s.id IS NULL), s.captured_at DESC NULLS LAST, m.kickoff_time NULLS LAST, m.home_team
+            ORDER BY (s.snapshot_id IS NULL), s.captured_at DESC NULLS LAST, m.kickoff_time NULLS LAST, m.home_team
             """
         ).fetchall()
         columns = [
@@ -481,7 +545,7 @@ class Database:
             "has_unibet",
             "attempt_count",
         ]
-        return [self._serialize(dict(zip(columns, row))) for row in rows]
+        return [self._with_final_snapshot_age(self._serialize(dict(zip(columns, row)))) for row in rows]
 
     @_locked
     def match_detail(self, match_id: str) -> dict[str, object] | None:
@@ -490,13 +554,15 @@ class Database:
             return None
         snapshots = self.connection.execute(
             """
-            SELECT s.*, COUNT(o.id) AS bookmaker_count
+            SELECT s.*, COUNT(o.id) AS bookmaker_count,
+                   m.kickoff_time
             FROM odds_snapshots s
+            JOIN matches m ON m.id = s.match_id
             LEFT JOIN bookmaker_odds o ON o.snapshot_id = s.id
             WHERE s.match_id = ?
             GROUP BY s.id, s.match_id, s.event_id, s.captured_at, s.market, s.capture_type,
                      s.quality_status, s.is_final_candidate, s.is_final, s.source_page_type,
-                     s.raw_payload_path, s.required_bookmakers_json, s.created_at
+                     s.raw_payload_path, s.required_bookmakers_json, s.created_at, m.kickoff_time
             ORDER BY s.captured_at DESC
             """,
             [match_id],
@@ -504,11 +570,11 @@ class Database:
         snapshot_columns = [col[0] for col in self.connection.description]
         odds_rows = self.connection.execute(
             """
-            SELECT o.*, s.captured_at AS snapshot_captured_at, s.quality_status AS snapshot_quality_status
+            SELECT o.*, s.market, s.captured_at AS snapshot_captured_at, s.quality_status AS snapshot_quality_status
             FROM bookmaker_odds o
             JOIN odds_snapshots s ON s.id = o.snapshot_id
             WHERE s.match_id = ? AND s.is_final = TRUE
-            ORDER BY s.captured_at DESC, o.bookmaker
+            ORDER BY s.market, s.captured_at DESC, o.bookmaker
             """,
             [match_id],
         ).fetchall()
@@ -521,7 +587,7 @@ class Database:
         return self._serialize(
             {
                 "match": match,
-                "snapshots": [dict(zip(snapshot_columns, row)) for row in snapshots],
+                "snapshots": [self._with_final_snapshot_age(self._serialize(dict(zip(snapshot_columns, row)))) for row in snapshots],
                 "bookmaker_odds": [dict(zip(odds_columns, row)) for row in odds_rows],
                 "attempts": [dict(zip(attempt_columns, row)) for row in attempts],
             }
@@ -531,19 +597,20 @@ class Database:
     def list_snapshots(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
             """
-            SELECT s.*, m.league, m.home_team, m.away_team, COUNT(o.id) AS bookmaker_count
+            SELECT s.*, m.league, m.home_team, m.away_team, COUNT(o.id) AS bookmaker_count,
+                   m.kickoff_time
             FROM odds_snapshots s
             LEFT JOIN matches m ON m.id = s.match_id
             LEFT JOIN bookmaker_odds o ON o.snapshot_id = s.id
             GROUP BY s.id, s.match_id, s.event_id, s.captured_at, s.market, s.capture_type,
                      s.quality_status, s.is_final_candidate, s.is_final, s.source_page_type,
                      s.raw_payload_path, s.required_bookmakers_json, s.created_at,
-                     m.league, m.home_team, m.away_team
+                     m.league, m.home_team, m.away_team, m.kickoff_time
             ORDER BY s.captured_at DESC LIMIT 300
             """
         ).fetchall()
         columns = [col[0] for col in self.connection.description]
-        return [self._serialize(dict(zip(columns, row))) for row in rows]
+        return [self._with_final_snapshot_age(self._serialize(dict(zip(columns, row)))) for row in rows]
 
     @_locked
     def list_attempts(self) -> list[dict[str, object]]:
@@ -589,7 +656,8 @@ class Database:
         rows = self.connection.execute(
             """
             SELECT m.betexplorer_match_id, m.source_url, m.league, m.home_team, m.away_team, m.kickoff_time,
-                   m.timing_status, s.event_id, s.market, s.captured_at, s.quality_status,
+                   m.timing_status, m.status, m.capture_phase, m.finalized_at,
+                   s.event_id, s.market, s.captured_at, s.quality_status,
                    s.required_bookmakers_json, s.source_page_type, s.capture_type, s.id
             FROM matches m
             JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE
@@ -598,7 +666,7 @@ class Database:
         ).fetchall()
         items: list[tuple[DiscoveredMatch, OddsSnapshot]] = []
         for row in rows:
-            snapshot_id = row[14]
+            snapshot_id = row[17]
             odds_rows = self.connection.execute(
                 """
                 SELECT bookmaker, normalized_bookmaker, home_odds, draw_odds, away_odds,
@@ -630,15 +698,18 @@ class Database:
                         away_team=row[4],
                         kickoff_time=row[5],
                         timing_status=TimingStatus(row[6]),
+                        status=row[7],
+                        capture_phase=row[8],
+                        finalized_at=row[9],
                     ),
                     OddsSnapshot(
-                        event_id=row[7],
-                        market=row[8],
-                        captured_at=row[9],
-                        quality_status=SnapshotQuality(row[10]),
-                        required_bookmakers=json.loads(row[11] or "[]"),
-                        source_page_type=row[12],
-                        capture_type=CaptureType(row[13]),
+                        event_id=row[10],
+                        market=row[11],
+                        captured_at=row[12],
+                        quality_status=SnapshotQuality(row[13]),
+                        required_bookmakers=json.loads(row[14] or "[]"),
+                        source_page_type=row[15],
+                        capture_type=CaptureType(row[16]),
                         bookmaker_odds=odds,
                     ),
                 )
@@ -653,3 +724,20 @@ class Database:
         if isinstance(value, datetime):
             return value.isoformat()
         return value
+
+    def _with_final_snapshot_age(self, row: dict[str, object]) -> dict[str, object]:
+        kickoff = self._parse_serialized_datetime(row.get("kickoff_time"))
+        captured = self._parse_serialized_datetime(row.get("captured_at"))
+        row["final_snapshot_age_to_kickoff_seconds"] = final_snapshot_age_to_kickoff_seconds(
+            kickoff,
+            captured,
+            self.timezone_offset,
+        )
+        return row
+
+    def _parse_serialized_datetime(self, value: object) -> datetime | None:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str) and value:
+            return datetime.fromisoformat(value)
+        return None
