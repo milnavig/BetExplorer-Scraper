@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup, Tag
 
 from .models import BookmakerOdds, DiscoveredMatch, TimingStatus
+from .snapshot_metrics import parse_timezone_offset_seconds
 from .utils import normalize_bookmaker_name, parse_float
 
 _EVENT_ID_RE = re.compile(r"/([A-Za-z0-9]{8})/$")
@@ -193,6 +194,29 @@ class DiscoveryParser:
             if details:
                 score = self._score_from_text(details.get_text(" ", strip=True))
         return finished, score
+
+    def parse_match_page_start_time(self, html: str, timezone_offset: str) -> datetime | None:
+        soup = BeautifulSoup(html, "lxml")
+        for script in soup.select('script[type="application/ld+json"]'):
+            text = script.string or script.get_text("", strip=True)
+            if "SportsEvent" not in text or "startDate" not in text:
+                continue
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            start_date = data.get("startDate") if isinstance(data, dict) else None
+            if not isinstance(start_date, str) or not start_date:
+                continue
+            try:
+                parsed = datetime.fromisoformat(start_date)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                return parsed
+            target_tz = timezone(timedelta(seconds=parse_timezone_offset_seconds(timezone_offset)))
+            return parsed.astimezone(target_tz).replace(tzinfo=None)
+        return None
 
     def _teams(self, li: Tag) -> list[str]:
         text_nodes = []

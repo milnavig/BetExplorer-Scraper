@@ -72,6 +72,30 @@ def test_due_match_is_skipped_until_next_capture_time() -> None:
     assert decision.next_capture_at == now + timedelta(seconds=7)
 
 
+def test_stale_next_capture_after_corrected_kickoff_is_due_now() -> None:
+    now = datetime(2026, 4, 28, 21, 40)
+    kickoff = datetime(2026, 4, 28, 22, 0)
+    decision = _scheduler().plan(
+        _match(kickoff),
+        now,
+        next_capture_at=datetime(2026, 4, 28, 22, 30),
+    )
+
+    assert decision.phase == "MONITORING"
+    assert decision.should_capture is True
+    assert decision.next_capture_at == now + timedelta(seconds=120)
+
+
+def test_planned_next_capture_is_clamped_to_post_kickoff_window() -> None:
+    now = datetime(2026, 4, 28, 22, 4, 50)
+    kickoff = datetime(2026, 4, 28, 22, 0)
+    decision = _scheduler().plan(_match(kickoff), now)
+
+    assert decision.phase == "FINALIZING"
+    assert decision.should_capture is True
+    assert decision.next_capture_at == datetime(2026, 4, 28, 22, 5)
+
+
 def test_recently_started_match_enters_finalizing_phase() -> None:
     now = datetime(2026, 4, 28, 16, 0)
     decision = _scheduler().plan(_match(now - timedelta(minutes=4)), now)

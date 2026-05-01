@@ -76,6 +76,10 @@ class NoDiscoveryTransport(FakeTransport):
         return RawResponse("https://www.betexplorer.com/football/", "<html></html>", 200)
 
 
+class RediscoveryTransport(FakeTransport):
+    pass
+
+
 class PartialOddsTransport(FakeTransport):
     async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:
         self.match_odds_calls += 1
@@ -439,6 +443,38 @@ async def test_run_once_backfills_empty_finalized_match_with_available_odds() ->
     assert transport.match_odds_calls == 1
     assert row["bookmaker_count"] == 2
     assert row["last_capture_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_run_once_backfills_empty_finalized_match_even_when_rediscovered() -> None:
+    now = datetime(2026, 5, 1, 18, 0)
+    kickoff = now - timedelta(hours=2)
+    db_path = Path("data/test_tmp/capture_empty_finalized_rediscovered.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    database = Database(db_path)
+    transport = RediscoveryTransport(kickoff)
+    service = CaptureService(_settings(db_path), database, transport)
+    match_id = database.upsert_match(
+        DiscoveredMatch(
+            event_id="abc12345",
+            source_url="https://www.betexplorer.com/football/test-league/home-away/abc12345/",
+            league="Test League",
+            home_team="Home",
+            away_team="Away",
+            kickoff_time=kickoff,
+            timing_status=TimingStatus.UNKNOWN,
+        )
+    )
+    database.update_match_schedule(match_id, "FINALIZED", None, now - timedelta(minutes=30))
+
+    result = await service.run_once(now=now)
+    row = service.database.list_matches()[0]
+
+    assert result["due"] == 1
+    assert result["captured"] == 1
+    assert transport.match_odds_calls == 1
+    assert row["bookmaker_count"] == 2
 
 
 @pytest.mark.asyncio

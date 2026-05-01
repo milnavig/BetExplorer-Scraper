@@ -49,6 +49,7 @@ class CaptureService:
         self._run_lock = asyncio.Lock()
         self._last_discovery_at: datetime | None = None
         self._markets_cache: dict[str, tuple[datetime, list[str]]] = {}
+        self._match_page_cache: dict[str, tuple[datetime, str]] = {}
         self._progress: dict[str, Any] = self._idle_progress()
 
     def progress_status(self) -> dict[str, Any]:
@@ -162,6 +163,7 @@ class CaptureService:
             self._set_progress(due=due, queued=len(capture_jobs), skipped=skipped, finalized=finalized, waiting=waiting)
 
         for match in matches:
+            await self._enrich_kickoff_from_match_page_if_needed(match, now)
             match.timing_status = classify_timing(
                 match.kickoff_time,
                 now,
@@ -187,8 +189,6 @@ class CaptureService:
                 self.settings.result_capture_lookback_hours,
                 self.settings.result_backfill_batch_size,
             ):
-                if match_id in seen_match_ids:
-                    continue
                 due += 1
                 capture_jobs.append((match_id, match.event_id, match.source_url, None, "FINALIZING", now))
             self._set_progress(due=due, queued=len(capture_jobs))
@@ -333,6 +333,7 @@ class CaptureService:
             checked_at = utc_now()
             try:
                 page = await self.transport.fetch_match_page(match.source_url)
+                self._cache_match_page(match.source_url, page.text)
                 finished, score = self.discovery_parser.parse_match_page_result(page.text)
                 if finished and score:
                     captured += 1 if self.database.mark_result_captured(match_id, score, checked_at) else 0
@@ -348,6 +349,41 @@ class CaptureService:
                 )
             self._set_progress(results_checked=checked, results_captured=captured)
         return checked, captured
+
+    async def _enrich_kickoff_from_match_page_if_needed(self, match: DiscoveredMatch, now: datetime) -> None:
+        if not match.kickoff_time:
+            return
+        if abs((match.kickoff_time - now).total_seconds()) > (self.odds_capture_window_minutes + 180) * 60:
+            return
+        try:
+            html = await self._fetch_match_page_cached(match.source_url)
+            kickoff = self.discovery_parser.parse_match_page_start_time(html, self.settings.betexplorer_timezone_offset)
+        except Exception as exc:
+            self.database.log("warning", "capture", "kickoff_enrichment_failed", match.event_id, {"error": str(exc)})
+            return
+        if not kickoff:
+            return
+        if abs((kickoff - match.kickoff_time).total_seconds()) >= 60:
+            self.database.log(
+                "info",
+                "capture",
+                "kickoff_time_corrected",
+                match.event_id,
+                {"from": match.kickoff_time.isoformat(), "to": kickoff.isoformat()},
+            )
+            match.kickoff_time = kickoff
+
+    async def _fetch_match_page_cached(self, source_url: str) -> str:
+        now = utc_now()
+        cached = self._match_page_cache.get(source_url)
+        if cached and cached[0] > now:
+            return cached[1]
+        page = await self.transport.fetch_match_page(source_url)
+        self._cache_match_page(source_url, page.text)
+        return page.text
+
+    def _cache_match_page(self, source_url: str, html: str) -> None:
+        self._match_page_cache[source_url] = (utc_now() + timedelta(seconds=self.settings.market_discovery_cache_seconds), html)
 
     async def capture_match(self, match_id: str, event_id: str, source_url: str) -> bool:
         markets = await self._markets_for_match(source_url)
@@ -408,8 +444,8 @@ class CaptureService:
         if cached and cached[0] > now:
             return cached[1]
         try:
-            page = await self.transport.fetch_match_page(source_url)
-            markets = self.odds_parser.parse_available_markets(page.text)
+            html = await self._fetch_match_page_cached(source_url)
+            markets = self.odds_parser.parse_available_markets(html)
             resolved = markets or ["1x2"]
             expires_at = now + timedelta(seconds=self.settings.market_discovery_cache_seconds)
             self._markets_cache[source_url] = (expires_at, resolved)

@@ -60,8 +60,14 @@ class Scheduler:
             return CaptureDecision("FINALIZED", False, None, now)
 
         phase = "FINALIZING" if now > match.kickoff_time or match.timing_status == TimingStatus.LIVE else "MONITORING"
-        due = next_capture_at is None or next_capture_at <= now
-        return CaptureDecision(phase, due, now + interval if due else next_capture_at)
+        stale_next_capture = next_capture_at is not None and next_capture_at > final_end
+        due = next_capture_at is None or next_capture_at <= now or stale_next_capture
+        if not due:
+            return CaptureDecision(phase, False, next_capture_at)
+        planned_next_capture = now + interval
+        if planned_next_capture > final_end:
+            planned_next_capture = final_end
+        return CaptureDecision(phase, True, planned_next_capture)
 
     def _capture_interval(self, kickoff_time: datetime, now: datetime) -> timedelta:
         fast_window_start = kickoff_time - timedelta(minutes=self.config.final_capture_fast_window_minutes)

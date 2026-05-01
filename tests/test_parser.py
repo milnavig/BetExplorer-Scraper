@@ -97,3 +97,15 @@ def test_parse_finished_match_page_result() -> None:
 
     assert finished is True
     assert score == "5:2"
+
+
+def test_parse_match_page_start_time_converts_to_configured_timezone() -> None:
+    html = """
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"SportsEvent","startDate":"2026-05-01T21:00:00+02:00"}
+    </script>
+    """
+
+    kickoff = DiscoveryParser().parse_match_page_start_time(html, "+3")
+
+    assert kickoff == datetime(2026, 5, 1, 22, 0)

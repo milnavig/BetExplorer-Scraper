@@ -238,6 +238,13 @@ class Database:
         )
 
     @_locked
+    def update_match_kickoff_time(self, match_id: str, kickoff_time: datetime) -> None:
+        self.connection.execute(
+            "UPDATE matches SET kickoff_time = ?, updated_at = ? WHERE id = ?",
+            [kickoff_time, utc_now(), match_id],
+        )
+
+    @_locked
     def list_result_backfill_candidates(
         self,
         now: datetime,
