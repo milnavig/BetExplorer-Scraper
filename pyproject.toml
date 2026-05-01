@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "betexplorer-scraper"
 version = "0.1.0"
-description = "API-first BetExplorer final odds capture with local monitoring API"
+description = "BetExplorer odds and results capture with local monitoring API"
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12.0",

@@ -83,7 +83,26 @@ def test_recently_started_match_enters_finalizing_phase() -> None:
 
 def test_match_is_finalized_after_post_kickoff_capture_window() -> None:
     now = datetime(2026, 4, 28, 16, 0)
-    decision = _scheduler().plan(_match(now - timedelta(minutes=6)), now)
+    decision = _scheduler().plan(_match(now - timedelta(minutes=6)), now, last_capture_at=now - timedelta(minutes=3))
+
+    assert decision.phase == "FINALIZED"
+    assert decision.should_capture is False
+    assert decision.finalized_at == now
+
+
+def test_late_match_without_previous_capture_gets_one_recovery_capture() -> None:
+    now = datetime(2026, 4, 28, 16, 0)
+    decision = _scheduler().plan(_match(now - timedelta(minutes=40)), now, last_capture_at=None)
+
+    assert decision.phase == "FINALIZING"
+    assert decision.should_capture is True
+    assert decision.next_capture_at is None
+    assert decision.finalized_at == now
+
+
+def test_late_match_with_previous_capture_is_finalized() -> None:
+    now = datetime(2026, 4, 28, 16, 0)
+    decision = _scheduler().plan(_match(now - timedelta(minutes=40)), now, last_capture_at=now - timedelta(minutes=35))
 
     assert decision.phase == "FINALIZED"
     assert decision.should_capture is False

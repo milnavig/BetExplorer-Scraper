@@ -92,6 +92,42 @@ class PartialOddsTransport(FakeTransport):
         return RawResponse("https://www.betexplorer.com/match-odds/abc12345/0/1x2/bestOdds/?lang=en", json.dumps({"odds": html}), 200)
 
 
+class FinishedResultTransport(FakeTransport):
+    async def fetch_homepage(self) -> RawResponse:
+        return RawResponse("https://www.betexplorer.com/", "<html></html>", 200)
+
+    async def fetch_football_date(self, target_date: date) -> RawResponse:
+        dt = f"{self.kickoff.day},{self.kickoff.month},{self.kickoff.year},{self.kickoff.hour},{self.kickoff.minute:02d}"
+        html = f"""
+        <table>
+          <tr class="js-tournament">
+            <th colspan="2"><a class="table-main__tournament" href="/football/test/">Test Country: Test League</a></th>
+          </tr>
+          <tr data-dt="{dt}">
+            <td>
+              <span class="table-main__time">{self.kickoff.hour:02d}:{self.kickoff.minute:02d}</span>
+              <a href="/football/test-league/home-away/abc12345/">Home - Away</a>
+              <span class="table-main__result">2:1</span>
+            </td>
+          </tr>
+        </table>
+        """
+        return RawResponse("https://www.betexplorer.com/football/", html, 200)
+
+
+class MatchPageResultTransport(NoDiscoveryTransport):
+    async def fetch_match_page(self, match_url: str) -> RawResponse:
+        html = """
+        <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"SportsEvent","eventStatus":"Finished"}
+        </script>
+        <div class="list-details">
+          <p class="list-details__item__score">5:2</p>
+        </div>
+        """
+        return RawResponse(match_url, html, 200)
+
+
 def _settings(db_path: Path) -> Settings:
     return Settings(
         database_path=db_path,
@@ -107,6 +143,7 @@ def _settings(db_path: Path) -> Settings:
         discovery_poll_interval_seconds=60,
         max_retries_per_match=1,
         capture_market="1x2",
+        result_backfill_batch_size=50,
     )
 
 
@@ -121,16 +158,26 @@ async def test_run_once_discovers_far_future_match_without_fetching_odds() -> No
     db_path = Path("data/test_tmp/capture_far.duckdb")
     if db_path.exists():
         db_path.unlink()
-    transport = FakeTransport(now + timedelta(hours=2))
+    transport = FakeTransport(now + timedelta(hours=7))
     service = CaptureService(_settings(db_path), Database(db_path), transport)
 
     result = await service.run_once(now=now)
     row = service.database.list_matches()[0]
 
-    assert result == {"discovered": 1, "due": 0, "captured": 0, "failed": 0, "skipped": 1, "finalized": 0, "waiting": 1}
+    assert result == {
+        "discovered": 1,
+        "due": 0,
+        "captured": 0,
+        "failed": 0,
+        "skipped": 1,
+        "finalized": 0,
+        "waiting": 1,
+        "results_captured": 0,
+        "results_checked": 0,
+    }
     assert transport.match_odds_calls == 0
     assert row["capture_phase"] == "WAITING"
-    assert row["next_capture_at"] == (now + timedelta(hours=2) - timedelta(minutes=30)).isoformat()
+    assert row["next_capture_at"] == (now + timedelta(hours=7) - timedelta(hours=6)).isoformat()
 
 
 @pytest.mark.asyncio
@@ -145,7 +192,17 @@ async def test_run_once_fetches_odds_when_match_is_due() -> None:
     result = await service.run_once(now=now)
     row = service.database.list_matches()[0]
 
-    assert result == {"discovered": 1, "due": 1, "captured": 1, "failed": 0, "skipped": 0, "finalized": 0, "waiting": 0}
+    assert result == {
+        "discovered": 1,
+        "due": 1,
+        "captured": 1,
+        "failed": 0,
+        "skipped": 0,
+        "finalized": 0,
+        "waiting": 0,
+        "results_captured": 0,
+        "results_checked": 0,
+    }
     assert transport.match_odds_calls == 1
     assert row["capture_phase"] == "MONITORING"
     assert row["last_capture_at"] is not None
@@ -185,12 +242,22 @@ async def test_run_once_discovers_future_date_table_rows() -> None:
     row = service.database.list_matches()[0]
     status = service.database.status(now=now)
 
-    assert result == {"discovered": 1, "due": 0, "captured": 0, "failed": 0, "skipped": 1, "finalized": 0, "waiting": 1}
+    assert result == {
+        "discovered": 1,
+        "due": 0,
+        "captured": 0,
+        "failed": 0,
+        "skipped": 1,
+        "finalized": 0,
+        "waiting": 1,
+        "results_captured": 0,
+        "results_checked": 0,
+    }
     assert transport.match_odds_calls == 0
     assert row["league"] == "Test Country: Test League"
     assert row["capture_phase"] == "WAITING"
-    assert row["next_capture_at"] == "2026-04-29T22:30:00"
-    assert status["next_capture"] == "2026-04-29T22:30:00"
+    assert row["next_capture_at"] == "2026-04-29T17:00:00"
+    assert status["next_capture"] == "2026-04-29T17:00:00"
 
 
 @pytest.mark.asyncio
@@ -226,7 +293,7 @@ async def test_run_once_uses_homepage_visible_local_time() -> None:
     row = service.database.list_matches()[0]
 
     assert row["kickoff_time"] == "2026-04-29T23:00:00"
-    assert row["next_capture_at"] == "2026-04-29T22:30:00"
+    assert row["next_capture_at"] == "2026-04-29T17:00:00"
 
 
 @pytest.mark.asyncio
@@ -289,7 +356,17 @@ async def test_run_once_captures_stored_due_match_missing_from_discovery() -> No
     result = await service.run_once(now=now)
     row = service.database.list_matches()[0]
 
-    assert result == {"discovered": 0, "due": 1, "captured": 1, "failed": 0, "skipped": 0, "finalized": 0, "waiting": 0}
+    assert result == {
+        "discovered": 0,
+        "due": 1,
+        "captured": 1,
+        "failed": 0,
+        "skipped": 0,
+        "finalized": 0,
+        "waiting": 0,
+        "results_captured": 0,
+        "results_checked": 0,
+    }
     assert transport.match_odds_calls == 1
     assert row["capture_phase"] == "MONITORING"
     assert row["bookmaker_count"] == 2
@@ -322,8 +399,102 @@ async def test_run_once_finalizes_stored_match_after_capture_window_when_missing
     result = await service.run_once(now=now)
     row = service.database.list_matches()[0]
 
-    assert result == {"discovered": 0, "due": 0, "captured": 0, "failed": 0, "skipped": 1, "finalized": 1, "waiting": 0}
-    assert transport.match_odds_calls == 0
-    assert row["capture_phase"] == "FINALIZED"
+    assert result["due"] == 1
+    assert result["captured"] == 1
+    assert transport.match_odds_calls == 1
+    assert row["capture_phase"] == "FINALIZING"
     assert row["next_capture_at"] is None
     assert row["finalized_at"] == now.isoformat()
+    assert row["bookmaker_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_run_once_backfills_empty_finalized_match_with_available_odds() -> None:
+    now = datetime(2026, 5, 1, 18, 0)
+    kickoff = now - timedelta(hours=2)
+    db_path = Path("data/test_tmp/capture_empty_finalized_odds_backfill.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    database = Database(db_path)
+    transport = NoDiscoveryTransport(kickoff)
+    service = CaptureService(_settings(db_path), database, transport)
+    match_id = database.upsert_match(
+        DiscoveredMatch(
+            event_id="abc12345",
+            source_url="https://www.betexplorer.com/football/test-league/home-away/abc12345/",
+            league="Test League",
+            home_team="Home",
+            away_team="Away",
+            kickoff_time=kickoff,
+            timing_status=TimingStatus.UNKNOWN,
+        )
+    )
+    database.update_match_schedule(match_id, "FINALIZED", None, now - timedelta(minutes=30))
+
+    result = await service.run_once(now=now)
+    row = service.database.list_matches()[0]
+
+    assert result["due"] == 1
+    assert result["captured"] == 1
+    assert transport.match_odds_calls == 1
+    assert row["bookmaker_count"] == 2
+    assert row["last_capture_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_run_once_captures_finished_result_once() -> None:
+    now = datetime(2026, 4, 28, 16, 0)
+    kickoff = now - timedelta(hours=3)
+    db_path = Path("data/test_tmp/capture_result_once.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    transport = FinishedResultTransport(kickoff)
+    service = CaptureService(_settings(db_path), Database(db_path), transport)
+
+    first = await service.run_once(now=now)
+    second = await service.run_once(now=now + timedelta(minutes=1))
+    row = service.database.list_matches()[0]
+    status = service.database.status(now=now)
+
+    assert first["results_captured"] == 1
+    assert second["results_captured"] == 0
+    assert row["status"] == "finished"
+    assert row["timing_status"] == "FINISHED"
+    assert row["live_score"] == "2:1"
+    assert row["result_captured_at"] is not None
+    assert status["result_captured_matches"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_backfills_result_from_match_page_for_stored_match() -> None:
+    now = datetime(2026, 5, 1, 18, 0)
+    kickoff = now - timedelta(days=2)
+    db_path = Path("data/test_tmp/capture_result_backfill.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    database = Database(db_path)
+    transport = MatchPageResultTransport(kickoff)
+    service = CaptureService(_settings(db_path), database, transport)
+    match_id = database.upsert_match(
+        DiscoveredMatch(
+            event_id="abc12345",
+            source_url="https://www.betexplorer.com/football/test-league/home-away/abc12345/",
+            league="Test League",
+            home_team="Home",
+            away_team="Away",
+            kickoff_time=kickoff,
+            timing_status=TimingStatus.UNKNOWN,
+            status="scheduled",
+        )
+    )
+    database.update_match_schedule(match_id, "FINALIZED", None, now - timedelta(days=1))
+
+    result = await service.run_once(now=now)
+    row = service.database.list_matches()[0]
+
+    assert result["results_checked"] == 1
+    assert result["results_captured"] == 1
+    assert row["status"] == "finished"
+    assert row["timing_status"] == "FINISHED"
+    assert row["live_score"] == "5:2"
+    assert row["result_captured_at"] is not None

@@ -39,6 +39,7 @@ class DiscoveredMatch:
     live_score: str | None = None
     capture_phase: str | None = None
     finalized_at: datetime | None = None
+    result_captured_at: datetime | None = None
 
 
 @dataclass(slots=True)

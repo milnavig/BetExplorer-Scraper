@@ -9,12 +9,13 @@ import {
   Play,
   RefreshCcw,
   Search,
-  Table2
+  Table2,
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
 
 type Status = {
@@ -33,6 +34,7 @@ type Status = {
   missed_finalized_matches: number;
   capture_missed_matches: number;
   skipped_out_of_window_matches: number;
+  result_captured_matches: number;
   last_capture: string | null;
   last_run: string | null;
   next_run: string | null;
@@ -44,6 +46,9 @@ type Status = {
   final_capture_fast_window_minutes: number;
   discovery_poll_interval_seconds: number;
   upcoming_window_minutes: number;
+  odds_capture_lookahead_hours: number;
+  result_capture_lookback_hours: number;
+  result_finish_grace_minutes: number;
   max_concurrent_captures: number;
   max_concurrent_markets_per_match: number;
   market_discovery_cache_seconds: number;
@@ -76,6 +81,8 @@ type CaptureProgress = {
   skipped: number;
   finalized: number;
   waiting: number;
+  results_captured: number;
+  results_checked: number;
   current_event_id: string | null;
   last_error: string | null;
   last_discovery_at: string | null;
@@ -97,6 +104,7 @@ type MatchRow = {
   next_capture_at: string | null;
   last_capture_at: string | null;
   finalized_at: string | null;
+  result_captured_at: string | null;
   snapshot_id: string | null;
   quality_status: string | null;
   captured_at: string | null;
@@ -214,6 +222,8 @@ type CaptureRunResult = {
   skipped: number;
   finalized: number;
   waiting: number;
+  results_captured: number;
+  results_checked: number;
 };
 
 type MatchFilter =
@@ -229,14 +239,27 @@ type MatchFilter =
   | "due"
   | "finalized"
   | "new";
-type SortMode = "capture_desc" | "kickoff_asc" | "bookmakers_desc" | "attempts_desc";
-type ProgressState = { label: string; value: number; detail: string; tone?: "good" | "warn" | "bad" | "idle" };
-type SchedulerState = { className: "active" | "idle" | "stale"; label: string; detail: string };
+type SortMode =
+  | "capture_desc"
+  | "kickoff_asc"
+  | "bookmakers_desc"
+  | "attempts_desc";
+type ProgressState = {
+  label: string;
+  value: number;
+  detail: string;
+  tone?: "good" | "warn" | "bad" | "idle";
+};
+type SchedulerState = {
+  className: "active" | "idle" | "stale";
+  label: string;
+  detail: string;
+};
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) }
+    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
@@ -264,20 +287,32 @@ export default function Dashboard() {
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const selectedIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   const load = async () => {
     setError(null);
     try {
-      const [nextStatus, nextMatches, nextSnapshots, nextAttempts, nextLogs, nextBookmakers, nextExports] =
-        await Promise.all([
-          api<Status>("/api/status"),
-          api<MatchRow[]>("/api/matches"),
-          api<SnapshotRow[]>("/api/snapshots"),
-          api<AttemptRow[]>("/api/attempts"),
-          api<LogRow[]>("/api/logs"),
-          api<BookmakerCoverage[]>("/api/bookmakers"),
-          api<ExportFile[]>("/api/exports")
-        ]);
+      const [
+        nextStatus,
+        nextMatches,
+        nextSnapshots,
+        nextAttempts,
+        nextLogs,
+        nextBookmakers,
+        nextExports,
+      ] = await Promise.all([
+        api<Status>("/api/status"),
+        api<MatchRow[]>("/api/matches"),
+        api<SnapshotRow[]>("/api/snapshots"),
+        api<AttemptRow[]>("/api/attempts"),
+        api<LogRow[]>("/api/logs"),
+        api<BookmakerCoverage[]>("/api/bookmakers"),
+        api<ExportFile[]>("/api/exports"),
+      ]);
       setStatus(nextStatus);
       setMatches(nextMatches);
       setSnapshots(nextSnapshots);
@@ -285,11 +320,18 @@ export default function Dashboard() {
       setLogs(nextLogs);
       setBookmakers(nextBookmakers);
       setExports(nextExports);
-      if ((!selectedId || !nextMatches.some((match) => match.id === selectedId)) && nextMatches.length > 0) {
-        setSelectedId((nextMatches.find((match) => match.bookmaker_count > 0) ?? nextMatches[0]).id);
+      const currentSelectedId = selectedIdRef.current;
+      if ((!currentSelectedId || !nextMatches.some((match) => match.id === currentSelectedId)) && nextMatches.length > 0) {
+        const nextSelectedId = (nextMatches.find((match) => match.bookmaker_count > 0) ?? nextMatches[0]).id;
+        selectedIdRef.current = nextSelectedId;
+        setSelectedId(nextSelectedId);
       }
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Failed to load API data");
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Failed to load API data",
+      );
     }
   };
 
@@ -314,7 +356,13 @@ export default function Dashboard() {
       .then((nextDetail) => {
         if (active) setDetail(nextDetail);
       })
-      .catch((nextError) => setError(nextError instanceof Error ? nextError.message : "Failed to load match detail"));
+      .catch((nextError) =>
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Failed to load match detail",
+        ),
+      );
     return () => {
       active = false;
     };
@@ -329,16 +377,33 @@ export default function Dashboard() {
         (matchFilter === "req_full" && match.quality_status === "COMPLETE") ||
         (matchFilter === "req_partial" && match.quality_status === "PARTIAL") ||
         (matchFilter === "req_missing" && match.quality_status === "FAILED") ||
-        (matchFilter === "missing_bwin" && match.bookmaker_count > 0 && !match.has_bwin) ||
-        (matchFilter === "missing_unibet" && match.bookmaker_count > 0 && !match.has_unibet) ||
-        (matchFilter === "capture_miss" && Boolean(match.finalized_at) && match.bookmaker_count === 0 && match.attempt_count > 0) ||
-        (matchFilter === "skipped_old" && Boolean(match.finalized_at) && match.bookmaker_count === 0 && match.attempt_count === 0) ||
+        (matchFilter === "missing_bwin" &&
+          match.bookmaker_count > 0 &&
+          !match.has_bwin) ||
+        (matchFilter === "missing_unibet" &&
+          match.bookmaker_count > 0 &&
+          !match.has_unibet) ||
+        (matchFilter === "capture_miss" &&
+          Boolean(match.finalized_at) &&
+          match.bookmaker_count === 0 &&
+          match.attempt_count > 0) ||
+        (matchFilter === "skipped_old" &&
+          Boolean(match.finalized_at) &&
+          match.bookmaker_count === 0 &&
+          match.attempt_count === 0) ||
         (matchFilter === "due" && Boolean(match.next_capture_at)) ||
         (matchFilter === "finalized" && Boolean(match.finalized_at)) ||
         (matchFilter === "new" && !match.quality_status);
       const queryOk =
         !query ||
-        [match.league, match.home_team, match.away_team, match.event_id, qualityLabel(match.quality_status), displayTiming(match)]
+        [
+          match.league,
+          match.home_team,
+          match.away_team,
+          match.event_id,
+          qualityLabel(match.quality_status),
+          displayTiming(match),
+        ]
           .filter(Boolean)
           .join(" ")
           .toLowerCase()
@@ -346,9 +411,12 @@ export default function Dashboard() {
       return stateOk && queryOk;
     });
     return visible.sort((left, right) => {
-      if (sortMode === "kickoff_asc") return timestamp(left.kickoff_time) - timestamp(right.kickoff_time);
-      if (sortMode === "bookmakers_desc") return right.bookmaker_count - left.bookmaker_count;
-      if (sortMode === "attempts_desc") return right.attempt_count - left.attempt_count;
+      if (sortMode === "kickoff_asc")
+        return timestamp(left.kickoff_time) - timestamp(right.kickoff_time);
+      if (sortMode === "bookmakers_desc")
+        return right.bookmaker_count - left.bookmaker_count;
+      if (sortMode === "attempts_desc")
+        return right.attempt_count - left.attempt_count;
       return timestamp(right.captured_at) - timestamp(left.captured_at);
     });
   }, [matches, matchFilter, matchQuery, sortMode]);
@@ -357,10 +425,19 @@ export default function Dashboard() {
     const rows = detail?.bookmaker_odds ?? [];
     const query = bookmakerQuery.trim().toLowerCase();
     return rows.filter((row) => {
-      const requiredOk = !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
+      const requiredOk =
+        !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
       const queryOk =
         !query ||
-        [row.market, marketLabel(row.market), marketLine(row), row.bookmaker, row.normalized_bookmaker, row.bookmaker_id, row.betexplorer_bookmaker_id]
+        [
+          row.market,
+          marketLabel(row.market),
+          marketLine(row),
+          row.bookmaker,
+          row.normalized_bookmaker,
+          row.bookmaker_id,
+          row.betexplorer_bookmaker_id,
+        ]
           .filter(Boolean)
           .join(" ")
           .toLowerCase()
@@ -369,23 +446,31 @@ export default function Dashboard() {
     });
   }, [bookmakerQuery, detail, requiredOnly]);
 
-  const selectedMatch = detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
+  const selectedMatch =
+    detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
   const latestExport = exports[0];
   const progressItems = useMemo(
     () => buildProgress(status, selectedMatch, nowMs),
-    [nowMs, selectedMatch, status]
+    [nowMs, selectedMatch, status],
   );
-  const schedulerStateValue = useMemo(() => schedulerState(status, nowMs), [nowMs, status]);
+  const schedulerStateValue = useMemo(
+    () => schedulerState(status, nowMs),
+    [nowMs, status],
+  );
 
   const runCapture = () => {
     startTransition(async () => {
       setError(null);
       try {
-        const result = await api<CaptureRunResult>("/api/capture/run-once", { method: "POST" });
+        const result = await api<CaptureRunResult>("/api/capture/run-once", {
+          method: "POST",
+        });
         setLastRun(result);
         await load();
       } catch (nextError) {
-        setError(nextError instanceof Error ? nextError.message : "Capture failed");
+        setError(
+          nextError instanceof Error ? nextError.message : "Capture failed",
+        );
       }
     });
   };
@@ -396,12 +481,14 @@ export default function Dashboard() {
       try {
         const result = await api<ExportResult>("/api/exports/final-odds", {
           method: "POST",
-          body: JSON.stringify({ format })
+          body: JSON.stringify({ format }),
         });
         window.location.assign(`${API_BASE}${result.download_url}`);
         await load();
       } catch (nextError) {
-        setError(nextError instanceof Error ? nextError.message : "Export failed");
+        setError(
+          nextError instanceof Error ? nextError.message : "Export failed",
+        );
       }
     });
   };
@@ -413,31 +500,68 @@ export default function Dashboard() {
           <span className="brand-mark">BE</span>
           <div>
             <h1>BetExplorer Monitor</h1>
-            <p>API-first 1X2 capture</p>
           </div>
         </div>
         <nav className="nav">
           <a href="#overview">Overview</a>
           <a href="#matches">Matches</a>
           <a href="#detail">Detail</a>
-          <a href={selectedMatch ? `/match?id=${encodeURIComponent(selectedMatch.id)}` : "#detail"}>Match page</a>
+          <a
+            href={
+              selectedMatch
+                ? `/match?id=${encodeURIComponent(selectedMatch.id)}`
+                : "#detail"
+            }
+          >
+            Match page
+          </a>
           <a href="#odds">Odds</a>
           <a href="#attempts">Attempts</a>
           <a href="#exports">Exports</a>
         </nav>
         <div className="side-note">
           <span>Last run</span>
-          <strong title={tooltipFor("Last run")}>{formatUtcDate(status?.last_run, true)}</strong>
+          <strong title={tooltipFor("Last run")}>
+            {formatUtcDate(status?.last_run, true)}
+          </strong>
           <small title={tooltipFor("Next run")}>
-            Next run {status?.capture_progress?.running ? "after current cycle" : formatUtcDate(status?.next_run, true)}
+            Next run{" "}
+            {status?.capture_progress?.running
+              ? "after current cycle"
+              : formatUtcDate(status?.next_run, true)}
           </small>
-          <small title={tooltipFor("Next capture")}>Next capture {formatScheduleDate(status?.next_capture, true)}</small>
-          <small title={tooltipFor("Last odds")}>Last odds {formatUtcDate(status?.last_capture, true)}</small>
-          <small title={tooltipFor("Discovery")}>Discovery {formatScheduleDate(status?.capture_progress?.next_discovery_at, true)}</small>
-          <small title={tooltipFor("Browser TZ")}>Browser TZ {clientTimezone}</small>
-          <small title={tooltipFor("BetExplorer TZ")}>BetExplorer TZ UTC{status?.betexplorer_timezone_offset ?? "-"}</small>
-          <small>{latestExport ? `Latest export ${latestExport.filename}` : "No exports yet"}</small>
-          <span className={`scheduler-state ${schedulerStateValue.className}`} title={schedulerStateValue.detail}>
+          <small title={tooltipFor("Next capture")}>
+            Next capture {formatScheduleDate(status?.next_capture, true)}
+          </small>
+          <small title={tooltipFor("Last odds")}>
+            Last odds {formatUtcDate(status?.last_capture, true)}
+          </small>
+          <small title={tooltipFor("Discovery")}>
+            Discovery{" "}
+            {formatScheduleDate(
+              status?.capture_progress?.next_discovery_at,
+              true,
+            )}
+          </small>
+          <small title={tooltipFor("Browser TZ")}>
+            Browser TZ {clientTimezone}
+          </small>
+          <small title={tooltipFor("BetExplorer TZ")}>
+            BetExplorer TZ UTC{status?.betexplorer_timezone_offset ?? "-"}
+          </small>
+          <small title={tooltipFor("Result capture")}>
+            Results {status?.result_captured_matches ?? 0} /{" "}
+            {status?.result_capture_lookback_hours ?? "-"}h lookback
+          </small>
+          <small>
+            {latestExport
+              ? `Latest export ${latestExport.filename}`
+              : "No exports yet"}
+          </small>
+          <span
+            className={`scheduler-state ${schedulerStateValue.className}`}
+            title={schedulerStateValue.detail}
+          >
             {schedulerStateValue.label}
           </span>
           <div className="side-progress">
@@ -458,19 +582,35 @@ export default function Dashboard() {
             </h2>
           </div>
           <div className="actions">
-            <button onClick={() => void load()} disabled={isPending} title="Refresh data">
+            <button
+              onClick={() => void load()}
+              disabled={isPending}
+              title="Refresh data"
+            >
               <RefreshCcw className="refresh-icon" size={16} />
               Refresh
             </button>
-            <button onClick={runCapture} disabled={isPending} title="Run one capture cycle">
+            <button
+              onClick={runCapture}
+              disabled={isPending}
+              title="Run one capture cycle"
+            >
               <Play size={16} />
               Run once
             </button>
-            <button onClick={() => exportOdds("csv")} disabled={isPending} title="Export CSV">
+            <button
+              onClick={() => exportOdds("csv")}
+              disabled={isPending}
+              title="Export CSV"
+            >
               <Download size={16} />
               CSV
             </button>
-            <button onClick={() => exportOdds("xlsx")} disabled={isPending} title="Export Excel">
+            <button
+              onClick={() => exportOdds("xlsx")}
+              disabled={isPending}
+              title="Export Excel"
+            >
               <Download size={16} />
               XLSX
             </button>
@@ -488,30 +628,67 @@ export default function Dashboard() {
             <span>skipped {lastRun.skipped}</span>
             <span>finalized {lastRun.finalized}</span>
             <span>waiting {lastRun.waiting}</span>
+            <span>results {lastRun.results_captured}</span>
+            <span>result checks {lastRun.results_checked}</span>
           </div>
         ) : null}
 
         <section className="metrics" id="overview">
           <Metric label="Matches" value={status?.matches} />
-          <Metric label="Captured" value={status?.captured_matches} tone="good" />
-          <Metric label="Capture miss" value={status?.capture_missed_matches} tone="bad" />
-          <Metric label="Skipped old" value={status?.skipped_out_of_window_matches} />
+          <Metric
+            label="Captured"
+            value={status?.captured_matches}
+            tone="good"
+          />
+          <Metric
+            label="Capture miss"
+            value={status?.capture_missed_matches}
+            tone="bad"
+          />
+          <Metric
+            label="Skipped old"
+            value={status?.skipped_out_of_window_matches}
+          />
           <Metric label="Due now" value={status?.due_matches} tone="warn" />
+          <Metric label="Results" value={status?.result_captured_matches} />
           <Metric label="Final snapshots" value={status?.snapshots} />
           <Metric label="Attempts" value={status?.snapshot_attempts} />
           <Metric label="Bookmaker rows" value={status?.bookmaker_rows} />
           <Metric label="Row attempts" value={status?.bookmaker_row_attempts} />
-          <Metric label="Req complete" value={status?.complete_snapshots} tone="good" />
-          <Metric label="Req partial" value={status?.partial_snapshots} tone="warn" />
-          <Metric label="Req missing" value={status?.failed_snapshots} tone="bad" />
+          <Metric
+            label="Req complete"
+            value={status?.complete_snapshots}
+            tone="good"
+          />
+          <Metric
+            label="Req partial"
+            value={status?.partial_snapshots}
+            tone="warn"
+          />
+          <Metric
+            label="Req missing"
+            value={status?.failed_snapshots}
+            tone="bad"
+          />
           <Metric label="Bookmakers" value={bookmakers.length} />
-          <Metric label="Poll seconds" value={status?.final_capture_poll_interval_seconds} />
+          <Metric
+            label="Poll seconds"
+            value={status?.final_capture_poll_interval_seconds}
+          />
           <Metric label="Concurrency" value={status?.max_concurrent_captures} />
         </section>
 
         <section className="coverage-strip">
           {bookmakers.slice(0, 12).map((bookmaker) => (
-            <div className={REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker) ? "coverage required" : "coverage"} key={bookmaker.normalized_bookmaker} title={`${bookmaker.bookmaker}: seen in ${bookmaker.matches} matches and ${bookmaker.rows} final odds rows.`}>
+            <div
+              className={
+                REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker)
+                  ? "coverage required"
+                  : "coverage"
+              }
+              key={bookmaker.normalized_bookmaker}
+              title={`${bookmaker.bookmaker}: seen in ${bookmaker.matches} matches and ${bookmaker.rows} final odds rows.`}
+            >
               <span>{bookmaker.bookmaker}</span>
               <strong>{bookmaker.matches}</strong>
               <small>{formatUtcDate(bookmaker.last_seen)}</small>
@@ -524,11 +701,17 @@ export default function Dashboard() {
             <div className="panel-head">
               <div>
                 <h3>Matches</h3>
-                <p>{filteredMatches.length} visible of {matches.length}</p>
+                <p>
+                  {filteredMatches.length} visible of {matches.length}
+                </p>
               </div>
               <label className="search">
                 <Search size={15} />
-                <input value={matchQuery} onChange={(event) => setMatchQuery(event.target.value)} placeholder="Search teams, league, event" />
+                <input
+                  value={matchQuery}
+                  onChange={(event) => setMatchQuery(event.target.value)}
+                  placeholder="Search teams, league, event"
+                />
               </label>
             </div>
             <div className="filters">
@@ -547,30 +730,48 @@ export default function Dashboard() {
                   "skipped_old",
                   "due",
                   "finalized",
-                  "new"
+                  "new",
                 ]}
               />
               <SelectFilter
                 value={sortMode}
                 onChange={(value) => setSortMode(value as SortMode)}
-                options={["capture_desc", "kickoff_asc", "bookmakers_desc", "attempts_desc"]}
+                options={[
+                  "capture_desc",
+                  "kickoff_asc",
+                  "bookmakers_desc",
+                  "attempts_desc",
+                ]}
               />
             </div>
             <div className="match-list">
               {filteredMatches.map((match) => (
                 <button
                   key={match.id}
-                  className={match.id === selectedId ? "match-row selected" : "match-row"}
-                  onClick={() => setSelectedId(match.id)}
+                  className={
+                    match.id === selectedId ? "match-row selected" : "match-row"
+                  }
+                  onClick={() => {
+                    selectedIdRef.current = match.id;
+                    setSelectedId(match.id);
+                  }}
                 >
-                  <span className={`quality ${qualityClass(match.quality_status)}`}>{qualityLabel(match.quality_status)}</span>
+                  <span
+                    className={`quality ${qualityClass(match.quality_status)}`}
+                  >
+                    {qualityLabel(match.quality_status)}
+                  </span>
                   <span>
                     <strong>{match.home_team}</strong>
                     <small>{match.away_team}</small>
                   </span>
                   <span>
                     <em>{match.league ?? "Unknown league"}</em>
-                    <small>{formatScheduleDate(match.kickoff_time)} · {match.capture_phase ?? "DISCOVERED"} · {match.attempt_count} tries</small>
+                    <small>
+                      {formatScheduleDate(match.kickoff_time)} ·{" "}
+                      {match.capture_phase ?? "DISCOVERED"} ·{" "}
+                      {match.attempt_count} tries
+                    </small>
                   </span>
                   <span className="required-pair">
                     <Badge label="B" active={match.has_bwin} />
@@ -579,7 +780,9 @@ export default function Dashboard() {
                   <span className="count">{match.bookmaker_count}</span>
                 </button>
               ))}
-              {filteredMatches.length === 0 ? <p className="empty">No matches match the current filters.</p> : null}
+              {filteredMatches.length === 0 ? (
+                <p className="empty">No matches match the current filters.</p>
+              ) : null}
             </div>
           </div>
 
@@ -587,16 +790,28 @@ export default function Dashboard() {
             <div className="panel-head">
               <div>
                 <h3>Selected match</h3>
-                <p>{selectedMatch ? selectedMatch.event_id : "No match selected"}</p>
+                <p>
+                  {selectedMatch ? selectedMatch.event_id : "No match selected"}
+                </p>
               </div>
               <div className="toolbar">
                 {selectedMatch ? (
                   <>
-                    <a className="icon-link" href={`/match?id=${encodeURIComponent(selectedMatch.id)}`} title="Open full local match page">
+                    <a
+                      className="icon-link"
+                      href={`/match?id=${encodeURIComponent(selectedMatch.id)}`}
+                      title="Open full local match page"
+                    >
                       <Table2 size={16} />
                       Full page
                     </a>
-                    <a className="icon-link" href={selectedMatch.source_url} target="_blank" rel="noreferrer" title="Open BetExplorer match">
+                    <a
+                      className="icon-link"
+                      href={selectedMatch.source_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      title="Open BetExplorer match"
+                    >
                       <ExternalLink size={16} />
                     </a>
                   </>
@@ -608,24 +823,66 @@ export default function Dashboard() {
               <>
                 <div className="match-title">
                   <div>
-                    <strong>{selectedMatch.home_team} - {selectedMatch.away_team}</strong>
+                    <strong>
+                      {selectedMatch.home_team} - {selectedMatch.away_team}
+                    </strong>
                     <small>{selectedMatch.league ?? "Unknown league"}</small>
                   </div>
-                  <span className={`quality large ${qualityClass(selectedMatch.quality_status)}`}>{qualityLabel(selectedMatch.quality_status)}</span>
+                  <span
+                    className={`quality large ${qualityClass(selectedMatch.quality_status)}`}
+                  >
+                    {qualityLabel(selectedMatch.quality_status)}
+                  </span>
                 </div>
 
                 <div className="info-grid">
-                  <Info label="Kickoff" value={formatScheduleDate(selectedMatch.kickoff_time)} />
-                  <Info label="Capture phase" value={selectedMatch.capture_phase ?? "DISCOVERED"} />
+                  <Info
+                    label="Kickoff"
+                    value={formatScheduleDate(selectedMatch.kickoff_time)}
+                  />
+                  <Info
+                    label="Capture phase"
+                    value={selectedMatch.capture_phase ?? "DISCOVERED"}
+                  />
                   <Info label="Timing" value={displayTiming(selectedMatch)} />
-                  <Info label="Bookmakers" value={String(selectedMatch.bookmaker_count)} />
-                  <Info label="Required" value={requiredAvailability(selectedMatch)} />
-                  <Info label="Attempts" value={String(selectedMatch.attempt_count)} />
-                  <Info label="Next capture" value={formatScheduleDate(selectedMatch.next_capture_at)} />
-                  <Info label="Last capture" value={formatUtcDate(selectedMatch.last_capture_at)} />
-                  <Info label="Final snapshot age" value={formatAgeToKickoff(selectedMatch.final_snapshot_age_to_kickoff_seconds)} />
-                  <Info label="Finalized" value={formatScheduleDate(selectedMatch.finalized_at)} />
-                  <Info label="Live score" value={selectedMatch.live_score ?? "-"} />
+                  <Info
+                    label="Bookmakers"
+                    value={String(selectedMatch.bookmaker_count)}
+                  />
+                  <Info
+                    label="Required"
+                    value={requiredAvailability(selectedMatch)}
+                  />
+                  <Info
+                    label="Attempts"
+                    value={String(selectedMatch.attempt_count)}
+                  />
+                  <Info
+                    label="Next capture"
+                    value={formatScheduleDate(selectedMatch.next_capture_at)}
+                  />
+                  <Info
+                    label="Last capture"
+                    value={formatUtcDate(selectedMatch.last_capture_at)}
+                  />
+                  <Info
+                    label="Final snapshot age"
+                    value={formatAgeToKickoff(
+                      selectedMatch.final_snapshot_age_to_kickoff_seconds,
+                    )}
+                  />
+                  <Info
+                    label="Finalized"
+                    value={formatScheduleDate(selectedMatch.finalized_at)}
+                  />
+                  <Info
+                    label="Result captured"
+                    value={formatUtcDate(selectedMatch.result_captured_at)}
+                  />
+                  <Info
+                    label="Live score"
+                    value={selectedMatch.live_score ?? "-"}
+                  />
                 </div>
 
                 <div className="section-stack">
@@ -635,26 +892,37 @@ export default function Dashboard() {
                         <th>Captured</th>
                         <th>Quality</th>
                         <th>Final</th>
-                        <th>Rows</th>
+                        <th title={tooltipFor("Odds rows")}>Odds rows</th>
                         <th>To kickoff</th>
-                        <th>Raw payload</th>
                       </tr>
                     </thead>
                     <tbody>
                       {(detail?.snapshots ?? []).map((snapshot) => (
                         <tr key={snapshot.id}>
                           <td>{formatUtcDate(snapshot.captured_at)}</td>
-                          <td><span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span></td>
+                          <td>
+                            <span
+                              className={`quality ${qualityClass(snapshot.quality_status)}`}
+                            >
+                              {qualityLabel(snapshot.quality_status)}
+                            </span>
+                          </td>
                           <td>{snapshot.is_final ? "yes" : "no"}</td>
                           <td>{snapshot.bookmaker_count ?? "-"}</td>
-                          <td>{formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</td>
-                          <td><code>{snapshot.raw_payload_path ?? "-"}</code></td>
+                          <td>
+                            {formatAgeToKickoff(
+                              snapshot.final_snapshot_age_to_kickoff_seconds,
+                            )}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </MiniTable>
 
-                  <MiniTable title="Match attempts" icon={<Activity size={15} />}>
+                  <MiniTable
+                    title="Match attempts"
+                    icon={<Activity size={15} />}
+                  >
                     <thead>
                       <tr>
                         <th>Attempt</th>
@@ -668,9 +936,19 @@ export default function Dashboard() {
                       {(detail?.attempts ?? []).map((attempt) => (
                         <tr key={attempt.id}>
                           <td>{attempt.attempt_number}</td>
-                          <td><span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span></td>
+                          <td>
+                            <span
+                              className={`quality ${qualityClass(attempt.status)}`}
+                            >
+                              {qualityLabel(attempt.status)}
+                            </span>
+                          </td>
                           <td>{formatUtcDate(attempt.started_at)}</td>
-                          <td><code>{formatRequiredJson(attempt.required_found_json)}</code></td>
+                          <td>
+                            <code>
+                              {formatRequiredJson(attempt.required_found_json)}
+                            </code>
+                          </td>
                           <td>{attempt.error_message ?? "-"}</td>
                         </tr>
                       ))}
@@ -688,16 +966,28 @@ export default function Dashboard() {
           <div className="panel-head">
             <div>
               <h3>Bookmaker odds</h3>
-              <p>{detail ? `${filteredBookmakers.length} visible of ${detail.bookmaker_odds.length}` : "Select a match"}</p>
+              <p>
+                {detail
+                  ? `${filteredBookmakers.length} visible of ${detail.bookmaker_odds.length}`
+                  : "Select a match"}
+              </p>
             </div>
             <div className="toolbar">
               <label className="toggle">
-                <input type="checkbox" checked={requiredOnly} onChange={(event) => setRequiredOnly(event.target.checked)} />
+                <input
+                  type="checkbox"
+                  checked={requiredOnly}
+                  onChange={(event) => setRequiredOnly(event.target.checked)}
+                />
                 Required only
               </label>
               <label className="search">
                 <Filter size={15} />
-                <input value={bookmakerQuery} onChange={(event) => setBookmakerQuery(event.target.value)} placeholder="Filter market, bookmakers, IDs" />
+                <input
+                  value={bookmakerQuery}
+                  onChange={(event) => setBookmakerQuery(event.target.value)}
+                  placeholder="Filter market, bookmakers, IDs"
+                />
               </label>
             </div>
           </div>
@@ -717,13 +1007,24 @@ export default function Dashboard() {
               </thead>
               <tbody>
                 {filteredBookmakers.map((row) => (
-                  <tr key={row.id} className={REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker) ? "required" : ""}>
+                  <tr
+                    key={row.id}
+                    className={
+                      REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker)
+                        ? "required"
+                        : ""
+                    }
+                  >
                     <td>{row.bookmaker}</td>
                     <td>{marketLabel(row.market)}</td>
-                    <td><span className="line-pill">{marketLine(row)}</span></td>
+                    <td>
+                      <span className="line-pill">{marketLine(row)}</span>
+                    </td>
                     <td>{row.bookmaker_id ?? "-"}</td>
                     <td>{row.betexplorer_bookmaker_id ?? "-"}</td>
-                    <td><PriceSet row={row} /></td>
+                    <td>
+                      <PriceSet row={row} />
+                    </td>
                     <td>{row.is_available ? "available" : "missing"}</td>
                     <td>{formatUtcDate(row.snapshot_captured_at)}</td>
                   </tr>
@@ -735,29 +1036,63 @@ export default function Dashboard() {
 
         <section className="tri-grid">
           <div className="panel" id="attempts">
-            <PanelTitle title="Recent attempts" subtitle={`${attempts.length} loaded`} />
+            <PanelTitle
+              title="Recent attempts"
+              subtitle={`${attempts.length} loaded`}
+            />
             <div className="compact-list">
               {attempts.slice(0, 18).map((attempt) => (
                 <div className="compact-row" key={attempt.id}>
-                  <span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span>
-                  <strong>{attempt.home_team ?? attempt.event_id} {attempt.away_team ? `- ${attempt.away_team}` : ""}</strong>
-                  <small>#{attempt.attempt_number} · {formatUtcDate(attempt.started_at)}</small>
-                  {attempt.error_message ? <code>{attempt.error_message}</code> : <code>{formatRequiredJson(attempt.required_found_json)}</code>}
+                  <span className={`quality ${qualityClass(attempt.status)}`}>
+                    {qualityLabel(attempt.status)}
+                  </span>
+                  <strong>
+                    {attempt.home_team ?? attempt.event_id}{" "}
+                    {attempt.away_team ? `- ${attempt.away_team}` : ""}
+                  </strong>
+                  <small>
+                    #{attempt.attempt_number} ·{" "}
+                    {formatUtcDate(attempt.started_at)}
+                  </small>
+                  {attempt.error_message ? (
+                    <code>{attempt.error_message}</code>
+                  ) : (
+                    <code>
+                      {formatRequiredJson(attempt.required_found_json)}
+                    </code>
+                  )}
                 </div>
               ))}
             </div>
           </div>
 
           <div className="panel">
-            <PanelTitle title="Recent snapshots" subtitle={`${snapshots.length} loaded`} />
+            <PanelTitle
+              title="Recent snapshots"
+              subtitle={`${snapshots.length} loaded`}
+            />
             <div className="compact-list">
               {snapshots.slice(0, 18).map((snapshot) => (
                 <div className="compact-row" key={snapshot.id}>
-                  <span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span>
-                  <strong>{snapshot.home_team ?? snapshot.event_id} {snapshot.away_team ? `- ${snapshot.away_team}` : ""}</strong>
-                  <small>{formatUtcDate(snapshot.captured_at)} · {snapshot.market} · {snapshot.bookmaker_count ?? 0} rows</small>
-                  <small>To kickoff {formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</small>
-                  <code>{snapshot.raw_payload_path ?? "-"}</code>
+                  <span
+                    className={`quality ${qualityClass(snapshot.quality_status)}`}
+                  >
+                    {qualityLabel(snapshot.quality_status)}
+                  </span>
+                  <strong>
+                    {snapshot.home_team ?? snapshot.event_id}{" "}
+                    {snapshot.away_team ? `- ${snapshot.away_team}` : ""}
+                  </strong>
+                  <small>
+                    {formatUtcDate(snapshot.captured_at)} · {snapshot.market} ·{" "}
+                    {snapshot.bookmaker_count ?? 0} rows
+                  </small>
+                  <small>
+                    To kickoff{" "}
+                    {formatAgeToKickoff(
+                      snapshot.final_snapshot_age_to_kickoff_seconds,
+                    )}
+                  </small>
                 </div>
               ))}
             </div>
@@ -770,7 +1105,9 @@ export default function Dashboard() {
                 <div className="compact-row" key={log.id}>
                   <span className={log.level}>{log.level}</span>
                   <strong>{log.event}</strong>
-                  <small>{formatUtcDate(log.timestamp)} · {log.event_id ?? "-"}</small>
+                  <small>
+                    {formatUtcDate(log.timestamp)} · {log.event_id ?? "-"}
+                  </small>
                   <code>{log.details_json}</code>
                 </div>
               ))}
@@ -780,7 +1117,10 @@ export default function Dashboard() {
 
         <section className="dual-grid" id="exports">
           <div className="panel">
-            <PanelTitle title="Bookmaker coverage" subtitle={`${bookmakers.length} final-market bookmakers`} />
+            <PanelTitle
+              title="Bookmaker coverage"
+              subtitle={`${bookmakers.length} final-market bookmakers`}
+            />
             <div className="table-wrap medium">
               <table>
                 <thead>
@@ -796,7 +1136,14 @@ export default function Dashboard() {
                 </thead>
                 <tbody>
                   {bookmakers.map((bookmaker) => (
-                    <tr key={bookmaker.normalized_bookmaker} className={REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker) ? "required" : ""}>
+                    <tr
+                      key={bookmaker.normalized_bookmaker}
+                      className={
+                        REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker)
+                          ? "required"
+                          : ""
+                      }
+                    >
                       <td>{bookmaker.bookmaker}</td>
                       <td>{bookmaker.matches}</td>
                       <td>{bookmaker.rows}</td>
@@ -815,15 +1162,24 @@ export default function Dashboard() {
             <PanelTitle title="Exports" subtitle={`${exports.length} files`} />
             <div className="export-list">
               {exports.map((file) => (
-                <a href={`${API_BASE}${file.download_url}`} className="export-row" key={file.filename}>
+                <a
+                  href={`${API_BASE}${file.download_url}`}
+                  className="export-row"
+                  key={file.filename}
+                >
                   <Download size={15} />
                   <span>
                     <strong>{file.filename}</strong>
-                    <small>{formatBytes(file.size_bytes)} · {formatScheduleDate(file.modified_at)}</small>
+                    <small>
+                      {formatBytes(file.size_bytes)} ·{" "}
+                      {formatScheduleDate(file.modified_at)}
+                    </small>
                   </span>
                 </a>
               ))}
-              {exports.length === 0 ? <p className="empty">No export files yet.</p> : null}
+              {exports.length === 0 ? (
+                <p className="empty">No export files yet.</p>
+              ) : null}
             </div>
           </div>
         </section>
@@ -832,7 +1188,15 @@ export default function Dashboard() {
   );
 }
 
-function Metric({ label, value, tone }: { label: string; value?: number; tone?: "good" | "warn" | "bad" }) {
+function Metric({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value?: number;
+  tone?: "good" | "warn" | "bad";
+}) {
   return (
     <div className={`metric ${tone ?? ""}`} title={tooltipFor(label)}>
       <span>{label}</span>
@@ -843,7 +1207,10 @@ function Metric({ label, value, tone }: { label: string; value?: number; tone?: 
 
 function Info({ label, value }: { label: string; value: string }) {
   return (
-    <div className="info-cell" title={`${tooltipFor(label)} Current value: ${value}`}>
+    <div
+      className="info-cell"
+      title={`${tooltipFor(label)} Current value: ${value}`}
+    >
       <span>{label}</span>
       <strong>{value}</strong>
     </div>
@@ -851,16 +1218,33 @@ function Info({ label, value }: { label: string; value: string }) {
 }
 
 function Badge({ label, active }: { label: string; active: boolean }) {
-  return <span className={active ? "mini-badge active" : "mini-badge"} title={`${label === "B" ? "Bwin" : "Unibet"} required bookmaker ${active ? "is present" : "is missing"}`}>{label}</span>;
+  return (
+    <span
+      className={active ? "mini-badge active" : "mini-badge"}
+      title={`${label === "B" ? "Bwin" : "Unibet"} required bookmaker ${active ? "is present" : "is missing"}`}
+    >
+      {label}
+    </span>
+  );
 }
 
-function SelectFilter({ value, onChange, options }: { value: string; onChange: (value: string) => void; options: string[] }) {
+function SelectFilter({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: string[];
+}) {
   return (
     <label className="select-filter" title={tooltipFor(value)}>
       <Filter size={14} />
       <select value={value} onChange={(event) => onChange(event.target.value)}>
         {options.map((option) => (
-          <option key={option} value={option}>{filterLabel(option)}</option>
+          <option key={option} value={option}>
+            {filterLabel(option)}
+          </option>
         ))}
       </select>
     </label>
@@ -879,7 +1263,15 @@ function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
   );
 }
 
-function MiniTable({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
+function MiniTable({
+  title,
+  icon,
+  children,
+}: {
+  title: string;
+  icon: ReactNode;
+  children: ReactNode;
+}) {
   return (
     <div className="mini-table" title={tooltipFor(title)}>
       <div className="mini-title">
@@ -914,23 +1306,31 @@ function ProgressBar({ label, value, detail, tone }: ProgressState) {
         <small>{detail}</small>
       </div>
       <div className="progress-track">
-        <span className={tone ?? ""} style={{ width: `${Math.max(0, Math.min(100, value))}%` }} />
+        <span
+          className={tone ?? ""}
+          style={{ width: `${Math.max(0, Math.min(100, value))}%` }}
+        />
       </div>
     </div>
   );
 }
 
-function formatScheduleDate(value: string | null | undefined, withSeconds = false) {
+function formatScheduleDate(
+  value: string | null | undefined,
+  withSeconds = false,
+) {
   if (!value) return "-";
   const options: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: "Europe/Kyiv"
+    timeZone: "Europe/Kyiv",
   };
   if (withSeconds) options.second = "2-digit";
-  return new Intl.DateTimeFormat("en", options).format(parseLocalApiDate(value));
+  return new Intl.DateTimeFormat("en", options).format(
+    parseLocalApiDate(value),
+  );
 }
 
 function formatUtcDate(value: string | null | undefined, withSeconds = false) {
@@ -940,7 +1340,7 @@ function formatUtcDate(value: string | null | undefined, withSeconds = false) {
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: "Europe/Kyiv"
+    timeZone: "Europe/Kyiv",
   };
   if (withSeconds) options.second = "2-digit";
   return new Intl.DateTimeFormat("en", options).format(parseUtcApiDate(value));
@@ -969,15 +1369,20 @@ function marketLabel(market: string | null | undefined) {
     ah: "Asian Handicap",
     dc: "Double Chance",
     bts: "Both Teams To Score",
-    dnb: "Draw No Bet"
+    dnb: "Draw No Bet",
   };
-  return labels[(market ?? "").toLowerCase()] ?? (market ? market.toUpperCase() : "-");
+  return (
+    labels[(market ?? "").toLowerCase()] ??
+    (market ? market.toUpperCase() : "-")
+  );
 }
 
 function marketLine(row: BookmakerOdds) {
   const attrs = parseRawAttributes(row.raw_attributes_json);
-  const explicit = attrs.market_line ?? attrs.line ?? attrs.handicap ?? attrs.total;
-  if (explicit != null && String(explicit).trim()) return String(explicit).trim();
+  const explicit =
+    attrs.market_line ?? attrs.line ?? attrs.handicap ?? attrs.total;
+  if (explicit != null && String(explicit).trim())
+    return String(explicit).trim();
   const raw = (row.raw_row_text ?? "").trim();
   const bookmaker = row.bookmaker.trim();
   const withoutBookmaker = raw.toLowerCase().startsWith(bookmaker.toLowerCase())
@@ -1004,11 +1409,15 @@ function priceItems(row: BookmakerOdds) {
     .filter((item) => item.label && item.value !== "-");
 }
 
-function parseRawAttributes(value: string | null | undefined): Record<string, unknown> {
+function parseRawAttributes(
+  value: string | null | undefined,
+): Record<string, unknown> {
   if (!value) return {};
   try {
     const parsed = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
   } catch {
     return {};
   }
@@ -1046,7 +1455,7 @@ function filterLabel(value: string) {
     capture_desc: "Latest capture",
     kickoff_asc: "Kickoff time",
     bookmakers_desc: "Most bookmakers",
-    attempts_desc: "Most attempts"
+    attempts_desc: "Most attempts",
   };
   return labels[value] ?? value;
 }
@@ -1055,34 +1464,58 @@ function tooltipFor(label: string) {
   const text: Record<string, string> = {
     Matches: "Total matches currently stored in the local database.",
     Captured: "Matches with at least one final odds snapshot.",
-    "Capture miss": "Finalized matches where capture attempts ran but no bookmaker rows were saved.",
-    "Skipped old": "Finalized matches that moved out of the capture window before any attempt ran.",
-    "Due now": "Matches whose next scheduled capture time is now or already overdue.",
-    "Final snapshots": "Final snapshots currently selected for export and match summaries. With all markets, each market can have its own final snapshot.",
+    "Capture miss":
+      "Finalized matches where capture attempts ran but no bookmaker rows were saved.",
+    "Skipped old":
+      "Finalized matches that moved out of the capture window before any attempt ran.",
+    "Due now":
+      "Matches whose next scheduled capture time is now or already overdue.",
+    Results:
+      "Finished match results captured once per match within RESULT_CAPTURE_LOOKBACK_HOURS.",
+    "Final snapshots":
+      "Final snapshots currently selected for export and match summaries. With all markets, each market can have its own final snapshot.",
+    "Odds rows":
+      "Bookmaker/line rows saved for this snapshot. Simple markets may have 2-3 rows; Asian Handicap and Over/Under can have many rows because every line is stored separately.",
     Attempts: "HTTP/parser attempts recorded for odds capture.",
     "Bookmaker rows": "Bookmaker odds rows in current final snapshots.",
-    "Row attempts": "All bookmaker odds rows saved across all attempts and snapshots.",
-    "Req complete": "Final snapshots where every required bookmaker was present.",
-    "Req partial": "Final snapshots where at least one required bookmaker was present.",
-    "Req missing": "Final snapshots where none of the required bookmakers were present.",
+    "Row attempts":
+      "All bookmaker odds rows saved across all attempts and snapshots.",
+    "Req complete":
+      "Final snapshots where every required bookmaker was present.",
+    "Req partial":
+      "Final snapshots where at least one required bookmaker was present.",
+    "Req missing":
+      "Final snapshots where none of the required bookmakers were present.",
     Bookmakers: "Distinct bookmakers seen in final odds rows.",
-    "Poll seconds": "How often an in-window match is scheduled for another odds request.",
-    Discovery: "Next full BetExplorer discovery. Due captures can still run between discovery cycles.",
+    "Poll seconds":
+      "How often an in-window match is scheduled for another odds request.",
+    Discovery:
+      "Next full BetExplorer discovery. Due captures can still run between discovery cycles.",
     Concurrency: "Maximum due matches captured in parallel.",
     "Last run": "Most recent completed scheduler heartbeat.",
-    "Next run": "Expected next scheduler heartbeat based on configured tick seconds.",
-    "Next capture": "Earliest scheduled odds capture among non-finalized matches.",
+    "Next run":
+      "Expected next scheduler heartbeat based on configured tick seconds.",
+    "Next capture":
+      "Earliest scheduled odds capture among non-finalized matches.",
     "Last odds": "Most recent saved odds snapshot.",
-    "Final snapshot age": "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
+    "Final snapshot age":
+      "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
     "Browser TZ": "Timezone reported by this browser.",
-    "BetExplorer TZ": "Timezone offset sent to BetExplorer via the my_timezone cookie.",
-    Kickoff: "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
+    "BetExplorer TZ":
+      "Timezone offset sent to BetExplorer via the my_timezone cookie.",
+    "Result capture":
+      "Finished results captured once per match during RESULT_CAPTURE_LOOKBACK_HOURS. This is separate from odds snapshots.",
+    Kickoff:
+      "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
     "Capture phase": "Scheduler state for this match.",
     Timing: "Timing classification relative to kickoff and live status.",
     Required: "Presence of required bookmakers in final odds rows.",
     Finalized: "Time when the scheduler closed the capture window.",
+    "Result captured":
+      "Time when the final score/result was saved. This is separate from odds capture and only happens once per match.",
     "Live score": "Live/recent score from BetExplorer live-results enrichment.",
-    Snapshots: "Saved odds payloads for this match.",
+    Snapshots:
+      "Saved odds snapshots for this match. Odds rows count bookmaker/line rows; modified markets like Asian Handicap and Over/Under can have many rows because each line is stored separately.",
     "Match attempts": "Capture attempts for this match.",
     all: "Show every match.",
     with_odds: "Only matches with saved bookmaker rows.",
@@ -1091,15 +1524,17 @@ function tooltipFor(label: string) {
     req_missing: "Only matches missing all required bookmakers.",
     missing_bwin: "Only matches where Bwin is missing but odds exist.",
     missing_unibet: "Only matches where Unibet is missing but odds exist.",
-    capture_miss: "Finalized matches where capture attempted but saved no odds rows.",
-    skipped_old: "Finalized matches skipped because the capture window was already over.",
+    capture_miss:
+      "Finalized matches where capture attempted but saved no odds rows.",
+    skipped_old:
+      "Finalized matches skipped because the capture window was already over.",
     due: "Matches currently scheduled for capture.",
     finalized: "Matches whose capture window is closed.",
     new: "Discovered matches without any final snapshot.",
     capture_desc: "Sort by latest saved snapshot first.",
     kickoff_asc: "Sort by kickoff time ascending.",
     bookmakers_desc: "Sort by most bookmaker rows.",
-    attempts_desc: "Sort by most capture attempts."
+    attempts_desc: "Sort by most capture attempts.",
   };
   return text[label] ?? label;
 }
@@ -1135,7 +1570,9 @@ function formatRequiredJson(value: string | null) {
 }
 
 function clientTimezoneLabel() {
-  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone.replace("Kiev", "Kyiv");
+  const zone = Intl.DateTimeFormat()
+    .resolvedOptions()
+    .timeZone.replace("Kiev", "Kyiv");
   const offsetHours = -new Date().getTimezoneOffset() / 60;
   const offset = `${offsetHours >= 0 ? "+" : ""}${offsetHours}`;
   return `${zone} UTC${offset}`;
@@ -1151,8 +1588,16 @@ function parseLocalApiDate(value: string) {
 
 function schedulerFresh(status: Status | null, nowMs: number) {
   if (!status?.last_run) return false;
-  if (status.running || status.scheduler?.running || status.capture_progress?.running) return true;
-  const allowedLag = Math.max(30000, (status.scheduler_tick_seconds ?? 10) * 4000);
+  if (
+    status.running ||
+    status.scheduler?.running ||
+    status.capture_progress?.running
+  )
+    return true;
+  const allowedLag = Math.max(
+    30000,
+    (status.scheduler_tick_seconds ?? 10) * 4000,
+  );
   return nowMs - parseUtcApiDate(status.last_run).getTime() < allowedLag;
 }
 
@@ -1162,53 +1607,60 @@ function schedulerState(status: Status | null, nowMs: number): SchedulerState {
     return {
       className: "active",
       label: `Capture ${progress.phase}`,
-      detail: `${progress.completed}/${progress.queued} capture jobs completed. Active: ${progress.active}. Trigger: ${progress.trigger ?? "-"}`
+      detail: `${progress.completed}/${progress.queued} capture jobs completed. Active: ${progress.active}. Trigger: ${progress.trigger ?? "-"}`,
     };
   }
   if (status?.scheduler?.running) {
     return {
       className: "active",
       label: "Scheduler active",
-      detail: `API scheduler is running. Tick interval: ${status.scheduler_tick_seconds}s.`
+      detail: `API scheduler is running. Tick interval: ${status.scheduler_tick_seconds}s.`,
     };
   }
   if (status?.scheduler && !status.scheduler.enabled) {
     return {
       className: "idle",
       label: "Scheduler disabled",
-      detail: "ENABLE_API_SCHEDULER is false. Start scripts/run_live_capture.py for continuous capture."
+      detail:
+        "ENABLE_API_SCHEDULER is false. Start scripts/run_live_capture.py for continuous capture.",
     };
   }
   if (!status?.last_run) {
     return {
       className: "idle",
       label: "Scheduler idle",
-      detail: "No capture heartbeat has completed yet."
+      detail: "No capture heartbeat has completed yet.",
     };
   }
   if (schedulerFresh(status, nowMs)) {
     return {
       className: "active",
       label: "Scheduler active",
-      detail: `Heartbeat is fresh. Tick interval: ${status.scheduler_tick_seconds}s.`
+      detail: `Heartbeat is fresh. Tick interval: ${status.scheduler_tick_seconds}s.`,
     };
   }
-  const overdue = status.next_run ? relativeTime(parseUtcApiDate(status.next_run).getTime() - nowMs) : "unknown";
+  const overdue = status.next_run
+    ? relativeTime(parseUtcApiDate(status.next_run).getTime() - nowMs)
+    : "unknown";
   if (status.due_matches > 0) {
     return {
       className: "stale",
       label: "Scheduler idle: due queue",
-      detail: `${status.due_matches} match(es) are due, but no scheduler heartbeat has run (${overdue}). Run once is only a manual one-cycle capture.`
+      detail: `${status.due_matches} match(es) are due, but no scheduler heartbeat has run (${overdue}). Run once is only a manual one-cycle capture.`,
     };
   }
   return {
     className: "idle",
     label: "Scheduler idle",
-    detail: `No continuous scheduler heartbeat is running (${overdue}). Run once is only a manual one-cycle capture.`
+    detail: `No continuous scheduler heartbeat is running (${overdue}). Run once is only a manual one-cycle capture.`,
   };
 }
 
-function buildProgress(status: Status | null, match: MatchRow | null, nowMs: number): ProgressState[] {
+function buildProgress(
+  status: Status | null,
+  match: MatchRow | null,
+  nowMs: number,
+): ProgressState[] {
   const items: ProgressState[] = [];
   const progress = status?.capture_progress;
   if (progress) {
@@ -1221,12 +1673,14 @@ function buildProgress(status: Status | null, match: MatchRow | null, nowMs: num
         ? 100
         : 0;
     items.push({
-      label: progress.running ? `Capture ${progress.phase}` : "Last capture cycle",
+      label: progress.running
+        ? `Capture ${progress.phase}`
+        : "Last capture cycle",
       value,
       detail: hasQueue
         ? `${progress.completed}/${progress.queued} jobs, ${progress.captured} ok, ${progress.failed} failed`
-        : `${progress.discovered} discovered, ${progress.due} due`,
-      tone: progress.failed > 0 ? "warn" : progress.running ? "good" : "idle"
+        : `${progress.discovered} discovered, ${progress.due} due, ${progress.results_checked} result checks, ${progress.results_captured} results`,
+      tone: progress.failed > 0 ? "warn" : progress.running ? "good" : "idle",
     });
   }
   if (status?.last_run && status.next_run) {
@@ -1236,7 +1690,11 @@ function buildProgress(status: Status | null, match: MatchRow | null, nowMs: num
       label: "Next heartbeat",
       value: percentBetween(start, end, nowMs),
       detail: relativeTime(end - nowMs),
-      tone: nowMs > end + Math.max(15000, (status.scheduler_tick_seconds ?? 10) * 1000) ? "bad" : "good"
+      tone:
+        nowMs >
+        end + Math.max(15000, (status.scheduler_tick_seconds ?? 10) * 1000)
+          ? "bad"
+          : "good",
     });
   }
   if (status?.next_capture) {
@@ -1245,17 +1703,21 @@ function buildProgress(status: Status | null, match: MatchRow | null, nowMs: num
       label: "Global next capture",
       value: target <= nowMs ? 100 : 0,
       detail: target <= nowMs ? "due now" : relativeTime(target - nowMs),
-      tone: target <= nowMs ? "warn" : "good"
+      tone: target <= nowMs ? "warn" : "good",
     });
   }
   if (match?.kickoff_time) {
     const kickoff = parseLocalApiDate(match.kickoff_time).getTime();
-    const windowStart = kickoff - (status?.upcoming_window_minutes ?? 30) * 60 * 1000;
+    const activeWindowMinutes = Math.max(
+      status?.upcoming_window_minutes ?? 30,
+      (status?.odds_capture_lookahead_hours ?? 0) * 60,
+    );
+    const windowStart = kickoff - activeWindowMinutes * 60 * 1000;
     items.push({
       label: "Selected kickoff",
       value: percentBetween(windowStart, kickoff, nowMs),
       detail: kickoff <= nowMs ? "started" : relativeTime(kickoff - nowMs),
-      tone: kickoff <= nowMs ? "warn" : "good"
+      tone: kickoff <= nowMs ? "warn" : "good",
     });
   }
   if (match?.next_capture_at) {
@@ -1264,7 +1726,7 @@ function buildProgress(status: Status | null, match: MatchRow | null, nowMs: num
       label: "Selected capture",
       value: target <= nowMs ? 100 : 0,
       detail: target <= nowMs ? "due now" : relativeTime(target - nowMs),
-      tone: target <= nowMs ? "warn" : "good"
+      tone: target <= nowMs ? "warn" : "good",
     });
   }
   return items;
@@ -1278,13 +1740,14 @@ function phaseProgress(phase: string) {
     live_results: 35,
     planning: 55,
     capturing: 75,
-    completed: 100
+    completed: 100,
   };
   return values[phase] ?? 50;
 }
 
 function percentBetween(start: number, end: number, now: number) {
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start)
+    return 0;
   return ((now - start) / (end - start)) * 100;
 }
 
@@ -1294,7 +1757,10 @@ function relativeTime(ms: number) {
   if (abs < 60) return overdue ? `overdue ${abs}s` : `${abs}s`;
   const minutes = Math.floor(abs / 60);
   const seconds = abs % 60;
-  const value = minutes < 60 ? `${minutes}m ${seconds}s` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  const value =
+    minutes < 60
+      ? `${minutes}m ${seconds}s`
+      : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
   if (overdue) return `overdue ${value}`;
   return value;
 }

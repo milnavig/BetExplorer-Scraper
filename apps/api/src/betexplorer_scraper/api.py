@@ -110,6 +110,9 @@ def status() -> dict[str, object]:
     result["final_capture_fast_window_minutes"] = settings.final_capture_fast_window_minutes
     result["discovery_poll_interval_seconds"] = settings.discovery_poll_interval_seconds
     result["upcoming_window_minutes"] = settings.upcoming_window_minutes
+    result["odds_capture_lookahead_hours"] = settings.odds_capture_lookahead_hours
+    result["result_capture_lookback_hours"] = settings.result_capture_lookback_hours
+    result["result_finish_grace_minutes"] = settings.result_finish_grace_minutes
     result["max_concurrent_captures"] = settings.max_concurrent_captures
     result["max_concurrent_markets_per_match"] = settings.max_concurrent_markets_per_match
     result["market_discovery_cache_seconds"] = settings.market_discovery_cache_seconds

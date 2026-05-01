@@ -11,7 +11,7 @@ import {
   Table2
 } from "lucide-react";
 import type { ReactNode } from "react";
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
@@ -31,6 +31,7 @@ type MatchRow = {
   next_capture_at: string | null;
   last_capture_at: string | null;
   finalized_at: string | null;
+  result_captured_at: string | null;
   snapshot_id: string | null;
   quality_status: string | null;
   captured_at: string | null;
@@ -107,6 +108,9 @@ type Status = {
   final_capture_fast_window_minutes: number;
   discovery_poll_interval_seconds: number;
   upcoming_window_minutes: number;
+  odds_capture_lookahead_hours: number;
+  result_capture_lookback_hours: number;
+  result_finish_grace_minutes: number;
   max_concurrent_captures: number;
   max_concurrent_markets_per_match: number;
   market_discovery_cache_seconds: number;
@@ -129,6 +133,11 @@ export default function MatchPage() {
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
+  const selectedIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   const loadMatches = async () => {
     setError(null);
@@ -137,9 +146,14 @@ export default function MatchPage() {
     setStatus(nextStatus);
     const params = new URLSearchParams(window.location.search);
     const requestedId = params.get("id");
-    const nextId = requestedId && nextMatches.some((match) => match.id === requestedId)
-      ? requestedId
-      : nextMatches[0]?.id ?? null;
+    const currentSelectedId = selectedIdRef.current;
+    const nextId =
+      requestedId && nextMatches.some((match) => match.id === requestedId)
+        ? requestedId
+        : currentSelectedId && nextMatches.some((match) => match.id === currentSelectedId)
+          ? currentSelectedId
+          : nextMatches[0]?.id ?? null;
+    selectedIdRef.current = nextId;
     setSelectedId(nextId);
   };
 
@@ -205,11 +219,13 @@ export default function MatchPage() {
   const refresh = () => {
     startTransition(async () => {
       await loadMatches();
-      if (selectedId) setDetail(await api<MatchDetail>(`/api/matches/${selectedId}`));
+      const currentSelectedId = selectedIdRef.current;
+      if (currentSelectedId) setDetail(await api<MatchDetail>(`/api/matches/${currentSelectedId}`));
     });
   };
 
   const selectMatch = (id: string) => {
+    selectedIdRef.current = id;
     setSelectedId(id);
     window.history.replaceState(null, "", `/match?id=${encodeURIComponent(id)}`);
   };
@@ -271,7 +287,8 @@ export default function MatchPage() {
           <span title={tooltipFor("Heartbeat")}>Heartbeat <strong>{status?.scheduler_tick_seconds ?? "-"}s</strong></span>
           <span title={tooltipFor("Concurrency")}>Concurrency <strong>{status?.max_concurrent_captures ?? "-"}</strong></span>
           <span title={tooltipFor("Market concurrency")}>Markets <strong>{status?.max_concurrent_markets_per_match ?? "-"}</strong></span>
-          <span title={tooltipFor("Window")}>Window <strong>{status?.upcoming_window_minutes ?? "-"}m</strong></span>
+          <span title={tooltipFor("Window")}>Odds lookahead <strong>{status?.odds_capture_lookahead_hours ?? "-"}h</strong></span>
+          <span title={tooltipFor("Results")}>Results <strong>{status?.result_capture_lookback_hours ?? "-"}h</strong></span>
         </section>
 
         {error ? <div className="error">{error}</div> : null}
@@ -295,6 +312,7 @@ export default function MatchPage() {
               <Info label="Next capture" value={formatScheduleDate(match.next_capture_at)} />
               <Info label="Last capture" value={formatUtcDate(match.last_capture_at)} />
               <Info label="Finalized" value={formatScheduleDate(match.finalized_at)} />
+              <Info label="Result captured" value={formatUtcDate(match.result_captured_at)} />
               <Info label="Live score" value={match.live_score ?? "-"} />
               <Info label="Snapshot ID" value={match.snapshot_id ?? "-"} />
               <Info label="Snapshot captured" value={formatUtcDate(match.captured_at)} />
@@ -385,10 +403,9 @@ export default function MatchPage() {
                         <th>Final candidate</th>
                         <th>Final</th>
                         <th>Source page</th>
-                        <th>Rows</th>
+                        <th title={tooltipFor("Odds rows")}>Odds rows</th>
                         <th>To kickoff</th>
                         <th>Required JSON</th>
-                        <th>Raw payload</th>
                         <th>Created</th>
                       </tr>
                     </thead>
@@ -406,7 +423,6 @@ export default function MatchPage() {
                           <td>{snapshot.bookmaker_count ?? "-"}</td>
                           <td>{formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</td>
                           <td><code>{formatRequiredJson(snapshot.required_bookmakers_json)}</code></td>
-                          <td><code>{snapshot.raw_payload_path ?? "-"}</code></td>
                           <td>{formatUtcDate(snapshot.created_at)}</td>
                         </tr>
                       ))}
@@ -631,7 +647,8 @@ function tooltipFor(label: string) {
     Heartbeat: "How often the scheduler loop wakes up.",
     Concurrency: "Maximum due matches captured in parallel.",
     "Market concurrency": "Maximum market endpoints captured in parallel inside one match.",
-    Window: "Minutes before kickoff when active odds capture begins.",
+    Window: "Hours before kickoff when active odds capture begins.",
+    Results: "How far back finished matches are checked for one-time result capture.",
     Kickoff: "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
     Status: "Raw match status persisted from discovery/live enrichment.",
     Timing: "Timing classification relative to kickoff and live status.",
@@ -639,11 +656,13 @@ function tooltipFor(label: string) {
     "Next capture": "Next scheduled odds request for this match.",
     "Last capture": "Most recent saved odds snapshot timestamp.",
     Finalized: "Time when the scheduler closed the capture window.",
+    "Result captured": "Time when the final score/result was saved. This is separate from odds capture and only happens once per match.",
     "Live score": "Live/recent score from BetExplorer live-results enrichment.",
     "Snapshot ID": "Latest final snapshot id used for summary display.",
     "Snapshot captured": "Timestamp for the latest final snapshot.",
     "Final snapshot age": "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
-    Bookmakers: "Bookmaker odds rows in final snapshots for this match.",
+    "Odds rows": "Bookmaker/line rows saved for this snapshot. Simple markets may have 2-3 rows; Asian Handicap and Over/Under can have many rows because every line is stored separately.",
+    Bookmakers: "Bookmaker odds rows in final snapshots for this match. Modified markets like Asian Handicap and Over/Under can have many rows because each line is stored separately.",
     Attempts: "HTTP/parser attempts recorded for this match.",
     "Match row ID": "Local database id for this match row.",
     "Event ID": "BetExplorer/Flashscore event id.",

@@ -35,6 +35,7 @@ class Scheduler:
         now: datetime,
         next_capture_at: datetime | None = None,
         finalized_at: datetime | None = None,
+        last_capture_at: datetime | None = None,
     ) -> CaptureDecision:
         if finalized_at is not None:
             return CaptureDecision("FINALIZED", False, None, finalized_at)
@@ -54,6 +55,8 @@ class Scheduler:
         if now < upcoming_start:
             return CaptureDecision("WAITING", False, upcoming_start)
         if now > final_end:
+            if last_capture_at is None:
+                return CaptureDecision("FINALIZING", True, None, now)
             return CaptureDecision("FINALIZED", False, None, now)
 
         phase = "FINALIZING" if now > match.kickoff_time or match.timing_status == TimingStatus.LIVE else "MONITORING"

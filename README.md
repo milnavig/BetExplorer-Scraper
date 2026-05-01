@@ -1,6 +1,6 @@
 # BetExplorer Final Odds Monitor
 
-Local API-first system for tracking BetExplorer football matches, capturing final pre-match odds markets, storing all bookmaker rows, and monitoring capture state from a Next.js/Tauri UI.
+Local monitoring system for tracking BetExplorer football matches, capturing final pre-match odds markets, storing all bookmaker rows, saving finished results, and monitoring capture state from a Next.js/Tauri UI.
 
 ## What It Does
 
@@ -11,6 +11,8 @@ Local API-first system for tracking BetExplorer football matches, capturing fina
   - `FINALIZING`: match has started but is still inside the post-kickoff capture window.
   - `FINALIZED`: capture window is over.
 - Captures all available bookmaker rows from BetExplorer direct HTTP endpoints for every market tab exposed on the match page.
+- Starts odds monitoring for matches up to `ODDS_CAPTURE_LOOKAHEAD_HOURS` ahead, default 6 hours.
+- Captures finished match results once for matches discovered within `RESULT_CAPTURE_LOOKBACK_HOURS`, default 24 hours.
 - Uses Bwin and Unibet as required bookmaker quality checks by default.
 - Saves matches, snapshots, bookmaker odds, attempts, logs, and scheduler state to DuckDB.
 - Exports CSV/XLSX.
@@ -63,6 +65,11 @@ TARGET_BOOKMAKERS=Bwin,Unibet
 CAPTURE_MARKET=all
 BETEXPLORER_TIMEZONE_OFFSET=+3
 UPCOMING_WINDOW_MINUTES=30
+ODDS_CAPTURE_LOOKAHEAD_HOURS=6
+RESULT_CAPTURE_LOOKBACK_HOURS=24
+RESULT_FINISH_GRACE_MINUTES=120
+RESULT_CHECK_RETRY_SECONDS=3600
+RESULT_BACKFILL_BATCH_SIZE=200
 MAX_MATCH_AGE_AFTER_KICKOFF_MINUTES=5
 MONITORING_CAPTURE_POLL_INTERVAL_SECONDS=120
 FINAL_CAPTURE_POLL_INTERVAL_SECONDS=20
@@ -130,7 +137,7 @@ uv run python scripts/run_live_capture.py
 
 Use this external loop only when `ENABLE_API_SCHEDULER=false` or when the API is not running. Do not run both schedulers against the same DuckDB file unless you intentionally want duplicate capture pressure.
 
-The continuous loop checks due matches every `SCHEDULER_TICK_SECONDS`, but full BetExplorer discovery is throttled by `DISCOVERY_POLL_INTERVAL_SECONDS`. Odds polling is adaptive: normal capture-window polling uses `MONITORING_CAPTURE_POLL_INTERVAL_SECONDS`, then switches to `FINAL_CAPTURE_POLL_INTERVAL_SECONDS` during the last `FINAL_CAPTURE_FAST_WINDOW_MINUTES` before kickoff and shortly after kickoff. Current defaults are intentionally moderate for `CAPTURE_MARKET=all`: every 120 seconds in the early window, every 20 seconds in the last 3 minutes, and up to 5 minutes after kickoff.
+The continuous loop checks due matches every `SCHEDULER_TICK_SECONDS`, but full BetExplorer discovery is throttled by `DISCOVERY_POLL_INTERVAL_SECONDS`. Odds polling is adaptive: matches enter monitoring up to `ODDS_CAPTURE_LOOKAHEAD_HOURS` before kickoff, normal polling uses `MONITORING_CAPTURE_POLL_INTERVAL_SECONDS`, then switches to `FINAL_CAPTURE_POLL_INTERVAL_SECONDS` during the last `FINAL_CAPTURE_FAST_WINDOW_MINUTES` before kickoff and shortly after kickoff. Current defaults are intentionally moderate for `CAPTURE_MARKET=all`: every 120 seconds in the early window, every 20 seconds in the last 3 minutes, and up to 5 minutes after kickoff. Results are captured separately once per finished match in the configured 24-hour lookback.
 
 Performance notes:
 - `MAX_CONCURRENT_CAPTURES` controls how many due matches run in parallel.

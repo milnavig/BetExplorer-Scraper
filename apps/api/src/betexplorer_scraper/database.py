@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, time
+from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -52,6 +52,8 @@ class Database:
                 next_capture_at TIMESTAMP,
                 last_capture_at TIMESTAMP,
                 finalized_at TIMESTAMP,
+                result_captured_at TIMESTAMP,
+                result_checked_at TIMESTAMP,
                 created_at TIMESTAMP,
                 updated_at TIMESTAMP
             )
@@ -61,6 +63,8 @@ class Database:
         self._ensure_column("matches", "next_capture_at", "TIMESTAMP")
         self._ensure_column("matches", "last_capture_at", "TIMESTAMP")
         self._ensure_column("matches", "finalized_at", "TIMESTAMP")
+        self._ensure_column("matches", "result_captured_at", "TIMESTAMP")
+        self._ensure_column("matches", "result_checked_at", "TIMESTAMP")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS odds_snapshots (
@@ -179,9 +183,9 @@ class Database:
             INSERT INTO matches (
                 id, betexplorer_match_id, sport, league, home_team, away_team, kickoff_time,
                 status, timing_status, source_url, live_score, capture_phase, next_capture_at,
-                last_capture_at, finalized_at, created_at, updated_at
+                last_capture_at, finalized_at, result_captured_at, result_checked_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 match_id,
@@ -199,6 +203,8 @@ class Database:
                 None,
                 None,
                 None,
+                None,
+                None,
                 now,
                 now,
             ],
@@ -206,21 +212,152 @@ class Database:
         return match_id
 
     @_locked
+    def mark_result_captured(self, match_id: str, score: str | None, captured_at: datetime) -> bool:
+        row = self.connection.execute("SELECT result_captured_at FROM matches WHERE id = ?", [match_id]).fetchone()
+        if not row or row[0] is not None:
+            return False
+        self.connection.execute(
+            """
+            UPDATE matches
+            SET status = 'finished',
+                timing_status = ?,
+                live_score = COALESCE(?, live_score),
+                result_captured_at = ?,
+                updated_at = ?
+            WHERE id = ? AND result_captured_at IS NULL
+            """,
+            [TimingStatus.FINISHED.value, score, captured_at, utc_now(), match_id],
+        )
+        return True
+
+    @_locked
+    def mark_result_checked(self, match_id: str, checked_at: datetime) -> None:
+        self.connection.execute(
+            "UPDATE matches SET result_checked_at = ?, updated_at = ? WHERE id = ?",
+            [checked_at, utc_now(), match_id],
+        )
+
+    @_locked
+    def list_result_backfill_candidates(
+        self,
+        now: datetime,
+        lookback_hours: int,
+        finish_grace_minutes: int,
+        retry_seconds: int,
+        limit: int,
+    ) -> list[tuple[str, DiscoveredMatch]]:
+        cutoff = now - timedelta(hours=lookback_hours)
+        finish_cutoff = now - timedelta(minutes=finish_grace_minutes)
+        retry_cutoff = now - timedelta(seconds=retry_seconds)
+        rows = self.connection.execute(
+            """
+            SELECT id, betexplorer_match_id, source_url, league, home_team, away_team, kickoff_time,
+                   timing_status, status, live_score, capture_phase, finalized_at, result_captured_at
+            FROM matches
+            WHERE result_captured_at IS NULL
+              AND kickoff_time IS NOT NULL
+              AND kickoff_time >= ?
+              AND kickoff_time <= ?
+              AND source_url IS NOT NULL
+              AND (result_checked_at IS NULL OR result_checked_at <= ?)
+            ORDER BY kickoff_time ASC
+            LIMIT ?
+            """,
+            [cutoff, finish_cutoff, retry_cutoff, limit],
+        ).fetchall()
+        candidates: list[tuple[str, DiscoveredMatch]] = []
+        for row in rows:
+            candidates.append(
+                (
+                    row[0],
+                    DiscoveredMatch(
+                        event_id=row[1],
+                        source_url=row[2],
+                        league=row[3],
+                        home_team=row[4],
+                        away_team=row[5],
+                        kickoff_time=row[6],
+                        timing_status=TimingStatus(row[7] or TimingStatus.UNKNOWN.value),
+                        status=row[8] or "scheduled",
+                        live_score=row[9],
+                        capture_phase=row[10],
+                        finalized_at=row[11],
+                        result_captured_at=row[12],
+                    ),
+                )
+            )
+        return candidates
+
+    @_locked
+    def list_empty_finalized_odds_backfill_candidates(
+        self,
+        now: datetime,
+        lookback_hours: int,
+        limit: int,
+    ) -> list[tuple[str, DiscoveredMatch]]:
+        cutoff = now - timedelta(hours=lookback_hours)
+        rows = self.connection.execute(
+            """
+            SELECT m.id, m.betexplorer_match_id, m.source_url, m.league, m.home_team, m.away_team, m.kickoff_time,
+                   m.timing_status, m.status, m.live_score, m.capture_phase, m.finalized_at, m.result_captured_at
+            FROM matches m
+            WHERE m.finalized_at IS NOT NULL
+              AND m.kickoff_time IS NOT NULL
+              AND m.kickoff_time >= ?
+              AND m.source_url IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM odds_snapshots s WHERE s.match_id = m.id)
+              AND NOT EXISTS (SELECT 1 FROM scrape_attempts a WHERE a.match_id = m.id)
+            ORDER BY m.kickoff_time DESC
+            LIMIT ?
+            """,
+            [cutoff, limit],
+        ).fetchall()
+        candidates: list[tuple[str, DiscoveredMatch]] = []
+        for row in rows:
+            candidates.append(
+                (
+                    row[0],
+                    DiscoveredMatch(
+                        event_id=row[1],
+                        source_url=row[2],
+                        league=row[3],
+                        home_team=row[4],
+                        away_team=row[5],
+                        kickoff_time=row[6],
+                        timing_status=TimingStatus(row[7] or TimingStatus.UNKNOWN.value),
+                        status=row[8] or "scheduled",
+                        live_score=row[9],
+                        capture_phase=row[10],
+                        finalized_at=row[11],
+                        result_captured_at=row[12],
+                    ),
+                )
+            )
+        return candidates
+
+    @_locked
     def get_match_schedule(self, match_id: str) -> dict[str, datetime | str | None]:
         row = self.connection.execute(
             """
-            SELECT capture_phase, next_capture_at, last_capture_at, finalized_at
+            SELECT capture_phase, next_capture_at, last_capture_at, finalized_at, result_captured_at
             FROM matches WHERE id = ?
             """,
             [match_id],
         ).fetchone()
         if not row:
-            return {"capture_phase": None, "next_capture_at": None, "last_capture_at": None, "finalized_at": None}
+            return {
+                "capture_phase": None,
+                "next_capture_at": None,
+                "last_capture_at": None,
+                "finalized_at": None,
+                "result_captured_at": None,
+            }
         return {
             "capture_phase": row[0],
             "next_capture_at": row[1],
             "last_capture_at": row[2],
             "finalized_at": row[3],
+            "result_captured_at": row[4],
         }
 
     @_locked
@@ -228,7 +365,7 @@ class Database:
         rows = self.connection.execute(
             """
             SELECT id, betexplorer_match_id, source_url, league, home_team, away_team, kickoff_time,
-                   timing_status, status, live_score, capture_phase, next_capture_at, last_capture_at, finalized_at
+                   timing_status, status, live_score, capture_phase, next_capture_at, last_capture_at, finalized_at, result_captured_at
             FROM matches
             WHERE finalized_at IS NULL
               AND next_capture_at IS NOT NULL
@@ -250,6 +387,7 @@ class Database:
                 live_score=row[9],
                 capture_phase=row[10],
                 finalized_at=row[13],
+                result_captured_at=row[14],
             )
             items.append(
                 (
@@ -260,6 +398,7 @@ class Database:
                         "next_capture_at": row[11],
                         "last_capture_at": row[12],
                         "finalized_at": row[13],
+                        "result_captured_at": row[14],
                     },
                 )
             )
@@ -416,7 +555,6 @@ class Database:
         last_run = self.connection.execute(
             "SELECT MAX(timestamp) FROM logs WHERE module = 'capture' AND event = 'run_once_completed'"
         ).fetchone()[0]
-        today_start = datetime.combine(now.date(), time.min)
         next_capture = self.connection.execute(
             """
             SELECT MIN(next_capture_at)
@@ -425,7 +563,7 @@ class Database:
               AND next_capture_at IS NOT NULL
               AND next_capture_at >= ?
             """,
-            [today_start],
+            [now],
         ).fetchone()[0]
         due_count = self.connection.execute(
             "SELECT COUNT(*) FROM matches WHERE finalized_at IS NULL AND next_capture_at IS NOT NULL AND next_capture_at <= ?",
@@ -463,6 +601,7 @@ class Database:
               AND NOT EXISTS (SELECT 1 FROM scrape_attempts a WHERE a.match_id = m.id)
             """
         ).fetchone()[0]
+        result_captured_count = self.connection.execute("SELECT COUNT(*) FROM matches WHERE result_captured_at IS NOT NULL").fetchone()[0]
         return {
             "running": False,
             "matches": match_count,
@@ -479,6 +618,7 @@ class Database:
             "missed_finalized_matches": finalized_without_snapshot_count,
             "capture_missed_matches": capture_missed_count,
             "skipped_out_of_window_matches": skipped_out_of_window_count,
+            "result_captured_matches": result_captured_count,
             "last_capture": last_capture.isoformat() if last_capture else None,
             "last_run": last_run.isoformat() if last_run else None,
             "next_capture": next_capture.isoformat() if next_capture else None,
@@ -501,7 +641,7 @@ class Database:
             SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
                    m.status, m.timing_status, m.source_url, m.live_score,
                    m.capture_phase, m.next_capture_at, m.last_capture_at, m.finalized_at,
-                   s.snapshot_id, s.quality_status, s.captured_at,
+                   m.result_captured_at, s.snapshot_id, s.quality_status, s.captured_at,
                    COUNT(o.id) AS bookmaker_count,
                    COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'bwin' THEN 1 ELSE 0 END), 0) > 0 AS has_bwin,
                    COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'unibet' THEN 1 ELSE 0 END), 0) > 0 AS has_unibet,
@@ -517,7 +657,8 @@ class Database:
             ) a ON a.match_id = m.id
             GROUP BY m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
                      m.status, m.timing_status, m.source_url, m.live_score, m.capture_phase,
-                     m.next_capture_at, m.last_capture_at, m.finalized_at, s.snapshot_id, s.quality_status, s.captured_at,
+                     m.next_capture_at, m.last_capture_at, m.finalized_at, m.result_captured_at,
+                     s.snapshot_id, s.quality_status, s.captured_at,
                      a.attempt_count
             ORDER BY (s.snapshot_id IS NULL), s.captured_at DESC NULLS LAST, m.kickoff_time NULLS LAST, m.home_team
             """
@@ -537,6 +678,7 @@ class Database:
             "next_capture_at",
             "last_capture_at",
             "finalized_at",
+            "result_captured_at",
             "snapshot_id",
             "quality_status",
             "captured_at",

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
-from betexplorer_scraper.parsers import OddsParser
+from betexplorer_scraper.models import TimingStatus
+from betexplorer_scraper.parsers import DiscoveryParser, OddsParser
 
 
 def _match_odds_payload(fragment: str) -> str:
@@ -55,3 +57,43 @@ def test_parse_market_line_from_modified_market_rows() -> None:
     rows = OddsParser().parse_match_odds_payload(payload)
 
     assert rows[0].raw_attributes["market_line"] == "2.5"
+
+
+def test_discovery_parser_marks_old_scored_row_as_finished() -> None:
+    html = """
+    <table>
+      <tr class="js-tournament">
+        <th colspan="2"><a class="table-main__tournament" href="/football/test/">Country: League</a></th>
+      </tr>
+      <tr data-dt="1,5,2026,14,00">
+        <td>
+          <span class="table-main__time">14:00</span>
+          <a href="/football/test-league/home-away/abc12345/">Home - Away</a>
+          <span class="table-main__result">2:1</span>
+        </td>
+      </tr>
+    </table>
+    """
+
+    rows = DiscoveryParser(finish_grace_minutes=120).parse_homepage(html, datetime(2026, 5, 1, 18, 0))
+
+    assert rows[0].status == "finished"
+    assert rows[0].timing_status == TimingStatus.FINISHED
+    assert rows[0].live_score == "2:1"
+
+
+def test_parse_finished_match_page_result() -> None:
+    html = """
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"SportsEvent","eventStatus":"Finished"}
+    </script>
+    <div class="list-details">
+      <p class="list-details__item__score">5:2</p>
+      <p class="list-details__item__partial">(2:0, 3:2)</p>
+    </div>
+    """
+
+    finished, score = DiscoveryParser().parse_match_page_result(html)
+
+    assert finished is True
+    assert score == "5:2"

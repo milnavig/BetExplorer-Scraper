@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urljoin
 
@@ -91,8 +91,9 @@ class OddsParser:
 
 
 class DiscoveryParser:
-    def __init__(self, base_url: str = "https://www.betexplorer.com") -> None:
+    def __init__(self, base_url: str = "https://www.betexplorer.com", finish_grace_minutes: int = 120) -> None:
         self.base_url = base_url.rstrip("/")
+        self.finish_grace_minutes = finish_grace_minutes
 
     def parse_homepage(self, html: str, now: datetime | None = None) -> list[DiscoveredMatch]:
         soup = BeautifulSoup(html, "lxml")
@@ -111,6 +112,9 @@ class DiscoveryParser:
             teams = self._teams(li)
             if len(teams) < 2:
                 continue
+            kickoff_time = self._kickoff_time(li)
+            score = self._score(li)
+            finished = self._looks_finished(kickoff_time, score, now)
             matches.append(
                 DiscoveredMatch(
                     event_id=event_id,
@@ -118,8 +122,10 @@ class DiscoveryParser:
                     league=self._league(li),
                     home_team=teams[0],
                     away_team=teams[1],
-                    kickoff_time=self._kickoff_time(li),
-                    timing_status=TimingStatus.UNKNOWN,
+                    kickoff_time=kickoff_time,
+                    timing_status=TimingStatus.FINISHED if finished else TimingStatus.UNKNOWN,
+                    status="finished" if finished else "scheduled",
+                    live_score=score,
                 )
             )
         for tr in soup.select("tr[data-dt]"):
@@ -133,6 +139,9 @@ class DiscoveryParser:
             teams = self._teams(tr)
             if len(teams) < 2:
                 continue
+            kickoff_time = self._kickoff_time(tr)
+            score = self._score(tr)
+            finished = self._looks_finished(kickoff_time, score, now)
             matches.append(
                 DiscoveredMatch(
                     event_id=match.group(1),
@@ -140,8 +149,10 @@ class DiscoveryParser:
                     league=self._league(tr),
                     home_team=teams[0],
                     away_team=teams[1],
-                    kickoff_time=self._kickoff_time(tr),
-                    timing_status=TimingStatus.UNKNOWN,
+                    kickoff_time=kickoff_time,
+                    timing_status=TimingStatus.FINISHED if finished else TimingStatus.UNKNOWN,
+                    status="finished" if finished else "scheduled",
+                    live_score=score,
                 )
             )
         return matches
@@ -161,6 +172,27 @@ class DiscoveryParser:
             match.live_score = event.get("score")
             match.timing_status = TimingStatus.FINISHED if event.get("finished") == 1 else TimingStatus.LIVE
         return matches
+
+    def parse_match_page_result(self, html: str) -> tuple[bool, str | None]:
+        soup = BeautifulSoup(html, "lxml")
+        finished = False
+        for script in soup.select('script[type="application/ld+json"]'):
+            text = script.string or script.get_text("", strip=True)
+            if '"eventStatus"' in text and "Finished" in text:
+                finished = True
+                break
+        if not finished and re.search(r"\beventStatus\b[^<]{0,80}\bFinished\b", html, flags=re.I):
+            finished = True
+
+        score = None
+        score_node = soup.select_one(".list-details__item__score")
+        if score_node:
+            score = self._score_from_text(score_node.get_text(" ", strip=True))
+        if not score:
+            details = soup.select_one(".list-details")
+            if details:
+                score = self._score_from_text(details.get_text(" ", strip=True))
+        return finished, score
 
     def _teams(self, li: Tag) -> list[str]:
         text_nodes = []
@@ -217,6 +249,33 @@ class DiscoveryParser:
         if hour > 23:
             return None
         return hour, minute
+
+    def _score(self, row: Tag) -> str | None:
+        for selector in (
+            ".table-main__result",
+            ".table-main__score",
+            ".table-main__matchResult",
+            ".table-main__partial",
+            "[class*='score']",
+            "[class*='result']",
+        ):
+            for node in row.select(selector):
+                text = node.get_text(" ", strip=True)
+                match = re.search(r"\b(\d{1,2})\s*[:\-]\s*(\d{1,2})\b", text)
+                if match:
+                    return f"{match.group(1)}:{match.group(2)}"
+        return None
+
+    def _score_from_text(self, text: str) -> str | None:
+        match = re.search(r"\b(\d{1,2})\s*[:\-]\s*(\d{1,2})\b", text)
+        if match:
+            return f"{match.group(1)}:{match.group(2)}"
+        return None
+
+    def _looks_finished(self, kickoff_time: datetime | None, score: str | None, now: datetime | None) -> bool:
+        if not score or not kickoff_time or not now:
+            return False
+        return kickoff_time <= now.replace(tzinfo=None) - timedelta(minutes=self.finish_grace_minutes)
 
     def _parse_betexplorer_datetime(self, value: str | None) -> datetime | None:
         if not value:

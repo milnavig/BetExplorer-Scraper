@@ -8,7 +8,7 @@ from typing import Any
 from .clock import utc_now
 from .config import Settings
 from .database import Database
-from .models import DiscoveredMatch, OddsSnapshot
+from .models import DiscoveredMatch, OddsSnapshot, TimingStatus
 from .parsers import DiscoveryParser, OddsParser
 from .scheduler import Scheduler, SchedulerConfig
 from .timing import classify_timing
@@ -29,11 +29,15 @@ class CaptureService:
             settings.betexplorer_base_url,
             timezone_offset=settings.betexplorer_timezone_offset,
         )
-        self.discovery_parser = DiscoveryParser(settings.betexplorer_base_url)
+        self.discovery_parser = DiscoveryParser(settings.betexplorer_base_url, settings.result_finish_grace_minutes)
         self.odds_parser = OddsParser()
+        self.odds_capture_window_minutes = max(
+            settings.upcoming_window_minutes,
+            settings.odds_capture_lookahead_hours * 60,
+        )
         self.scheduler = Scheduler(
             SchedulerConfig(
-                upcoming_window_minutes=settings.upcoming_window_minutes,
+                upcoming_window_minutes=self.odds_capture_window_minutes,
                 recently_started_window_minutes=settings.recently_started_window_minutes,
                 max_match_age_after_kickoff_minutes=settings.max_match_age_after_kickoff_minutes,
                 monitoring_capture_poll_interval_seconds=settings.monitoring_capture_poll_interval_seconds,
@@ -67,6 +71,8 @@ class CaptureService:
             "skipped": 0,
             "finalized": 0,
             "waiting": 0,
+            "results_captured": 0,
+            "results_checked": 0,
             "current_event_id": None,
             "last_error": None,
             "last_discovery_at": None,
@@ -129,6 +135,8 @@ class CaptureService:
         skipped = 0
         finalized = 0
         waiting = 0
+        results_captured = 0
+        results_checked = 0
         capture_jobs: list[tuple[str, str, str, datetime | None, str, datetime | None]] = []
         self._set_progress(phase="planning")
 
@@ -141,6 +149,7 @@ class CaptureService:
                 now,
                 next_capture_at=schedule_state["next_capture_at"],
                 finalized_at=schedule_state["finalized_at"],
+                last_capture_at=schedule_state["last_capture_at"],
             )
             self.database.update_match_schedule(match_id, decision.phase, decision.next_capture_at, decision.finalized_at)
             if not decision.should_capture:
@@ -156,7 +165,7 @@ class CaptureService:
             match.timing_status = classify_timing(
                 match.kickoff_time,
                 now,
-                self.settings.upcoming_window_minutes,
+                self.odds_capture_window_minutes,
                 self.settings.recently_started_window_minutes,
                 is_live=match.timing_status.value == "LIVE",
                 is_finished=match.timing_status.value == "FINISHED",
@@ -164,7 +173,25 @@ class CaptureService:
             match_id = self.database.upsert_match(match)
             seen_match_ids.add(match_id)
             schedule_state = self.database.get_match_schedule(match_id)
+            if self._should_capture_result(match, now, schedule_state):
+                results_captured += 1 if self.database.mark_result_captured(match_id, match.live_score, utc_now()) else 0
             schedule_match(match_id, match, schedule_state)
+
+        if should_discover:
+            self._set_progress(phase="result_backfill", results_captured=results_captured)
+            backfill_checked, backfill_captured = await self._capture_result_backfill(now, seen_match_ids)
+            results_checked += backfill_checked
+            results_captured += backfill_captured
+            for match_id, match in self.database.list_empty_finalized_odds_backfill_candidates(
+                now,
+                self.settings.result_capture_lookback_hours,
+                self.settings.result_backfill_batch_size,
+            ):
+                if match_id in seen_match_ids:
+                    continue
+                due += 1
+                capture_jobs.append((match_id, match.event_id, match.source_url, None, "FINALIZING", now))
+            self._set_progress(due=due, queued=len(capture_jobs))
 
         for match_id, match, schedule_state in self.database.list_due_scheduled_matches(now):
             if match_id in seen_match_ids:
@@ -172,7 +199,7 @@ class CaptureService:
             match.timing_status = classify_timing(
                 match.kickoff_time,
                 now,
-                self.settings.upcoming_window_minutes,
+                self.odds_capture_window_minutes,
                 self.settings.recently_started_window_minutes,
                 is_live=match.timing_status.value == "LIVE",
                 is_finished=match.timing_status.value == "FINISHED",
@@ -215,6 +242,8 @@ class CaptureService:
             "skipped": skipped,
             "finalized": finalized,
             "waiting": waiting,
+            "results_captured": results_captured,
+            "results_checked": results_checked,
         }
         self.database.log("info", "capture", "run_once_completed", details=result)
         self._set_progress(
@@ -231,6 +260,8 @@ class CaptureService:
             skipped=result["skipped"],
             finalized=result["finalized"],
             waiting=result["waiting"],
+            results_captured=result["results_captured"],
+            results_checked=result["results_checked"],
             last_discovery_at=self._last_discovery_at.isoformat() if self._last_discovery_at else None,
             next_discovery_at=self._next_discovery_at().isoformat() if self._next_discovery_at() else None,
         )
@@ -248,7 +279,9 @@ class CaptureService:
 
     async def _discover_matches(self, now: datetime) -> list:
         pages = [await self.transport.fetch_homepage()]
-        for offset in range(self.settings.discovery_days_ahead + 1):
+        past_days = max(1, (self.settings.result_capture_lookback_hours + 23) // 24)
+        future_days = max(self.settings.discovery_days_ahead, (self.settings.odds_capture_lookahead_hours + 23) // 24)
+        for offset in range(-past_days, future_days + 1):
             target_date = (now + timedelta(days=offset)).date()
             try:
                 pages.append(await self.transport.fetch_football_date(target_date))
@@ -267,6 +300,54 @@ class CaptureService:
             for match in self.discovery_parser.parse_homepage(page.text, now):
                 matches_by_event_id[match.event_id] = match
         return list(matches_by_event_id.values())
+
+    def _should_capture_result(
+        self,
+        match: DiscoveredMatch,
+        now: datetime,
+        schedule_state: dict[str, datetime | str | None],
+    ) -> bool:
+        if schedule_state.get("result_captured_at") is not None:
+            return False
+        if match.timing_status != TimingStatus.FINISHED and match.status != "finished":
+            return False
+        if not match.kickoff_time or not match.live_score:
+            return False
+        age = now - match.kickoff_time
+        return timedelta(0) <= age <= timedelta(hours=self.settings.result_capture_lookback_hours)
+
+    async def _capture_result_backfill(self, now: datetime, skip_match_ids: set[str]) -> tuple[int, int]:
+        checked = 0
+        captured = 0
+        candidates = self.database.list_result_backfill_candidates(
+            now,
+            self.settings.result_capture_lookback_hours,
+            self.settings.result_finish_grace_minutes,
+            self.settings.result_check_retry_seconds,
+            self.settings.result_backfill_batch_size,
+        )
+        for match_id, match in candidates:
+            if match_id in skip_match_ids:
+                continue
+            checked += 1
+            checked_at = utc_now()
+            try:
+                page = await self.transport.fetch_match_page(match.source_url)
+                finished, score = self.discovery_parser.parse_match_page_result(page.text)
+                if finished and score:
+                    captured += 1 if self.database.mark_result_captured(match_id, score, checked_at) else 0
+                self.database.mark_result_checked(match_id, checked_at)
+            except Exception as exc:
+                self.database.mark_result_checked(match_id, checked_at)
+                self.database.log(
+                    "warning",
+                    "capture",
+                    "result_backfill_failed",
+                    match.event_id,
+                    {"error": str(exc), "source_url": match.source_url},
+                )
+            self._set_progress(results_checked=checked, results_captured=captured)
+        return checked, captured
 
     async def capture_match(self, match_id: str, event_id: str, source_url: str) -> bool:
         markets = await self._markets_for_match(source_url)

@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     target_bookmakers: str = "Bwin,Unibet"
     capture_market: str = "all"
     upcoming_window_minutes: int = 30
+    odds_capture_lookahead_hours: int = 6
+    result_capture_lookback_hours: int = 24
+    result_finish_grace_minutes: int = 120
+    result_check_retry_seconds: int = 3600
+    result_backfill_batch_size: int = 200
     recently_started_window_minutes: int = 10
     max_match_age_after_kickoff_minutes: int = 5
     monitoring_capture_poll_interval_seconds: int = 120
