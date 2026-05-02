@@ -705,6 +705,24 @@ tbody tr:hover td {
   background: #eef8fa;
 }
 
+.market-group-row td {
+  position: sticky;
+  top: 37px;
+  z-index: 1;
+  background: #dfeef2;
+  color: var(--accent);
+  font-weight: 800;
+}
+
+.market-group-row strong {
+  margin-right: 8px;
+}
+
+.market-group-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 td.odd {
   color: var(--accent-2);
   font-weight: 800;
@@ -977,6 +995,52 @@ code {
 
 .table-toolbar {
   margin-bottom: 10px;
+}
+
+.market-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.market-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.market-tab strong {
+  font-size: 12px;
+}
+
+.market-tab span {
+  min-width: 24px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #edf3f5;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.market-tab.active {
+  border-color: var(--accent);
+  background: #eaf6f9;
+  color: var(--accent);
+}
+
+.market-tab.active span {
+  background: var(--accent);
+  color: #ffffff;
 }
 
 .full-table {

@@ -100,6 +100,10 @@ type MatchDetail = {
   attempts: AttemptRow[];
 };
 
+type GroupedOddsRow =
+  | { type: "market"; market: string; count: number }
+  | { type: "odds"; row: BookmakerOdds };
+
 type Status = {
   betexplorer_timezone_offset: string;
   scheduler_tick_seconds: number;
@@ -218,6 +222,14 @@ export default function MatchPage() {
   const match = detail?.match ?? matches.find((item) => item.id === selectedId) ?? null;
   const requiredRows = filteredOdds.filter((row) => REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker));
   const marketCounts = useMemo(() => marketCountsFor(detail?.bookmaker_odds ?? []), [detail]);
+  const groupedOddsRows = useMemo(() => groupOddsRows(filteredOdds), [filteredOdds]);
+
+  useEffect(() => {
+    if (marketFilter === "all_markets") return;
+    if (!marketCounts.some((item) => item.market === marketFilter)) {
+      setMarketFilter("all_markets");
+    }
+  }, [marketCounts, marketFilter]);
 
   const refresh = () => {
     startTransition(async () => {
@@ -348,6 +360,27 @@ export default function MatchPage() {
                 title="All bookmaker odds rows"
                 subtitle={`${filteredOdds.length} visible of ${detail?.bookmaker_odds.length ?? 0} · ${marketCounts.map((item) => `${marketLabel(item.market)} ${item.count}`).join(" · ")}`}
               />
+              <div className="market-tabs" aria-label="Market filters">
+                <button
+                  type="button"
+                  className={marketFilter === "all_markets" ? "market-tab active" : "market-tab"}
+                  onClick={() => setMarketFilter("all_markets")}
+                >
+                  <strong>All</strong>
+                  <span>{detail?.bookmaker_odds.length ?? 0}</span>
+                </button>
+                {marketCounts.map((item) => (
+                  <button
+                    type="button"
+                    key={item.market}
+                    className={marketFilter === item.market ? "market-tab active" : "market-tab"}
+                    onClick={() => setMarketFilter(item.market)}
+                  >
+                    <strong>{marketLabel(item.market)}</strong>
+                    <span>{item.count}</span>
+                  </button>
+                ))}
+              </div>
               <div className="toolbar table-toolbar">
                 <label className="toggle">
                   <input type="checkbox" checked={requiredOnly} onChange={(event) => setRequiredOnly(event.target.checked)} />
@@ -386,20 +419,29 @@ export default function MatchPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredOdds.map((row) => (
-                      <tr key={row.id} className={REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker) ? "required" : ""}>
-                        <td>{row.bookmaker}</td>
-                        <td>{marketLabel(row.market)}</td>
-                        <td><span className="line-pill">{marketLine(row)}</span></td>
-                        <td>{row.normalized_bookmaker}</td>
-                        <td>{row.bookmaker_id ?? "-"}</td>
-                        <td>{row.betexplorer_bookmaker_id ?? "-"}</td>
-                        <td><PriceSet row={row} /></td>
-                        <td>{row.is_available ? "yes" : "no"}</td>
-                        <td>{formatUtcDate(row.snapshot_captured_at)}</td>
-                        <td>{formatUtcDate(row.created_at)}</td>
-                      </tr>
-                    ))}
+                    {groupedOddsRows.map((item) =>
+                      item.type === "market" ? (
+                        <tr key={`market-${item.market}`} className="market-group-row">
+                          <td colSpan={10}>
+                            <strong>{marketLabel(item.market)}</strong>
+                            <span>{item.count} rows</span>
+                          </td>
+                        </tr>
+                      ) : (
+                        <tr key={item.row.id} className={REQUIRED_BOOKMAKERS.has(item.row.normalized_bookmaker) ? "required" : ""}>
+                          <td>{item.row.bookmaker}</td>
+                          <td>{marketLabel(item.row.market)}</td>
+                          <td><span className="line-pill">{marketLine(item.row)}</span></td>
+                          <td>{item.row.normalized_bookmaker}</td>
+                          <td>{item.row.bookmaker_id ?? "-"}</td>
+                          <td>{item.row.betexplorer_bookmaker_id ?? "-"}</td>
+                          <td><PriceSet row={item.row} /></td>
+                          <td>{item.row.is_available ? "yes" : "no"}</td>
+                          <td>{formatUtcDate(item.row.snapshot_captured_at)}</td>
+                          <td>{formatUtcDate(item.row.created_at)}</td>
+                        </tr>
+                      ),
+                    )}
                   </tbody>
                 </table>
               </div>
@@ -610,8 +652,23 @@ function marketCountsFor(rows: BookmakerOdds[]) {
     .sort((left, right) => marketSortValue(left.market) - marketSortValue(right.market));
 }
 
+function groupOddsRows(rows: BookmakerOdds[]): GroupedOddsRow[] {
+  const groups = new Map<string, BookmakerOdds[]>();
+  for (const row of rows) {
+    const group = groups.get(row.market) ?? [];
+    group.push(row);
+    groups.set(row.market, group);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => marketSortValue(left) - marketSortValue(right))
+    .flatMap(([market, marketRows]) => [
+      { type: "market" as const, market, count: marketRows.length },
+      ...marketRows.map((row) => ({ type: "odds" as const, row })),
+    ]);
+}
+
 function marketSortValue(market: string) {
-  const order = ["1x2", "ou", "ah", "ha", "dc", "bts"];
+  const order = ["ou", "ah", "ha", "dc", "bts", "1x2"];
   const index = order.indexOf(market.toLowerCase());
   return index === -1 ? order.length : index;
 }
