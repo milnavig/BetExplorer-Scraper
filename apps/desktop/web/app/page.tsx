@@ -214,6 +214,9 @@ type ExportResult = {
   download_url: string;
 };
 
+type ExportFormat = "csv" | "xlsx";
+type ExportLayout = "wide" | "long";
+
 type CaptureRunResult = {
   discovered: number;
   due: number;
@@ -281,6 +284,7 @@ export default function Dashboard() {
   const [bookmakerQuery, setBookmakerQuery] = useState("");
   const [matchFilter, setMatchFilter] = useState<MatchFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("capture_desc");
+  const [marketFilter, setMarketFilter] = useState("all_markets");
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [lastRun, setLastRun] = useState<CaptureRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -427,6 +431,7 @@ export default function Dashboard() {
     return rows.filter((row) => {
       const requiredOk =
         !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
+      const marketOk = marketFilter === "all_markets" || row.market === marketFilter;
       const queryOk =
         !query ||
         [
@@ -442,9 +447,14 @@ export default function Dashboard() {
           .join(" ")
           .toLowerCase()
           .includes(query);
-      return requiredOk && queryOk;
+      return requiredOk && marketOk && queryOk;
     });
-  }, [bookmakerQuery, detail, requiredOnly]);
+  }, [bookmakerQuery, detail, marketFilter, requiredOnly]);
+
+  const marketCounts = useMemo(
+    () => marketCountsFor(detail?.bookmaker_odds ?? []),
+    [detail],
+  );
 
   const selectedMatch =
     detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
@@ -475,13 +485,13 @@ export default function Dashboard() {
     });
   };
 
-  const exportOdds = (format: "csv" | "xlsx") => {
+  const exportOdds = (format: ExportFormat, layout: ExportLayout = "wide") => {
     startTransition(async () => {
       setError(null);
       try {
         const result = await api<ExportResult>("/api/exports/final-odds", {
           method: "POST",
-          body: JSON.stringify({ format }),
+          body: JSON.stringify({ format, layout }),
         });
         window.location.assign(`${API_BASE}${result.download_url}`);
         await load();
@@ -599,20 +609,36 @@ export default function Dashboard() {
               Run once
             </button>
             <button
-              onClick={() => exportOdds("csv")}
+              onClick={() => exportOdds("csv", "wide")}
               disabled={isPending}
-              title="Export CSV"
+              title="Export wide CSV"
             >
               <Download size={16} />
               CSV
             </button>
             <button
-              onClick={() => exportOdds("xlsx")}
+              onClick={() => exportOdds("csv", "long")}
               disabled={isPending}
-              title="Export Excel"
+              title="Export long CSV with one row per bookmaker market line"
+            >
+              <Download size={16} />
+              Long CSV
+            </button>
+            <button
+              onClick={() => exportOdds("xlsx", "wide")}
+              disabled={isPending}
+              title="Export wide Excel"
             >
               <Download size={16} />
               XLSX
+            </button>
+            <button
+              onClick={() => exportOdds("xlsx", "long")}
+              disabled={isPending}
+              title="Export long Excel with one row per bookmaker market line"
+            >
+              <Download size={16} />
+              Long XLSX
             </button>
           </div>
         </header>
@@ -968,7 +994,7 @@ export default function Dashboard() {
               <h3>Bookmaker odds</h3>
               <p>
                 {detail
-                  ? `${filteredBookmakers.length} visible of ${detail.bookmaker_odds.length}`
+                  ? `${filteredBookmakers.length} visible of ${detail.bookmaker_odds.length} · ${marketCounts.map((item) => `${marketLabel(item.market)} ${item.count}`).join(" · ")}`
                   : "Select a match"}
               </p>
             </div>
@@ -980,6 +1006,17 @@ export default function Dashboard() {
                   onChange={(event) => setRequiredOnly(event.target.checked)}
                 />
                 Required only
+              </label>
+              <label className="select-filter" title="Filter bookmaker rows by market">
+                <Filter size={14} />
+                <select value={marketFilter} onChange={(event) => setMarketFilter(event.target.value)}>
+                  <option value="all_markets">All markets</option>
+                  {marketCounts.map((item) => (
+                    <option key={item.market} value={item.market}>
+                      {marketLabel(item.market)} ({item.count})
+                    </option>
+                  ))}
+                </select>
               </label>
               <label className="search">
                 <Filter size={15} />
@@ -1375,6 +1412,22 @@ function marketLabel(market: string | null | undefined) {
     labels[(market ?? "").toLowerCase()] ??
     (market ? market.toUpperCase() : "-")
   );
+}
+
+function marketCountsFor(rows: BookmakerOdds[]) {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    counts.set(row.market, (counts.get(row.market) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([market, count]) => ({ market, count }))
+    .sort((left, right) => marketSortValue(left.market) - marketSortValue(right.market));
+}
+
+function marketSortValue(market: string) {
+  const order = ["1x2", "ou", "ah", "ha", "dc", "bts"];
+  const index = order.indexOf(market.toLowerCase());
+  return index === -1 ? order.length : index;
 }
 
 function marketLine(row: BookmakerOdds) {

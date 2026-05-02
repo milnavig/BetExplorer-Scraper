@@ -819,7 +819,7 @@ class Database:
             odds_rows = self.connection.execute(
                 """
                 SELECT bookmaker, normalized_bookmaker, home_odds, draw_odds, away_odds,
-                       bookmaker_id, betexplorer_bookmaker_id, raw_row_text
+                       bookmaker_id, betexplorer_bookmaker_id, raw_row_text, raw_attributes_json
                 FROM bookmaker_odds WHERE snapshot_id = ? ORDER BY bookmaker
                 """,
                 [snapshot_id],
@@ -834,6 +834,7 @@ class Database:
                     bookmaker_id=o[5],
                     betexplorer_bookmaker_id=o[6],
                     raw_row_text=o[7] or "",
+                    raw_attributes=json.loads(o[8] or "{}"),
                 )
                 for o in odds_rows
             ]

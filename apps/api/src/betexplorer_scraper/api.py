@@ -75,6 +75,7 @@ app.add_middleware(
 class ExportRequest(BaseModel):
     date: str | None = None
     format: str = "csv"
+    layout: str = "wide"
 
 
 @app.get("/api/status")
@@ -190,6 +191,7 @@ async def capture_run_once() -> dict[str, int]:
 @app.post("/api/exports/final-odds")
 def export_final_odds_endpoint(request: ExportRequest) -> dict[str, str]:
     fmt = request.format.lower()
+    layout = request.layout.lower()
     date_slug = request.date or utc_now().strftime("%Y-%m-%d")
     try:
         path = export_final_odds(
@@ -198,6 +200,7 @@ def export_final_odds_endpoint(request: ExportRequest) -> dict[str, str]:
             date_slug,
             fmt,
             settings.betexplorer_timezone_offset,
+            layout,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

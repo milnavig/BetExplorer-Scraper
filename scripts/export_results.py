@@ -12,6 +12,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Export BetExplorer final odds")
     parser.add_argument("--date", default=utc_now().strftime("%Y-%m-%d"))
     parser.add_argument("--format", choices=["csv", "xlsx"], default="csv")
+    parser.add_argument("--layout", choices=["wide", "long"], default="wide")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -22,6 +23,7 @@ def main() -> None:
         args.date,
         args.format,
         settings.betexplorer_timezone_offset,
+        args.layout,
     )
     print(path)
 

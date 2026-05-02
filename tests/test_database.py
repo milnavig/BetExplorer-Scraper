@@ -51,6 +51,50 @@ def test_database_persists_match_snapshot_and_rehydrates_final_export_items() ->
     assert final_odds_rows(items)[0]["quality_status"] == "COMPLETE"
 
 
+def test_database_rehydrates_bookmaker_raw_attributes_for_exports() -> None:
+    db_path = Path("data/test_tmp/test_export_raw_attributes.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="attrs123",
+            source_url="https://www.betexplorer.com/football/test/attrs123/",
+            league="Test League",
+            home_team="Home",
+            away_team="Away",
+            kickoff_time=datetime(2026, 4, 28, 20, 0),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="attrs123",
+            market="ou",
+            captured_at=datetime(2026, 4, 28, 19, 59),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin"],
+            bookmaker_odds=[
+                BookmakerOdds(
+                    "Bwin",
+                    "bwin",
+                    1.91,
+                    1.89,
+                    None,
+                    raw_row_text="Bwin 2.5 1.91 1.89",
+                    raw_attributes={"market_line": "2.5"},
+                )
+            ],
+        ),
+    )
+
+    items = db.final_snapshot_items()
+
+    assert items[0][1].bookmaker_odds[0].raw_attributes["market_line"] == "2.5"
+
+
 def test_database_stores_capture_schedule_fields() -> None:
     db_path = Path("data/test_tmp/test_scheduler.duckdb")
     db_path.parent.mkdir(parents=True, exist_ok=True)

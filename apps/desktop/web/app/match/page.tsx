@@ -129,6 +129,7 @@ export default function MatchPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [matchQuery, setMatchQuery] = useState("");
   const [oddsQuery, setOddsQuery] = useState("");
+  const [marketFilter, setMarketFilter] = useState("all_markets");
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
@@ -194,6 +195,7 @@ export default function MatchPage() {
     const query = oddsQuery.trim().toLowerCase();
     return (detail?.bookmaker_odds ?? []).filter((row) => {
       const requiredOk = !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
+      const marketOk = marketFilter === "all_markets" || row.market === marketFilter;
       const queryOk =
         !query ||
         [
@@ -209,12 +211,13 @@ export default function MatchPage() {
           .join(" ")
           .toLowerCase()
           .includes(query);
-      return requiredOk && queryOk;
+      return requiredOk && marketOk && queryOk;
     });
-  }, [detail, oddsQuery, requiredOnly]);
+  }, [detail, marketFilter, oddsQuery, requiredOnly]);
 
   const match = detail?.match ?? matches.find((item) => item.id === selectedId) ?? null;
   const requiredRows = filteredOdds.filter((row) => REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker));
+  const marketCounts = useMemo(() => marketCountsFor(detail?.bookmaker_odds ?? []), [detail]);
 
   const refresh = () => {
     startTransition(async () => {
@@ -341,11 +344,25 @@ export default function MatchPage() {
             </section>
 
             <section className="panel">
-              <PanelHeader title="All bookmaker odds rows" subtitle={`${filteredOdds.length} visible of ${detail?.bookmaker_odds.length ?? 0}`} />
+              <PanelHeader
+                title="All bookmaker odds rows"
+                subtitle={`${filteredOdds.length} visible of ${detail?.bookmaker_odds.length ?? 0} · ${marketCounts.map((item) => `${marketLabel(item.market)} ${item.count}`).join(" · ")}`}
+              />
               <div className="toolbar table-toolbar">
                 <label className="toggle">
                   <input type="checkbox" checked={requiredOnly} onChange={(event) => setRequiredOnly(event.target.checked)} />
                   Required only
+                </label>
+                <label className="select-filter" title="Filter bookmaker rows by market">
+                  <Filter size={14} />
+                  <select value={marketFilter} onChange={(event) => setMarketFilter(event.target.value)}>
+                    <option value="all_markets">All markets</option>
+                    {marketCounts.map((item) => (
+                      <option key={item.market} value={item.market}>
+                        {marketLabel(item.market)} ({item.count})
+                      </option>
+                    ))}
+                  </select>
                 </label>
                 <label className="search">
                   <Filter size={15} />
@@ -581,6 +598,22 @@ function marketLabel(market: string | null | undefined) {
     dnb: "Draw No Bet"
   };
   return labels[(market ?? "").toLowerCase()] ?? (market ? market.toUpperCase() : "-");
+}
+
+function marketCountsFor(rows: BookmakerOdds[]) {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    counts.set(row.market, (counts.get(row.market) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([market, count]) => ({ market, count }))
+    .sort((left, right) => marketSortValue(left.market) - marketSortValue(right.market));
+}
+
+function marketSortValue(market: string) {
+  const order = ["1x2", "ou", "ah", "ha", "dc", "bts"];
+  const index = order.indexOf(market.toLowerCase());
+  return index === -1 ? order.length : index;
 }
 
 function marketLine(row: BookmakerOdds) {
