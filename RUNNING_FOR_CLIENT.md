@@ -8,15 +8,50 @@ This folder contains the full BetExplorer Monitor app. The client does not need 
 
 1A. Install Python 3.11 or newer from https://www.python.org/downloads/.
 
-Important: on the first Python installer screen, enable:
+1B. Add Python to Windows PATH manually.
+
+After installation, find where Python was installed. Common folders look like:
 
 ```text
-Add python.exe to PATH
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python314\
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python314\
+С:\Python314\
 ```
 
-Then click `Install Now`.
+Also find the `Scripts` folder inside it:
 
-1B. Check that Windows can find Python.
+```text
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python314\Scripts\
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python314\Scripts\
+С:\Python314\
+```
+
+Add both folders to Windows PATH:
+
+1. Open Start menu.
+2. Search for `Environment Variables`.
+3. Open `Edit the system environment variables`.
+4. Click `Environment Variables...`.
+5. In `User variables`, select `Path`.
+6. Click `Edit`.
+7. Click `New`.
+8. Add the Python folder, for example:
+
+```text
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python312\
+```
+
+9. Click `New` again.
+10. Add the Python Scripts folder, for example:
+
+```text
+C:\Users\<WindowsUser>\AppData\Local\Programs\Python\Python312\Scripts\
+```
+
+11. Click `OK` on all windows.
+12. Close and reopen `Command Prompt`.
+
+Check that Windows can find Python:
 
 Open `Command Prompt` from the Start menu and run:
 
@@ -27,14 +62,10 @@ python --version
 It should print something like:
 
 ```text
-Python 3.11.9
+Python 3.14...
 ```
 
-If Windows says that `python` is not recognized, Python was installed without PATH. Fix it with one of these options:
-
-- Run the Python installer again, choose `Modify`, enable `Add Python to environment variables`, then finish the installer.
-- Or uninstall Python, install it again, and make sure `Add python.exe to PATH` is checked.
-- Close and reopen `Command Prompt` after changing PATH.
+If Windows says that `python` is not recognized, the Python folders were not added to PATH correctly. Recheck both paths and reopen `Command Prompt`.
 
 2. Install Node.js LTS from https://nodejs.org/.
 3. Open this project folder.
