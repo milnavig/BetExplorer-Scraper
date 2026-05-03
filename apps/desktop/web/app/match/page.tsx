@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
+const MATCH_RENDER_BATCH = 80;
 
 type MatchRow = {
   id: string;
@@ -139,6 +140,8 @@ export default function MatchPage() {
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
   const selectedIdRef = useRef<string | null>(null);
+  const matchListMoreRef = useRef<HTMLDivElement | null>(null);
+  const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
@@ -195,6 +198,33 @@ export default function MatchPage() {
     });
   }, [matchQuery, matches]);
 
+  useEffect(() => {
+    setMatchRenderLimit(MATCH_RENDER_BATCH);
+  }, [matchQuery]);
+
+  const renderedMatches = useMemo(
+    () => visibleMatches.slice(0, matchRenderLimit),
+    [matchRenderLimit, visibleMatches],
+  );
+  const hasMoreMatches = renderedMatches.length < visibleMatches.length;
+  const loadMoreMatches = () =>
+    setMatchRenderLimit((value) =>
+      Math.min(value + MATCH_RENDER_BATCH, visibleMatches.length),
+    );
+
+  useEffect(() => {
+    const node = matchListMoreRef.current;
+    if (!node || !hasMoreMatches || !("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreMatches();
+      },
+      { rootMargin: "320px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasMoreMatches, visibleMatches.length]);
+
   const filteredOdds = useMemo(() => {
     const query = oddsQuery.trim().toLowerCase();
     return (detail?.bookmaker_odds ?? []).filter((row) => {
@@ -223,6 +253,9 @@ export default function MatchPage() {
   const requiredRows = filteredOdds.filter((row) => REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker));
   const marketCounts = useMemo(() => marketCountsFor(detail?.bookmaker_odds ?? []), [detail]);
   const groupedOddsRows = useMemo(() => groupOddsRows(filteredOdds), [filteredOdds]);
+  const timezoneOffset = status?.betexplorer_timezone_offset ?? "+0";
+  const formatSchedule = (value?: string | null) => formatScheduleDate(value, timezoneOffset);
+  const formatUtc = (value?: string | null) => formatUtcDate(value, timezoneOffset);
 
   useEffect(() => {
     if (marketFilter === "all_markets") return;
@@ -261,13 +294,25 @@ export default function MatchPage() {
           <input value={matchQuery} onChange={(event) => setMatchQuery(event.target.value)} placeholder="Search matches" />
         </label>
         <div className="match-picker">
-          {visibleMatches.map((item) => (
+          {renderedMatches.map((item) => (
             <button key={item.id} className={item.id === selectedId ? "picker-row selected" : "picker-row"} onClick={() => selectMatch(item.id)}>
               <span className={`quality ${qualityClass(item.quality_status)}`}>{qualityLabel(item.quality_status)}</span>
               <strong>{item.home_team} - {item.away_team}</strong>
-              <small>{formatScheduleDate(item.kickoff_time)} · {item.bookmaker_count} bookmakers · {item.attempt_count} tries</small>
+              <small>{formatSchedule(item.kickoff_time)} · {item.bookmaker_count} bookmakers · {item.attempt_count} tries</small>
             </button>
           ))}
+          {visibleMatches.length > 0 ? (
+            <div className="list-footer" ref={matchListMoreRef}>
+              <span>
+                Showing {renderedMatches.length} of {visibleMatches.length}
+              </span>
+              {hasMoreMatches ? (
+                <button type="button" onClick={loadMoreMatches}>
+                  Load more matches
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       </aside>
 
@@ -317,17 +362,17 @@ export default function MatchPage() {
             </section>
 
             <section className="detail-metrics">
-              <Info label="Kickoff" value={formatScheduleDate(match.kickoff_time)} />
+              <Info label="Kickoff" value={formatSchedule(match.kickoff_time)} />
               <Info label="Status" value={match.status ?? "-"} />
               <Info label="Timing" value={displayTiming(match)} />
               <Info label="Capture phase" value={displayCapturePhase(match)} />
-              <Info label="Next capture" value={formatScheduleDate(match.next_capture_at)} />
-              <Info label="Last capture" value={formatUtcDate(match.last_capture_at)} />
-              <Info label="Finalized" value={formatScheduleDate(match.finalized_at)} />
-              <Info label="Result captured" value={formatUtcDate(match.result_captured_at)} />
+              <Info label="Next capture" value={formatSchedule(match.next_capture_at)} />
+              <Info label="Last capture" value={formatUtc(match.last_capture_at)} />
+              <Info label="Finalized" value={formatSchedule(match.finalized_at)} />
+              <Info label="Result captured" value={formatUtc(match.result_captured_at)} />
               <Info label="Live score" value={match.live_score ?? "-"} />
               <Info label="Snapshot ID" value={match.snapshot_id ?? "-"} />
-              <Info label="Snapshot captured" value={formatUtcDate(match.captured_at)} />
+              <Info label="Snapshot captured" value={formatUtc(match.captured_at)} />
               <Info label="Final snapshot age" value={formatAgeToKickoff(match.final_snapshot_age_to_kickoff_seconds)} />
               <Info label="Bookmakers" value={String(match.bookmaker_count)} />
               <Info label="Attempts" value={String(match.attempt_count)} />
@@ -434,8 +479,8 @@ export default function MatchPage() {
                           <td>{item.row.betexplorer_bookmaker_id ?? "-"}</td>
                           <td><PriceSet row={item.row} /></td>
                           <td>{item.row.is_available ? "yes" : "no"}</td>
-                          <td>{formatUtcDate(item.row.snapshot_captured_at)}</td>
-                          <td>{formatUtcDate(item.row.created_at)}</td>
+                          <td>{formatUtc(item.row.snapshot_captured_at)}</td>
+                          <td>{formatUtc(item.row.created_at)}</td>
                         </tr>
                       ),
                     )}
@@ -469,7 +514,7 @@ export default function MatchPage() {
                       {(detail?.snapshots ?? []).map((snapshot) => (
                         <tr key={snapshot.id}>
                           <td><code>{snapshot.id}</code></td>
-                          <td>{formatUtcDate(snapshot.captured_at)}</td>
+                          <td>{formatUtc(snapshot.captured_at)}</td>
                           <td>{snapshot.market}</td>
                           <td>{snapshot.capture_type}</td>
                           <td><span className={`quality ${qualityClass(snapshot.quality_status)}`}>{qualityLabel(snapshot.quality_status)}</span></td>
@@ -479,7 +524,7 @@ export default function MatchPage() {
                           <td>{snapshot.bookmaker_count ?? "-"}</td>
                           <td>{formatAgeToKickoff(snapshot.final_snapshot_age_to_kickoff_seconds)}</td>
                           <td><code>{formatRequiredJson(snapshot.required_bookmakers_json)}</code></td>
-                          <td>{formatUtcDate(snapshot.created_at)}</td>
+                          <td>{formatUtc(snapshot.created_at)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -509,8 +554,8 @@ export default function MatchPage() {
                           <td><code>{attempt.id}</code></td>
                           <td>{attempt.attempt_number}</td>
                           <td><span className={`quality ${qualityClass(attempt.status)}`}>{qualityLabel(attempt.status)}</span></td>
-                          <td>{formatUtcDate(attempt.started_at)}</td>
-                          <td>{formatUtcDate(attempt.finished_at)}</td>
+                          <td>{formatUtc(attempt.started_at)}</td>
+                          <td>{formatUtc(attempt.finished_at)}</td>
                           <td><code>{formatRequiredJson(attempt.required_found_json)}</code></td>
                           <td>{attempt.error_message ?? "-"}</td>
                           <td><code>{attempt.source_url}</code></td>
@@ -587,28 +632,25 @@ function PriceSet({ row }: { row: BookmakerOdds }) {
   );
 }
 
-function formatScheduleDate(value?: string | null) {
-  return value
-    ? new Intl.DateTimeFormat("en", {
-        month: "short",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        timeZone: "Europe/Kyiv"
-      }).format(parseLocalApiDate(value))
-    : "-";
+function formatScheduleDate(value: string | null | undefined, timezoneOffset: string) {
+  if (!value) return "-";
+  return formatOffsetDate(parseOffsetLocalApiDate(value, timezoneOffset), timezoneOffset);
 }
 
-function formatUtcDate(value?: string | null) {
-  return value
-    ? new Intl.DateTimeFormat("en", {
-        month: "short",
-        day: "2-digit",
-        hour: "2-digit",
-        minute: "2-digit",
-        timeZone: "Europe/Kyiv"
-      }).format(parseUtcApiDate(value))
-    : "-";
+function formatUtcDate(value: string | null | undefined, timezoneOffset: string) {
+  if (!value) return "-";
+  return formatOffsetDate(parseUtcApiDate(value), timezoneOffset);
+}
+
+function formatOffsetDate(date: Date, timezoneOffset: string) {
+  const shifted = new Date(date.getTime() + parseTimezoneOffsetMs(timezoneOffset));
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+  }).format(shifted);
 }
 
 function formatOdd(value: number | null) {
@@ -792,6 +834,25 @@ function parseUtcApiDate(value: string) {
   return new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`);
 }
 
-function parseLocalApiDate(value: string) {
-  return new Date(value);
+function parseOffsetLocalApiDate(value: string, timezoneOffset: string) {
+  if (/[zZ]$|[+-]\d\d:\d\d$/.test(value)) return new Date(value);
+  return new Date(`${value}${formatTimezoneOffset(timezoneOffset)}`);
+}
+
+function parseTimezoneOffsetMs(value: string) {
+  const match = value.trim().match(/^([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  if (!match) return 0;
+  const sign = match[1] === "-" ? -1 : 1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3] ?? "0");
+  return sign * (hours * 60 + minutes) * 60 * 1000;
+}
+
+function formatTimezoneOffset(value: string) {
+  const offsetMs = parseTimezoneOffsetMs(value);
+  const sign = offsetMs < 0 ? "-" : "+";
+  const absoluteMinutes = Math.abs(offsetMs) / 60000;
+  const hours = Math.floor(absoluteMinutes / 60);
+  const minutes = absoluteMinutes % 60;
+  return `${sign}${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }

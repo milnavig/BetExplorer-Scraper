@@ -534,6 +534,22 @@ small {
   transform: translateX(2px);
 }
 
+.list-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 2px 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.list-footer button {
+  width: auto;
+  min-height: 32px;
+  padding: 6px 10px;
+}
+
 .match-row strong,
 .match-row small,
 .match-row em,

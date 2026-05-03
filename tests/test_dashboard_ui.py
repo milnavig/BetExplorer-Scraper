@@ -34,3 +34,70 @@ def test_dashboard_prefers_finalized_at_over_stale_finalizing_phase() -> None:
     assert expected_phase in page
     assert expected_phase in match_page
     assert 'label="Capture phase" value={displayCapturePhase(match)}' in match_page
+
+
+def test_dashboard_dates_use_api_timezone_offset_not_hardcoded_kyiv() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+
+    assert 'timeZone: "Europe/Kyiv"' not in page
+    assert 'timeZone: "Europe/Kyiv"' not in match_page
+    assert "betexplorer_timezone_offset" in page
+    assert "betexplorer_timezone_offset" in match_page
+    assert "formatTimezoneOffset" in page
+    assert "formatTimezoneOffset" in match_page
+
+
+def test_dashboard_bookmaker_strip_does_not_hide_loaded_bookmakers() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+
+    assert "bookmakers.slice(0, 12)" not in page
+    assert "bookmakers.map((bookmaker)" in page
+
+
+def test_match_lists_render_incrementally_instead_of_mapping_every_row() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+
+    assert "MATCH_RENDER_BATCH" in page
+    assert "renderedMatches" in page
+    assert "filteredMatches.map((match)" not in page
+    assert "IntersectionObserver" in page
+    assert "Load more matches" in page
+
+    assert "MATCH_RENDER_BATCH" in match_page
+    assert "renderedMatches" in match_page
+    assert "visibleMatches.map((item)" not in match_page
+    assert "IntersectionObserver" in match_page
+    assert "Load more matches" in match_page
+
+
+def test_dashboard_tooltips_explain_metrics_with_operational_context() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+
+    expected_phrases = [
+        "Total rows in the matches table",
+        "Distinct matches that currently have at least one final odds snapshot",
+        "Due captures is not a live-match count",
+        "Finalized matches that have scrape attempts but still have zero final odds snapshots",
+        "Distinct bookmaker names present in final odds rows",
+        "Rows saved in the currently selected final snapshots",
+        "This is separate from odds capture",
+        'title={tooltipFor("Overview nav")}',
+        'title={tooltipFor("Refresh data")}',
+        'title={tooltipFor("Export long CSV")}',
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page
+
+
+def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+
+    assert "DASHBOARD_STATUS_REFRESH_MS" in page
+    assert "DASHBOARD_FULL_REFRESH_MS" in page
+    assert "loadStatusOnly" in page
+    assert "loadDashboardData" in page
+    assert "setInterval(() => void load(), 5000)" not in page
+    assert "api<MatchRow[]>(\"/api/matches\")" in page

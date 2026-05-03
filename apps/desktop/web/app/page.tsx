@@ -17,6 +17,9 @@ import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
+const MATCH_RENDER_BATCH = 80;
+const DASHBOARD_STATUS_REFRESH_MS = 5000;
+const DASHBOARD_FULL_REFRESH_MS = 30000;
 
 type Status = {
   running: boolean;
@@ -292,12 +295,47 @@ export default function Dashboard() {
   const [clientTimezone, setClientTimezone] = useState("-");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const selectedIdRef = useRef<string | null>(null);
+  const matchListMoreRef = useRef<HTMLDivElement | null>(null);
+  const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
 
-  const load = async () => {
+  const applyDashboardData = (
+    nextStatus: Status,
+    nextMatches: MatchRow[],
+    nextSnapshots: SnapshotRow[],
+    nextAttempts: AttemptRow[],
+    nextLogs: LogRow[],
+    nextBookmakers: BookmakerCoverage[],
+    nextExports: ExportFile[],
+  ) => {
+    startTransition(() => {
+      setStatus(nextStatus);
+      setMatches(nextMatches);
+      setSnapshots(nextSnapshots);
+      setAttempts(nextAttempts);
+      setLogs(nextLogs);
+      setBookmakers(nextBookmakers);
+      setExports(nextExports);
+      const currentSelectedId = selectedIdRef.current;
+      if (
+        (!currentSelectedId ||
+          !nextMatches.some((match) => match.id === currentSelectedId)) &&
+        nextMatches.length > 0
+      ) {
+        const nextSelectedId = (
+          nextMatches.find((match) => match.bookmaker_count > 0) ??
+          nextMatches[0]
+        ).id;
+        selectedIdRef.current = nextSelectedId;
+        setSelectedId(nextSelectedId);
+      }
+    });
+  };
+
+  const loadDashboardData = async () => {
     setError(null);
     try {
       const [
@@ -317,19 +355,15 @@ export default function Dashboard() {
         api<BookmakerCoverage[]>("/api/bookmakers"),
         api<ExportFile[]>("/api/exports"),
       ]);
-      setStatus(nextStatus);
-      setMatches(nextMatches);
-      setSnapshots(nextSnapshots);
-      setAttempts(nextAttempts);
-      setLogs(nextLogs);
-      setBookmakers(nextBookmakers);
-      setExports(nextExports);
-      const currentSelectedId = selectedIdRef.current;
-      if ((!currentSelectedId || !nextMatches.some((match) => match.id === currentSelectedId)) && nextMatches.length > 0) {
-        const nextSelectedId = (nextMatches.find((match) => match.bookmaker_count > 0) ?? nextMatches[0]).id;
-        selectedIdRef.current = nextSelectedId;
-        setSelectedId(nextSelectedId);
-      }
+      applyDashboardData(
+        nextStatus,
+        nextMatches,
+        nextSnapshots,
+        nextAttempts,
+        nextLogs,
+        nextBookmakers,
+        nextExports,
+      );
     } catch (nextError) {
       setError(
         nextError instanceof Error
@@ -339,14 +373,35 @@ export default function Dashboard() {
     }
   };
 
+  const loadStatusOnly = async () => {
+    try {
+      const nextStatus = await api<Status>("/api/status");
+      startTransition(() => setStatus(nextStatus));
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Failed to load API status",
+      );
+    }
+  };
+
   useEffect(() => {
     setClientTimezone(clientTimezoneLabel());
-    void load();
+    void loadDashboardData();
     const clock = window.setInterval(() => setNowMs(Date.now()), 1000);
-    const refresh = window.setInterval(() => void load(), 5000);
+    const statusRefresh = window.setInterval(
+      () => void loadStatusOnly(),
+      DASHBOARD_STATUS_REFRESH_MS,
+    );
+    const fullRefresh = window.setInterval(
+      () => void loadDashboardData(),
+      DASHBOARD_FULL_REFRESH_MS,
+    );
     return () => {
       window.clearInterval(clock);
-      window.clearInterval(refresh);
+      window.clearInterval(statusRefresh);
+      window.clearInterval(fullRefresh);
     };
   }, []);
 
@@ -371,6 +426,8 @@ export default function Dashboard() {
       active = false;
     };
   }, [selectedId]);
+
+  const timezoneOffset = status?.betexplorer_timezone_offset ?? "+0";
 
   const filteredMatches = useMemo(() => {
     const query = matchQuery.trim().toLowerCase();
@@ -416,14 +473,20 @@ export default function Dashboard() {
     });
     return visible.sort((left, right) => {
       if (sortMode === "kickoff_asc")
-        return timestamp(left.kickoff_time) - timestamp(right.kickoff_time);
+        return (
+          timestamp(left.kickoff_time, timezoneOffset) -
+          timestamp(right.kickoff_time, timezoneOffset)
+        );
       if (sortMode === "bookmakers_desc")
         return right.bookmaker_count - left.bookmaker_count;
       if (sortMode === "attempts_desc")
         return right.attempt_count - left.attempt_count;
-      return timestamp(right.captured_at) - timestamp(left.captured_at);
+      return (
+        timestamp(right.captured_at, timezoneOffset) -
+        timestamp(left.captured_at, timezoneOffset)
+      );
     });
-  }, [matches, matchFilter, matchQuery, sortMode]);
+  }, [matches, matchFilter, matchQuery, sortMode, timezoneOffset]);
 
   const filteredBookmakers = useMemo(() => {
     const rows = detail?.bookmaker_odds ?? [];
@@ -431,7 +494,8 @@ export default function Dashboard() {
     return rows.filter((row) => {
       const requiredOk =
         !requiredOnly || REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker);
-      const marketOk = marketFilter === "all_markets" || row.market === marketFilter;
+      const marketOk =
+        marketFilter === "all_markets" || row.market === marketFilter;
       const queryOk =
         !query ||
         [
@@ -451,6 +515,33 @@ export default function Dashboard() {
     });
   }, [bookmakerQuery, detail, marketFilter, requiredOnly]);
 
+  useEffect(() => {
+    setMatchRenderLimit(MATCH_RENDER_BATCH);
+  }, [matchFilter, matchQuery, sortMode]);
+
+  const renderedMatches = useMemo(
+    () => filteredMatches.slice(0, matchRenderLimit),
+    [filteredMatches, matchRenderLimit],
+  );
+  const hasMoreMatches = renderedMatches.length < filteredMatches.length;
+  const loadMoreMatches = () =>
+    setMatchRenderLimit((value) =>
+      Math.min(value + MATCH_RENDER_BATCH, filteredMatches.length),
+    );
+
+  useEffect(() => {
+    const node = matchListMoreRef.current;
+    if (!node || !hasMoreMatches || !("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreMatches();
+      },
+      { rootMargin: "320px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [filteredMatches.length, hasMoreMatches]);
+
   const marketCounts = useMemo(
     () => marketCountsFor(detail?.bookmaker_odds ?? []),
     [detail],
@@ -460,13 +551,19 @@ export default function Dashboard() {
     detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
   const latestExport = exports[0];
   const progressItems = useMemo(
-    () => buildProgress(status, selectedMatch, nowMs),
-    [nowMs, selectedMatch, status],
+    () => buildProgress(status, selectedMatch, nowMs, timezoneOffset),
+    [nowMs, selectedMatch, status, timezoneOffset],
   );
   const schedulerStateValue = useMemo(
     () => schedulerState(status, nowMs),
     [nowMs, status],
   );
+  const formatSchedule = (
+    value: string | null | undefined,
+    withSeconds = false,
+  ) => formatScheduleDate(value, timezoneOffset, withSeconds);
+  const formatUtc = (value: string | null | undefined, withSeconds = false) =>
+    formatUtcDate(value, timezoneOffset, withSeconds);
 
   const runCapture = () => {
     startTransition(async () => {
@@ -476,7 +573,7 @@ export default function Dashboard() {
           method: "POST",
         });
         setLastRun(result);
-        await load();
+        await loadDashboardData();
       } catch (nextError) {
         setError(
           nextError instanceof Error ? nextError.message : "Capture failed",
@@ -494,7 +591,7 @@ export default function Dashboard() {
           body: JSON.stringify({ format, layout }),
         });
         window.location.assign(`${API_BASE}${result.download_url}`);
-        await load();
+        await loadDashboardData();
       } catch (nextError) {
         setError(
           nextError instanceof Error ? nextError.message : "Export failed",
@@ -513,45 +610,51 @@ export default function Dashboard() {
           </div>
         </div>
         <nav className="nav">
-          <a href="#overview">Overview</a>
-          <a href="#matches">Matches</a>
-          <a href="#detail">Detail</a>
+          <a href="#overview" title={tooltipFor("Overview nav")}>
+            Overview
+          </a>
+          {/* <a href="#matches" title={tooltipFor("Matches nav")}>Matches</a> */}
+          {/* <a href="#detail" title={tooltipFor("Detail nav")}>Detail</a> */}
           <a
             href={
               selectedMatch
                 ? `/match?id=${encodeURIComponent(selectedMatch.id)}`
                 : "#detail"
             }
+            title={tooltipFor("Match page nav")}
           >
             Match page
           </a>
-          <a href="#odds">Odds</a>
-          <a href="#attempts">Attempts</a>
-          <a href="#exports">Exports</a>
+          <a href="#odds" title={tooltipFor("Odds nav")}>
+            Odds
+          </a>
+          <a href="#attempts" title={tooltipFor("Attempts nav")}>
+            Attempts
+          </a>
+          <a href="#exports" title={tooltipFor("Exports nav")}>
+            Exports
+          </a>
         </nav>
         <div className="side-note">
           <span>Last run</span>
           <strong title={tooltipFor("Last run")}>
-            {formatUtcDate(status?.last_run, true)}
+            {formatUtc(status?.last_run, true)}
           </strong>
           <small title={tooltipFor("Next run")}>
             Next run{" "}
             {status?.capture_progress?.running
               ? "after current cycle"
-              : formatUtcDate(status?.next_run, true)}
+              : formatUtc(status?.next_run, true)}
           </small>
           <small title={tooltipFor("Next capture")}>
-            Next capture {formatScheduleDate(status?.next_capture, true)}
+            Next capture {formatSchedule(status?.next_capture, true)}
           </small>
           <small title={tooltipFor("Last odds")}>
-            Last odds {formatUtcDate(status?.last_capture, true)}
+            Last odds {formatUtc(status?.last_capture, true)}
           </small>
           <small title={tooltipFor("Discovery")}>
             Discovery{" "}
-            {formatScheduleDate(
-              status?.capture_progress?.next_discovery_at,
-              true,
-            )}
+            {formatSchedule(status?.capture_progress?.next_discovery_at, true)}
           </small>
           <small title={tooltipFor("Browser TZ")}>
             Browser TZ {clientTimezone}
@@ -593,9 +696,9 @@ export default function Dashboard() {
           </div>
           <div className="actions">
             <button
-              onClick={() => void load()}
+              onClick={() => void loadDashboardData()}
               disabled={isPending}
-              title="Refresh data"
+              title={tooltipFor("Refresh data")}
             >
               <RefreshCcw className="refresh-icon" size={16} />
               Refresh
@@ -603,7 +706,7 @@ export default function Dashboard() {
             <button
               onClick={runCapture}
               disabled={isPending}
-              title="Run one capture cycle"
+              title={tooltipFor("Run once")}
             >
               <Play size={16} />
               Run once
@@ -611,7 +714,7 @@ export default function Dashboard() {
             <button
               onClick={() => exportOdds("csv", "wide")}
               disabled={isPending}
-              title="Export wide CSV"
+              title={tooltipFor("Export CSV")}
             >
               <Download size={16} />
               CSV
@@ -619,7 +722,7 @@ export default function Dashboard() {
             <button
               onClick={() => exportOdds("csv", "long")}
               disabled={isPending}
-              title="Export long CSV with one row per bookmaker market line"
+              title={tooltipFor("Export long CSV")}
             >
               <Download size={16} />
               Long CSV
@@ -627,7 +730,7 @@ export default function Dashboard() {
             <button
               onClick={() => exportOdds("xlsx", "wide")}
               disabled={isPending}
-              title="Export wide Excel"
+              title={tooltipFor("Export XLSX")}
             >
               <Download size={16} />
               XLSX
@@ -635,7 +738,7 @@ export default function Dashboard() {
             <button
               onClick={() => exportOdds("xlsx", "long")}
               disabled={isPending}
-              title="Export long Excel with one row per bookmaker market line"
+              title={tooltipFor("Export long XLSX")}
             >
               <Download size={16} />
               Long XLSX
@@ -675,7 +778,11 @@ export default function Dashboard() {
             label="Skipped old"
             value={status?.skipped_out_of_window_matches}
           />
-          <Metric label="Due now" value={status?.due_matches} tone="warn" />
+          <Metric
+            label="Due captures"
+            value={status?.due_matches}
+            tone="warn"
+          />
           <Metric label="Results" value={status?.result_captured_matches} />
           <Metric label="Final snapshots" value={status?.snapshots} />
           <Metric label="Attempts" value={status?.snapshot_attempts} />
@@ -700,7 +807,7 @@ export default function Dashboard() {
         </section>
 
         <section className="coverage-strip">
-          {bookmakers.slice(0, 12).map((bookmaker) => (
+          {bookmakers.map((bookmaker) => (
             <div
               className={
                 REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker)
@@ -712,7 +819,7 @@ export default function Dashboard() {
             >
               <span>{bookmaker.bookmaker}</span>
               <strong>{bookmaker.matches}</strong>
-              <small>{formatUtcDate(bookmaker.last_seen)}</small>
+              <small>{formatUtc(bookmaker.last_seen)}</small>
             </div>
           ))}
         </section>
@@ -726,7 +833,7 @@ export default function Dashboard() {
                   {filteredMatches.length} visible of {matches.length}
                 </p>
               </div>
-              <label className="search">
+              <label className="search" title={tooltipFor("Match search")}>
                 <Search size={15} />
                 <input
                   value={matchQuery}
@@ -766,7 +873,7 @@ export default function Dashboard() {
               />
             </div>
             <div className="match-list">
-              {filteredMatches.map((match) => (
+              {renderedMatches.map((match) => (
                 <button
                   key={match.id}
                   className={
@@ -789,9 +896,8 @@ export default function Dashboard() {
                   <span>
                     <em>{match.league ?? "Unknown league"}</em>
                     <small>
-                      {formatScheduleDate(match.kickoff_time)} ·{" "}
-                      {displayCapturePhase(match)} ·{" "}
-                      {match.attempt_count} tries
+                      {formatSchedule(match.kickoff_time)} ·{" "}
+                      {displayCapturePhase(match)} · {match.attempt_count} tries
                     </small>
                   </span>
                   <span className="required-pair">
@@ -803,6 +909,22 @@ export default function Dashboard() {
               ))}
               {filteredMatches.length === 0 ? (
                 <p className="empty">No matches match the current filters.</p>
+              ) : null}
+              {filteredMatches.length > 0 ? (
+                <div className="list-footer" ref={matchListMoreRef}>
+                  <span>
+                    Showing {renderedMatches.length} of {filteredMatches.length}
+                  </span>
+                  {hasMoreMatches ? (
+                    <button
+                      type="button"
+                      onClick={loadMoreMatches}
+                      title={tooltipFor("Load more matches")}
+                    >
+                      Load more matches
+                    </button>
+                  ) : null}
+                </div>
               ) : null}
             </div>
           </div>
@@ -859,7 +981,7 @@ export default function Dashboard() {
                 <div className="info-grid">
                   <Info
                     label="Kickoff"
-                    value={formatScheduleDate(selectedMatch.kickoff_time)}
+                    value={formatSchedule(selectedMatch.kickoff_time)}
                   />
                   <Info
                     label="Capture phase"
@@ -880,11 +1002,11 @@ export default function Dashboard() {
                   />
                   <Info
                     label="Next capture"
-                    value={formatScheduleDate(selectedMatch.next_capture_at)}
+                    value={formatSchedule(selectedMatch.next_capture_at)}
                   />
                   <Info
                     label="Last capture"
-                    value={formatUtcDate(selectedMatch.last_capture_at)}
+                    value={formatUtc(selectedMatch.last_capture_at)}
                   />
                   <Info
                     label="Final snapshot age"
@@ -894,11 +1016,11 @@ export default function Dashboard() {
                   />
                   <Info
                     label="Finalized"
-                    value={formatScheduleDate(selectedMatch.finalized_at)}
+                    value={formatSchedule(selectedMatch.finalized_at)}
                   />
                   <Info
                     label="Result captured"
-                    value={formatUtcDate(selectedMatch.result_captured_at)}
+                    value={formatUtc(selectedMatch.result_captured_at)}
                   />
                   <Info
                     label="Live score"
@@ -920,7 +1042,7 @@ export default function Dashboard() {
                     <tbody>
                       {(detail?.snapshots ?? []).map((snapshot) => (
                         <tr key={snapshot.id}>
-                          <td>{formatUtcDate(snapshot.captured_at)}</td>
+                          <td>{formatUtc(snapshot.captured_at)}</td>
                           <td>
                             <span
                               className={`quality ${qualityClass(snapshot.quality_status)}`}
@@ -964,7 +1086,7 @@ export default function Dashboard() {
                               {qualityLabel(attempt.status)}
                             </span>
                           </td>
-                          <td>{formatUtcDate(attempt.started_at)}</td>
+                          <td>{formatUtc(attempt.started_at)}</td>
                           <td>
                             <code>
                               {formatRequiredJson(attempt.required_found_json)}
@@ -1002,9 +1124,15 @@ export default function Dashboard() {
                 />
                 Required only
               </label>
-              <label className="select-filter" title="Filter bookmaker rows by market">
+              <label
+                className="select-filter"
+                title="Filter bookmaker rows by market"
+              >
                 <Filter size={14} />
-                <select value={marketFilter} onChange={(event) => setMarketFilter(event.target.value)}>
+                <select
+                  value={marketFilter}
+                  onChange={(event) => setMarketFilter(event.target.value)}
+                >
                   <option value="all_markets">All markets</option>
                   {marketCounts.map((item) => (
                     <option key={item.market} value={item.market}>
@@ -1013,7 +1141,7 @@ export default function Dashboard() {
                   ))}
                 </select>
               </label>
-              <label className="search">
+              <label className="search" title={tooltipFor("Bookmaker search")}>
                 <Filter size={15} />
                 <input
                   value={bookmakerQuery}
@@ -1058,7 +1186,7 @@ export default function Dashboard() {
                       <PriceSet row={row} />
                     </td>
                     <td>{row.is_available ? "available" : "missing"}</td>
-                    <td>{formatUtcDate(row.snapshot_captured_at)}</td>
+                    <td>{formatUtc(row.snapshot_captured_at)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1083,8 +1211,7 @@ export default function Dashboard() {
                     {attempt.away_team ? `- ${attempt.away_team}` : ""}
                   </strong>
                   <small>
-                    #{attempt.attempt_number} ·{" "}
-                    {formatUtcDate(attempt.started_at)}
+                    #{attempt.attempt_number} · {formatUtc(attempt.started_at)}
                   </small>
                   {attempt.error_message ? (
                     <code>{attempt.error_message}</code>
@@ -1116,7 +1243,7 @@ export default function Dashboard() {
                     {snapshot.away_team ? `- ${snapshot.away_team}` : ""}
                   </strong>
                   <small>
-                    {formatUtcDate(snapshot.captured_at)} · {snapshot.market} ·{" "}
+                    {formatUtc(snapshot.captured_at)} · {snapshot.market} ·{" "}
                     {snapshot.bookmaker_count ?? 0} rows
                   </small>
                   <small>
@@ -1138,7 +1265,7 @@ export default function Dashboard() {
                   <span className={log.level}>{log.level}</span>
                   <strong>{log.event}</strong>
                   <small>
-                    {formatUtcDate(log.timestamp)} · {log.event_id ?? "-"}
+                    {formatUtc(log.timestamp)} · {log.event_id ?? "-"}
                   </small>
                   <code>{log.details_json}</code>
                 </div>
@@ -1182,7 +1309,7 @@ export default function Dashboard() {
                       <td>{formatOdd(bookmaker.avg_home_odds)}</td>
                       <td>{formatOdd(bookmaker.avg_draw_odds)}</td>
                       <td>{formatOdd(bookmaker.avg_away_odds)}</td>
-                      <td>{formatUtcDate(bookmaker.last_seen)}</td>
+                      <td>{formatUtc(bookmaker.last_seen)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1198,13 +1325,14 @@ export default function Dashboard() {
                   href={`${API_BASE}${file.download_url}`}
                   className="export-row"
                   key={file.filename}
+                  title={`${tooltipFor("Export file")} ${file.filename}`}
                 >
                   <Download size={15} />
                   <span>
                     <strong>{file.filename}</strong>
                     <small>
                       {formatBytes(file.size_bytes)} ·{" "}
-                      {formatScheduleDate(file.modified_at)}
+                      {formatSchedule(file.modified_at)}
                     </small>
                   </span>
                 </a>
@@ -1285,7 +1413,10 @@ function SelectFilter({
 
 function PanelTitle({ title, subtitle }: { title: string; subtitle: string }) {
   return (
-    <div className="panel-head compact-head" title={subtitle}>
+    <div
+      className="panel-head compact-head"
+      title={`${tooltipFor(title)} ${subtitle}`}
+    >
       <div>
         <h3>{title}</h3>
         <p>{subtitle}</p>
@@ -1349,33 +1480,43 @@ function ProgressBar({ label, value, detail, tone }: ProgressState) {
 
 function formatScheduleDate(
   value: string | null | undefined,
+  timezoneOffset: string,
   withSeconds = false,
 ) {
   if (!value) return "-";
-  const options: Intl.DateTimeFormatOptions = {
-    month: "short",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "Europe/Kyiv",
-  };
-  if (withSeconds) options.second = "2-digit";
-  return new Intl.DateTimeFormat("en", options).format(
-    parseLocalApiDate(value),
+  return formatOffsetDate(
+    parseOffsetLocalApiDate(value, timezoneOffset),
+    timezoneOffset,
+    withSeconds,
   );
 }
 
-function formatUtcDate(value: string | null | undefined, withSeconds = false) {
+function formatUtcDate(
+  value: string | null | undefined,
+  timezoneOffset: string,
+  withSeconds = false,
+) {
   if (!value) return "-";
+  return formatOffsetDate(parseUtcApiDate(value), timezoneOffset, withSeconds);
+}
+
+function formatOffsetDate(
+  date: Date,
+  timezoneOffset: string,
+  withSeconds = false,
+) {
+  const shifted = new Date(
+    date.getTime() + parseTimezoneOffsetMs(timezoneOffset),
+  );
   const options: Intl.DateTimeFormatOptions = {
     month: "short",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    timeZone: "Europe/Kyiv",
+    timeZone: "UTC",
   };
   if (withSeconds) options.second = "2-digit";
-  return new Intl.DateTimeFormat("en", options).format(parseUtcApiDate(value));
+  return new Intl.DateTimeFormat("en", options).format(shifted);
 }
 
 function formatOdd(value: number | null) {
@@ -1416,7 +1557,10 @@ function marketCountsFor(rows: BookmakerOdds[]) {
   }
   return [...counts.entries()]
     .map(([market, count]) => ({ market, count }))
-    .sort((left, right) => marketSortValue(left.market) - marketSortValue(right.market));
+    .sort(
+      (left, right) =>
+        marketSortValue(left.market) - marketSortValue(right.market),
+    );
 }
 
 function marketSortValue(market: string) {
@@ -1497,7 +1641,7 @@ function filterLabel(value: string) {
     missing_unibet: "Missing Unibet",
     capture_miss: "Capture miss",
     skipped_old: "Skipped old",
-    due: "Due now",
+    due: "Due captures",
     finalized: "Finalized",
     new: "No snapshot",
     capture_desc: "Latest capture",
@@ -1510,79 +1654,142 @@ function filterLabel(value: string) {
 
 function tooltipFor(label: string) {
   const text: Record<string, string> = {
-    Matches: "Total matches currently stored in the local database.",
-    Captured: "Matches with at least one final odds snapshot.",
+    "Overview nav":
+      "Jump to high-level health counters for the local database, scheduler queue, final snapshots, and bookmaker coverage.",
+    "Matches nav":
+      "Jump to the match list. Use the search, status filter, and sort selector to choose the match shown in the detail panel.",
+    "Detail nav":
+      "Jump to the selected match summary: schedule state, required bookmaker presence, snapshots, and attempts.",
+    "Match page nav":
+      "Open the full-screen detail page for the selected match. It shows every final bookmaker row grouped by market.",
+    "Odds nav":
+      "Jump to bookmaker odds rows for the selected match. These are final snapshot rows only.",
+    "Attempts nav":
+      "Jump to recent capture attempts, recent snapshots, and logs.",
+    "Exports nav":
+      "Jump to generated CSV/XLSX files and bookmaker coverage table.",
+    "Match search":
+      "Search the loaded match list by team, league, event id, quality label, or displayed scheduler/timing status.",
+    "Bookmaker search":
+      "Filter the selected match odds rows by market name, market line, bookmaker name, normalized bookmaker, or BetExplorer bookmaker id.",
+    "Load more matches":
+      "Render the next batch of matches in the list. The full dataset is already loaded; batching keeps the page responsive.",
+    "Export file": "Download this generated export file from the local API:",
+    "Refresh data":
+      "Reload status, matches, snapshots, attempts, logs, bookmaker coverage, and export files from the local API. Does not run capture.",
+    "Run once":
+      "Manually run one scheduler/capture cycle now. The continuous API scheduler still runs independently when enabled.",
+    "Export CSV":
+      "Generate the wide CSV export: one row per final match/market snapshot, with required bookmaker odds flattened into columns.",
+    "Export long CSV":
+      "Generate the long CSV export: one row per bookmaker/market/line, with selection labels and odds in separate columns.",
+    "Export XLSX":
+      "Generate the wide Excel export with the same columns as the wide CSV.",
+    "Export long XLSX":
+      "Generate the long Excel export with the same rows as Long CSV.",
+    Matches:
+      "Total rows in the matches table. This includes discovered, scheduled, finalized, finished, and matches without odds.",
+    Captured:
+      "Distinct matches that currently have at least one final odds snapshot. A match can have many final snapshots when multiple markets are captured.",
     "Capture miss":
-      "Finalized matches where capture attempts ran but no bookmaker rows were saved.",
+      "Finalized matches that have scrape attempts but still have zero final odds snapshots. Usually means BetExplorer returned no usable odds rows or parsing failed for all attempts.",
     "Skipped old":
-      "Finalized matches that moved out of the capture window before any attempt ran.",
-    "Due now":
-      "Matches whose next scheduled capture time is now or already overdue.",
+      "Finalized matches with zero odds snapshots and zero scrape attempts. Usually means the match was discovered only after its configured capture window had already closed.",
+    "Due captures":
+      "Due captures is not a live-match count. It is non-finalized matches where next_capture_at is now or overdue; it can jump when discovery adds matches, kickoff times are corrected, or a scheduler cycle drains the queue.",
     Results:
-      "Finished match results captured once per match within RESULT_CAPTURE_LOOKBACK_HOURS.",
+      "Matches where the final score/result was saved. This is separate from odds capture and only happens once per match inside RESULT_CAPTURE_LOOKBACK_HOURS.",
     "Final snapshots":
-      "Final snapshots currently selected for export and match summaries. With all markets, each market can have its own final snapshot.",
+      "Final odds snapshots currently selected for exports and summaries. With CAPTURE_MARKET=all, each match can have one final snapshot per market.",
     "Odds rows":
-      "Bookmaker/line rows saved for this snapshot. Simple markets may have 2-3 rows; Asian Handicap and Over/Under can have many rows because every line is stored separately.",
-    Attempts: "HTTP/parser attempts recorded for odds capture.",
-    "Bookmaker rows": "Bookmaker odds rows in current final snapshots.",
+      "Bookmaker/line rows saved for this snapshot. Simple markets have fewer rows; Asian Handicap and Over/Under can have many rows because every line is stored separately.",
+    Attempts:
+      "Total HTTP/parser attempts recorded for odds capture. Retries and multiple markets increase this number.",
+    "Bookmaker rows":
+      "Rows saved in the currently selected final snapshots. This counts bookmaker/market/line rows, not distinct bookmakers.",
     "Row attempts":
-      "All bookmaker odds rows saved across all attempts and snapshots.",
+      "All bookmaker odds rows saved across every attempt and every snapshot, including rows that are no longer final.",
     "Req complete":
-      "Final snapshots where every required bookmaker was present.",
+      "Final snapshots where every required bookmaker from TARGET_BOOKMAKERS was found.",
     "Req partial":
-      "Final snapshots where at least one required bookmaker was present.",
+      "Final snapshots where at least one required bookmaker was found, but not all required bookmakers were present.",
     "Req missing":
-      "Final snapshots where none of the required bookmakers were present.",
-    Bookmakers: "Distinct bookmakers seen in final odds rows.",
+      "Final snapshots where none of the required bookmakers were found. Odds may still exist from other bookmakers.",
+    Bookmakers:
+      "Distinct bookmaker names present in final odds rows. The strip and table below list these names; the metric is not bookmaker rows.",
     "Poll seconds":
       "How often an in-window match is scheduled for another odds request.",
     Discovery:
-      "Next full BetExplorer discovery. Due captures can still run between discovery cycles.",
+      "Next full BetExplorer match-list refresh. Due captures can still run between discovery cycles from already scheduled matches.",
     Concurrency: "Maximum due matches captured in parallel.",
-    "Last run": "Most recent completed scheduler heartbeat.",
+    "Last run":
+      "Most recent completed scheduler cycle. If this is stale while the scheduler is enabled, the API scheduler may be stopped or blocked.",
     "Next run":
-      "Expected next scheduler heartbeat based on configured tick seconds.",
+      "Expected next scheduler heartbeat based on SCHEDULER_TICK_SECONDS. During an active cycle, it updates after the cycle completes.",
     "Next capture":
-      "Earliest scheduled odds capture among non-finalized matches.",
-    "Last odds": "Most recent saved odds snapshot.",
+      "Earliest next_capture_at among non-finalized matches. Empty means there is no currently scheduled odds capture.",
+    "Last odds":
+      "Most recent saved odds snapshot timestamp across all matches and markets.",
     "Final snapshot age":
-      "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff.",
-    "Browser TZ": "Timezone reported by this browser.",
+      "How far the selected final snapshot is from kickoff. Positive means before kickoff; negative means after kickoff. Large 'after' values usually mean late backfill.",
+    "Browser TZ":
+      "Timezone reported by this browser. Displayed for diagnostics only; capture/export use BetExplorer TZ from the API config.",
     "BetExplorer TZ":
-      "Timezone offset sent to BetExplorer via the my_timezone cookie.",
+      "Timezone offset sent to BetExplorer via the my_timezone cookie and used by UI/export date formatting.",
     "Result capture":
-      "Finished results captured once per match during RESULT_CAPTURE_LOOKBACK_HOURS. This is separate from odds snapshots.",
+      "Finished results captured once per match during RESULT_CAPTURE_LOOKBACK_HOURS. This is separate from odds capture and does not mean odds were captured.",
     Kickoff:
-      "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
-    "Capture phase": "Scheduler state for this match.",
-    Timing: "Timing classification relative to kickoff and live status.",
-    Required: "Presence of required bookmakers in final odds rows.",
-    Finalized: "Time when the scheduler closed the capture window.",
+      "BetExplorer kickoff time in the configured BetExplorer timezone offset.",
+    "Capture phase":
+      "Scheduler state for this match. FINALIZED means the odds capture window is closed; FINALIZING means the match has started but is still inside the configured post-kickoff window.",
+    Timing:
+      "Raw timing classifier from kickoff/live-result data. It can say FINISHED even when capture phase explains the odds scheduler state.",
+    Required:
+      "Presence of required bookmakers in final odds rows for this selected match.",
+    Finalized:
+      "Time when the scheduler closed the odds capture window for this match.",
     "Result captured":
       "Time when the final score/result was saved. This is separate from odds capture and only happens once per match.",
-    "Live score": "Live/recent score from BetExplorer live-results enrichment.",
+    "Live score":
+      "Live or final score from BetExplorer live-results/result enrichment. It does not imply required bookmakers were found.",
     Snapshots:
-      "Saved odds snapshots for this match. Odds rows count bookmaker/line rows; modified markets like Asian Handicap and Over/Under can have many rows because each line is stored separately.",
-    "Match attempts": "Capture attempts for this match.",
-    all: "Show every match.",
-    with_odds: "Only matches with saved bookmaker rows.",
-    req_full: "Only matches with all required bookmakers present.",
-    req_partial: "Only matches with at least one required bookmaker present.",
-    req_missing: "Only matches missing all required bookmakers.",
-    missing_bwin: "Only matches where Bwin is missing but odds exist.",
-    missing_unibet: "Only matches where Unibet is missing but odds exist.",
+      "Saved odds snapshots for the selected match. Only snapshots marked final feed exports and the main match summary.",
+    "Match attempts":
+      "Capture attempts for the selected match, including retry status and required bookmaker presence for each attempt.",
+    "Recent attempts":
+      "Latest capture attempts across all matches. Use this to see parser/network failures and retry behavior.",
+    "Recent snapshots":
+      "Latest saved odds snapshots across all matches and markets. This is capped for display and sorted newest first.",
+    Logs: "Recent application log events from the local database. Useful for capture errors, discovery failures, and scheduler status.",
+    "Bookmaker coverage":
+      "Distinct bookmakers found in final odds rows, with number of matches, total rows, average odds fields, and last seen time.",
+    Exports:
+      "Generated export files in EXPORT_DIR. Click a file to download it from the local API.",
+    all: "Show every stored match, regardless of odds or scheduler state.",
+    with_odds: "Only matches with at least one saved final bookmaker row.",
+    req_full:
+      "Only matches whose final snapshots include all required bookmakers.",
+    req_partial:
+      "Only matches where at least one required bookmaker is present but the set is incomplete.",
+    req_missing:
+      "Only matches where final snapshots exist but none of the required bookmakers were found.",
+    missing_bwin:
+      "Only matches where odds exist but Bwin is missing from final rows.",
+    missing_unibet:
+      "Only matches where odds exist but Unibet is missing from final rows.",
     capture_miss:
-      "Finalized matches where capture attempted but saved no odds rows.",
+      "Finalized matches where at least one capture attempt ran but no final odds snapshot was saved.",
     skipped_old:
-      "Finalized matches skipped because the capture window was already over.",
-    due: "Matches currently scheduled for capture.",
-    finalized: "Matches whose capture window is closed.",
-    new: "Discovered matches without any final snapshot.",
-    capture_desc: "Sort by latest saved snapshot first.",
-    kickoff_asc: "Sort by kickoff time ascending.",
-    bookmakers_desc: "Sort by most bookmaker rows.",
-    attempts_desc: "Sort by most capture attempts.",
+      "Finalized matches skipped because the capture window was already closed before any attempt ran.",
+    due: "Only matches currently due or overdue for odds capture.",
+    finalized: "Only matches whose odds capture window is closed.",
+    new: "Discovered matches without any final snapshot yet.",
+    capture_desc: "Sort by latest saved final snapshot first.",
+    kickoff_asc:
+      "Sort by kickoff time ascending in the configured BetExplorer timezone.",
+    bookmakers_desc:
+      "Sort by number of final bookmaker/line rows, highest first.",
+    attempts_desc: "Sort by number of capture attempts, highest first.",
   };
   return text[label] ?? label;
 }
@@ -1604,9 +1811,9 @@ function displayCapturePhase(match: MatchRow) {
   return match.capture_phase ?? "DISCOVERED";
 }
 
-function timestamp(value: string | null | undefined) {
+function timestamp(value: string | null | undefined, timezoneOffset = "+0") {
   if (!value) return 0;
-  const parsed = parseLocalApiDate(value).getTime();
+  const parsed = parseLocalApiDate(value, timezoneOffset).getTime();
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
@@ -1635,8 +1842,31 @@ function parseUtcApiDate(value: string) {
   return new Date(/[zZ]$|[+-]\d\d:\d\d$/.test(value) ? value : `${value}Z`);
 }
 
-function parseLocalApiDate(value: string) {
-  return new Date(value);
+function parseLocalApiDate(value: string, timezoneOffset = "+0") {
+  return parseOffsetLocalApiDate(value, timezoneOffset);
+}
+
+function parseOffsetLocalApiDate(value: string, timezoneOffset: string) {
+  if (/[zZ]$|[+-]\d\d:\d\d$/.test(value)) return new Date(value);
+  return new Date(`${value}${formatTimezoneOffset(timezoneOffset)}`);
+}
+
+function parseTimezoneOffsetMs(value: string) {
+  const match = value.trim().match(/^([+-])(\d{1,2})(?::?(\d{2}))?$/);
+  if (!match) return 0;
+  const sign = match[1] === "-" ? -1 : 1;
+  const hours = Number(match[2]);
+  const minutes = Number(match[3] ?? "0");
+  return sign * (hours * 60 + minutes) * 60 * 1000;
+}
+
+function formatTimezoneOffset(value: string) {
+  const offsetMs = parseTimezoneOffsetMs(value);
+  const sign = offsetMs < 0 ? "-" : "+";
+  const absoluteMinutes = Math.abs(offsetMs) / 60000;
+  const hours = Math.floor(absoluteMinutes / 60);
+  const minutes = absoluteMinutes % 60;
+  return `${sign}${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
 function schedulerFresh(status: Status | null, nowMs: number) {
@@ -1713,6 +1943,7 @@ function buildProgress(
   status: Status | null,
   match: MatchRow | null,
   nowMs: number,
+  timezoneOffset: string,
 ): ProgressState[] {
   const items: ProgressState[] = [];
   const progress = status?.capture_progress;
@@ -1751,7 +1982,10 @@ function buildProgress(
     });
   }
   if (status?.next_capture) {
-    const target = parseLocalApiDate(status.next_capture).getTime();
+    const target = parseLocalApiDate(
+      status.next_capture,
+      timezoneOffset,
+    ).getTime();
     items.push({
       label: "Global next capture",
       value: target <= nowMs ? 100 : 0,
@@ -1760,7 +1994,10 @@ function buildProgress(
     });
   }
   if (match?.kickoff_time) {
-    const kickoff = parseLocalApiDate(match.kickoff_time).getTime();
+    const kickoff = parseLocalApiDate(
+      match.kickoff_time,
+      timezoneOffset,
+    ).getTime();
     const activeWindowMinutes = Math.max(
       status?.upcoming_window_minutes ?? 30,
       (status?.odds_capture_lookahead_hours ?? 0) * 60,
@@ -1774,7 +2011,10 @@ function buildProgress(
     });
   }
   if (match?.next_capture_at) {
-    const target = parseLocalApiDate(match.next_capture_at).getTime();
+    const target = parseLocalApiDate(
+      match.next_capture_at,
+      timezoneOffset,
+    ).getTime();
     items.push({
       label: "Selected capture",
       value: target <= nowMs ? 100 : 0,
