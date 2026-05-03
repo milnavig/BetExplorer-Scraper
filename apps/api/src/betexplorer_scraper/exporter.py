@@ -18,7 +18,7 @@ def final_odds_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], timezone_
             "kickoff_time": format_export_datetime(match.kickoff_time, timezone_offset),
             "status": export_status(match),
             "match_status": match.status,
-            "capture_phase": match.capture_phase,
+            "capture_phase": export_capture_phase(match),
             "finalized_at": format_export_datetime(match.finalized_at, timezone_offset),
             "league": match.league,
             "home_team": match.home_team,
@@ -65,7 +65,7 @@ def final_odds_long_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], time
                 "kickoff_time": format_export_datetime(match.kickoff_time, timezone_offset),
                 "status": export_status(match),
                 "match_status": match.status,
-                "capture_phase": match.capture_phase,
+                "capture_phase": export_capture_phase(match),
                 "finalized_at": format_export_datetime(match.finalized_at, timezone_offset),
                 "league": match.league,
                 "home_team": match.home_team,
@@ -95,15 +95,21 @@ def final_odds_long_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], time
 
 
 def export_status(match: DiscoveredMatch) -> str:
-    if match.capture_phase:
-        return match.capture_phase
     if match.finalized_at:
         return "FINALIZED"
+    if match.capture_phase:
+        return match.capture_phase
     if match.timing_status.value != "UNKNOWN":
         return match.timing_status.value
     if match.status and match.status != "scheduled":
         return match.status.upper()
     return "CAPTURED"
+
+
+def export_capture_phase(match: DiscoveredMatch) -> str | None:
+    if match.finalized_at:
+        return "FINALIZED"
+    return match.capture_phase
 
 
 def format_export_datetime(

@@ -24,8 +24,13 @@ def test_dashboard_hides_poll_seconds_and_concurrency_metrics() -> None:
 def test_dashboard_prefers_finalized_at_over_stale_finalizing_phase() -> None:
     page = read_repo_file("apps/desktop/web/app/page.tsx")
     match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
-    expected = """if (match.finalized_at) return "FINALIZED";
+    expected_timing = """if (match.finalized_at) return "FINALIZED";
   if (match.capture_phase) return match.capture_phase;"""
+    expected_phase = """function displayCapturePhase(match: MatchRow) {
+  if (match.finalized_at) return "FINALIZED";"""
 
-    assert expected in page
-    assert expected in match_page
+    assert expected_timing in page
+    assert expected_timing in match_page
+    assert expected_phase in page
+    assert expected_phase in match_page
+    assert 'label="Capture phase" value={displayCapturePhase(match)}' in match_page

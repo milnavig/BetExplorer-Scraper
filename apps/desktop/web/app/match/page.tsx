@@ -320,7 +320,7 @@ export default function MatchPage() {
               <Info label="Kickoff" value={formatScheduleDate(match.kickoff_time)} />
               <Info label="Status" value={match.status ?? "-"} />
               <Info label="Timing" value={displayTiming(match)} />
-              <Info label="Capture phase" value={match.capture_phase ?? "DISCOVERED"} />
+              <Info label="Capture phase" value={displayCapturePhase(match)} />
               <Info label="Next capture" value={formatScheduleDate(match.next_capture_at)} />
               <Info label="Last capture" value={formatUtcDate(match.last_capture_at)} />
               <Info label="Finalized" value={formatScheduleDate(match.finalized_at)} />
@@ -762,6 +762,11 @@ function displayTiming(match: MatchRow) {
   if (match.capture_phase) return match.capture_phase;
   if (match.next_capture_at) return "SCHEDULED";
   return "UNKNOWN";
+}
+
+function displayCapturePhase(match: MatchRow) {
+  if (match.finalized_at) return "FINALIZED";
+  return match.capture_phase ?? "DISCOVERED";
 }
 
 function formatRequiredJson(value?: string | null) {

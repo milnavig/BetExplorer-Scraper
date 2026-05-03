@@ -119,12 +119,53 @@ def test_database_stores_capture_schedule_fields() -> None:
     row = db.list_matches()[0]
     schedule = db.get_match_schedule(match_id)
 
-    assert row["capture_phase"] == "FINALIZING"
+    assert row["capture_phase"] == "FINALIZED"
     assert row["next_capture_at"] == next_capture_at.isoformat()
     assert row["last_capture_at"] == "2026-04-28T16:31:00"
     assert row["finalized_at"] == finalized_at.isoformat()
     assert schedule["next_capture_at"] == next_capture_at
     assert schedule["finalized_at"] == finalized_at
+
+
+def test_database_normalizes_stale_finalizing_phase_when_match_is_finalized() -> None:
+    db_path = Path("data/test_tmp/test_stale_finalizing_normalized.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+    finalized_at = datetime(2026, 4, 28, 16, 40)
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="stalephase123",
+            source_url="https://www.betexplorer.com/football/test/stalephase123/",
+            league="Test League",
+            home_team="Home",
+            away_team="Away",
+            kickoff_time=datetime(2026, 4, 28, 16, 35),
+            timing_status=TimingStatus.FINISHED,
+        )
+    )
+    db.update_match_schedule(match_id, "FINALIZING", None, finalized_at)
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="stalephase123",
+            market="1x2",
+            captured_at=datetime(2026, 4, 28, 16, 50),
+            quality_status=SnapshotQuality.PARTIAL,
+            required_bookmakers=["Bwin"],
+            bookmaker_odds=[BookmakerOdds("Bet365", "bet365", 2.2, 3.1, 2.87)],
+        ),
+    )
+
+    row = db.list_matches()[0]
+    detail = db.match_detail(match_id)
+    items = db.final_snapshot_items()
+
+    assert row["capture_phase"] == "FINALIZED"
+    assert detail is not None
+    assert detail["match"]["capture_phase"] == "FINALIZED"
+    assert items[0][0].capture_phase == "FINALIZED"
 
 
 def test_database_lists_captured_matches_first_and_match_detail_uses_final_snapshot_only() -> None:

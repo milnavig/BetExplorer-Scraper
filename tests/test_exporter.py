@@ -120,6 +120,33 @@ def test_final_odds_export_status_does_not_leak_unknown_for_captured_rows() -> N
     assert row["finalized_at"] == "2026-04-28T20:10:00+00:00"
 
 
+def test_final_odds_export_treats_stale_finalizing_phase_as_finalized() -> None:
+    match = DiscoveredMatch(
+        event_id="abc123",
+        source_url="https://www.betexplorer.com/football/test/abc123/",
+        league="Test League",
+        home_team="Home",
+        away_team="Away",
+        kickoff_time=datetime(2026, 4, 28, 20, 0),
+        timing_status=TimingStatus.FINISHED,
+        capture_phase="FINALIZING",
+        finalized_at=datetime(2026, 4, 28, 20, 10),
+    )
+    snapshot = OddsSnapshot(
+        event_id="abc123",
+        market="1x2",
+        captured_at=datetime(2026, 4, 28, 20, 9),
+        quality_status=SnapshotQuality.PARTIAL,
+        required_bookmakers=["Bwin"],
+        bookmaker_odds=[BookmakerOdds("Bet365", "bet365", 2.55, 3.1, 2.38)],
+    )
+
+    row = final_odds_rows([(match, snapshot)])[0]
+
+    assert row["status"] == "FINALIZED"
+    assert row["capture_phase"] == "FINALIZED"
+
+
 def test_final_odds_long_export_keeps_market_line_and_raw_context() -> None:
     match = DiscoveredMatch(
         event_id="abc123",

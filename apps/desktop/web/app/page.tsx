@@ -790,7 +790,7 @@ export default function Dashboard() {
                     <em>{match.league ?? "Unknown league"}</em>
                     <small>
                       {formatScheduleDate(match.kickoff_time)} ·{" "}
-                      {match.capture_phase ?? "DISCOVERED"} ·{" "}
+                      {displayCapturePhase(match)} ·{" "}
                       {match.attempt_count} tries
                     </small>
                   </span>
@@ -863,7 +863,7 @@ export default function Dashboard() {
                   />
                   <Info
                     label="Capture phase"
-                    value={selectedMatch.capture_phase ?? "DISCOVERED"}
+                    value={displayCapturePhase(selectedMatch)}
                   />
                   <Info label="Timing" value={displayTiming(selectedMatch)} />
                   <Info
@@ -1597,6 +1597,11 @@ function displayTiming(match: MatchRow) {
   if (match.capture_phase) return match.capture_phase;
   if (match.next_capture_at) return "SCHEDULED";
   return "UNKNOWN";
+}
+
+function displayCapturePhase(match: MatchRow) {
+  if (match.finalized_at) return "FINALIZED";
+  return match.capture_phase ?? "DISCOVERED";
 }
 
 function timestamp(value: string | null | undefined) {

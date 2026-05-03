@@ -849,7 +849,7 @@ class Database:
                         kickoff_time=row[5],
                         timing_status=TimingStatus(row[6]),
                         status=row[7],
-                        capture_phase=row[8],
+                        capture_phase=self._effective_capture_phase(row[8], row[9]),
                         finalized_at=row[9],
                     ),
                     OddsSnapshot(
@@ -868,7 +868,10 @@ class Database:
 
     def _serialize(self, value):
         if isinstance(value, dict):
-            return {key: self._serialize(item) for key, item in value.items()}
+            serialized = {key: self._serialize(item) for key, item in value.items()}
+            if serialized.get("finalized_at"):
+                serialized["capture_phase"] = "FINALIZED"
+            return serialized
         if isinstance(value, list):
             return [self._serialize(item) for item in value]
         if isinstance(value, datetime):
@@ -891,3 +894,8 @@ class Database:
         if isinstance(value, str) and value:
             return datetime.fromisoformat(value)
         return None
+
+    def _effective_capture_phase(self, capture_phase: str | None, finalized_at: datetime | None) -> str | None:
+        if finalized_at:
+            return "FINALIZED"
+        return capture_phase
