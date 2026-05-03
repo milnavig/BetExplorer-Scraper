@@ -36,7 +36,7 @@ def test_windows_launchers_wire_setup_start_shortcut_and_package_scripts() -> No
     assert "scripts\\start-windows.ps1" in start_cmd
     assert "scripts\\install-shortcut-windows.ps1" in shortcut_cmd
     assert "config\\settings.example.env" in setup_ps1
-    assert 'uv pip install -e "."' in setup_ps1
+    assert 'Invoke-Uv @("pip", "install", "-e", ".")' in setup_ps1
     assert "npm --prefix apps/desktop/web install" in setup_ps1
     assert "uvicorn betexplorer_scraper.api:app" in start_ps1
     assert "npm --prefix apps/desktop/web run dev" in start_ps1
@@ -66,6 +66,20 @@ def test_windows_launcher_ties_child_processes_to_terminal_lifetime() -> None:
     assert "Assign-ProcessToJob $process" in start_ps1
     assert "Stop-ProcessTree" in start_ps1
     assert "Get-CimInstance Win32_Process" in start_ps1
+
+
+def test_windows_launchers_can_run_uv_as_python_module_when_uv_exe_is_not_on_path() -> None:
+    setup_ps1 = read_repo_file("scripts/setup-windows.ps1")
+    start_ps1 = read_repo_file("scripts/start-windows.ps1")
+
+    for content in [setup_ps1, start_ps1]:
+        assert "Resolve-UvLauncher" in content
+        assert '("-m", "uv")' in content
+        assert "-m uv --version" in content
+
+    assert "Invoke-Uv @(\"venv\", \".venv\")" in setup_ps1
+    assert "Invoke-Uv @(\"pip\", \"install\", \"-e\", \".\")" in setup_ps1
+    assert '$api = Start-ServiceProcess "API" $UvFilePath ($UvPrefixArgs + @(' in start_ps1
 
 
 def test_unix_launchers_wire_setup_start_and_shortcut_scripts() -> None:

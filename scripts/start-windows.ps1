@@ -118,6 +118,32 @@ function Require-Command($Name, $Hint) {
     }
 }
 
+function Resolve-UvLauncher {
+    $uvCommand = Get-Command uv.exe -ErrorAction SilentlyContinue
+    if (-not $uvCommand) {
+        $uvCommand = Get-Command uv -ErrorAction SilentlyContinue
+    }
+    if ($uvCommand) {
+        return @{
+            FilePath = $uvCommand.Source
+            PrefixArgs = @()
+        }
+    }
+
+    $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    if ($pythonCommand) {
+        & $pythonCommand.Source -m uv --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return @{
+                FilePath = $pythonCommand.Source
+                PrefixArgs = @("-m", "uv")
+            }
+        }
+    }
+
+    throw "uv is not available. Run setup-windows.cmd first. If it still fails, install uv with: python -m pip install --user uv"
+}
+
 function Wait-ForUrl($Url, $Name, $TimeoutSeconds) {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -146,22 +172,19 @@ function Start-ServiceProcess($Name, $FilePath, [string[]] $Arguments, $OutLog, 
     return $process
 }
 
-Require-Command uv "Run setup-windows.cmd first. If it still fails, install uv with: python -m pip install --user uv"
 Require-Command npm "Install Node.js LTS from https://nodejs.org/ and run setup-windows.cmd again."
 
 if (-not (Test-Path ".env")) {
     Copy-Item "config\settings.example.env" ".env"
 }
 
-$uvCommand = Get-Command uv.exe -ErrorAction SilentlyContinue
-if (-not $uvCommand) {
-    $uvCommand = Get-Command uv
-}
 $npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
 if (-not $npmCommand) {
     $npmCommand = Get-Command npm
 }
-$uv = $uvCommand.Source
+$uvLauncher = Resolve-UvLauncher
+$UvFilePath = $uvLauncher.FilePath
+$UvPrefixArgs = $uvLauncher.PrefixArgs
 $npm = $npmCommand.Source
 $apiOut = Join-Path $LogDir "api-launch.out.log"
 $apiErr = Join-Path $LogDir "api-launch.err.log"
@@ -173,7 +196,7 @@ $web = $null
 $script:ProcessJob = New-KillOnCloseJob
 
 try {
-    $api = Start-ServiceProcess "API" $uv @("run", "uvicorn", "betexplorer_scraper.api:app", "--host", "127.0.0.1", "--port", "8000") $apiOut $apiErr
+    $api = Start-ServiceProcess "API" $UvFilePath ($UvPrefixArgs + @("run", "uvicorn", "betexplorer_scraper.api:app", "--host", "127.0.0.1", "--port", "8000")) $apiOut $apiErr
     Wait-ForUrl $ApiUrl "API" 90
 
     $web = Start-ServiceProcess "UI" $npm @("--prefix", "apps/desktop/web", "run", "dev") $webOut $webErr
