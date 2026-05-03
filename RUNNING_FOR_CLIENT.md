@@ -6,7 +6,36 @@ This folder contains the full BetExplorer Monitor app. The client does not need 
 
 ### First launch on a new computer
 
-1. Install Python 3.11 or newer from https://www.python.org/downloads/.
+1A. Install Python 3.11 or newer from https://www.python.org/downloads/.
+
+Important: on the first Python installer screen, enable:
+
+```text
+Add python.exe to PATH
+```
+
+Then click `Install Now`.
+
+1B. Check that Windows can find Python.
+
+Open `Command Prompt` from the Start menu and run:
+
+```cmd
+python --version
+```
+
+It should print something like:
+
+```text
+Python 3.11.9
+```
+
+If Windows says that `python` is not recognized, Python was installed without PATH. Fix it with one of these options:
+
+- Run the Python installer again, choose `Modify`, enable `Add Python to environment variables`, then finish the installer.
+- Or uninstall Python, install it again, and make sure `Add python.exe to PATH` is checked.
+- Close and reopen `Command Prompt` after changing PATH.
+
 2. Install Node.js LTS from https://nodejs.org/.
 3. Open this project folder.
 4. Double-click `setup-windows.cmd`.
