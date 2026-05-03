@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $Root
 
 $ApiUrl = "http://127.0.0.1:8000/api/status"
@@ -9,6 +9,108 @@ $ApiCommandLabel = "uvicorn betexplorer_scraper.api:app"
 $WebCommandLabel = "npm --prefix apps/desktop/web run dev"
 $LogDir = Join-Path $Root "data\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class Win32Job {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr info, uint length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    public const int JobObjectExtendedLimitInformation = 9;
+    public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public long Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+}
+"@
+
+function New-KillOnCloseJob {
+    $job = [Win32Job]::CreateJobObject([IntPtr]::Zero, $null)
+    if ($job -eq [IntPtr]::Zero) {
+        throw "Cannot create Windows cleanup job."
+    }
+
+    $limits = New-Object Win32Job+JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    $limits.BasicLimitInformation.LimitFlags = [Win32Job]::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+    $length = [Runtime.InteropServices.Marshal]::SizeOf($limits)
+    $pointer = [Runtime.InteropServices.Marshal]::AllocHGlobal($length)
+    try {
+        [Runtime.InteropServices.Marshal]::StructureToPtr($limits, $pointer, $false)
+        $ok = [Win32Job]::SetInformationJobObject(
+            $job,
+            [Win32Job]::JobObjectExtendedLimitInformation,
+            $pointer,
+            [uint32] $length
+        )
+        if (-not $ok) {
+            throw "Cannot configure Windows cleanup job."
+        }
+        return $job
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($pointer)
+    }
+}
+
+function Assign-ProcessToJob($process) {
+    if (-not $process -or $process.HasExited) {
+        return
+    }
+
+    $ok = [Win32Job]::AssignProcessToJobObject($script:ProcessJob, $process.Handle)
+    if (-not $ok) {
+        throw "Cannot attach process $($process.Id) to Windows cleanup job."
+    }
+}
+
+function Stop-ProcessTree($ProcessId) {
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        Stop-ProcessTree $child.ProcessId
+    }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+}
 
 function Require-Command($Name, $Hint) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
@@ -32,7 +134,7 @@ function Wait-ForUrl($Url, $Name, $TimeoutSeconds) {
 
 function Start-ServiceProcess($Name, $FilePath, [string[]] $Arguments, $OutLog, $ErrLog) {
     Write-Host "Starting $Name..." -ForegroundColor Cyan
-    return Start-Process `
+    $process = Start-Process `
         -FilePath $FilePath `
         -ArgumentList $Arguments `
         -WorkingDirectory $Root `
@@ -40,6 +142,8 @@ function Start-ServiceProcess($Name, $FilePath, [string[]] $Arguments, $OutLog, 
         -RedirectStandardError $ErrLog `
         -WindowStyle Hidden `
         -PassThru
+    Assign-ProcessToJob $process
+    return $process
 }
 
 Require-Command uv "Run setup-windows.cmd first. If it still fails, install uv with: python -m pip install --user uv"
@@ -66,6 +170,7 @@ $webErr = Join-Path $LogDir "web-launch.err.log"
 
 $api = $null
 $web = $null
+$script:ProcessJob = New-KillOnCloseJob
 
 try {
     $api = Start-ServiceProcess "API" $uv @("run", "uvicorn", "betexplorer_scraper.api:app", "--host", "127.0.0.1", "--port", "8000") $apiOut $apiErr
@@ -90,7 +195,10 @@ try {
 } finally {
     foreach ($process in @($api, $web)) {
         if ($process -and -not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree $process.Id
         }
+    }
+    if ($script:ProcessJob -and $script:ProcessJob -ne [IntPtr]::Zero) {
+        [Win32Job]::CloseHandle($script:ProcessJob) | Out-Null
     }
 }

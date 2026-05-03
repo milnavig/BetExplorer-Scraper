@@ -53,10 +53,27 @@ open_browser() {
 }
 
 cleanup() {
-  if [ "${API_PID:-}" ]; then kill "$API_PID" >/dev/null 2>&1 || true; fi
-  if [ "${WEB_PID:-}" ]; then kill "$WEB_PID" >/dev/null 2>&1 || true; fi
+  if [ "${API_PID:-}" ]; then kill_tree "$API_PID"; fi
+  if [ "${WEB_PID:-}" ]; then kill_tree "$WEB_PID"; fi
 }
-trap cleanup EXIT INT TERM
+
+kill_tree() {
+  local pid="$1"
+  local child
+
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    kill_tree "$child"
+  done
+
+  kill "$pid" >/dev/null 2>&1 || true
+  sleep 1
+  kill -9 "$pid" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM HUP
 
 require_command uv "Run ./setup-unix.sh first."
 require_command npm "Install Node.js LTS and run ./setup-unix.sh again."

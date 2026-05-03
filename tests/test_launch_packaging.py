@@ -46,6 +46,28 @@ def test_windows_launchers_wire_setup_start_shortcut_and_package_scripts() -> No
     assert "BetExplorer-Monitor-Client.zip" in package_ps1
 
 
+def test_windows_powershell_scripts_use_string_root_paths() -> None:
+    scripts = [
+        "scripts/setup-windows.ps1",
+        "scripts/start-windows.ps1",
+        "scripts/install-shortcut-windows.ps1",
+        "scripts/package-windows.ps1",
+    ]
+
+    for path in scripts:
+        content = read_repo_file(path)
+        assert '$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path' in content, path
+
+
+def test_windows_launcher_ties_child_processes_to_terminal_lifetime() -> None:
+    start_ps1 = read_repo_file("scripts/start-windows.ps1")
+
+    assert "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE" in start_ps1
+    assert "Assign-ProcessToJob $process" in start_ps1
+    assert "Stop-ProcessTree" in start_ps1
+    assert "Get-CimInstance Win32_Process" in start_ps1
+
+
 def test_unix_launchers_wire_setup_start_and_shortcut_scripts() -> None:
     expected_files = [
         "setup-unix.sh",
@@ -71,6 +93,14 @@ def test_unix_launchers_wire_setup_start_and_shortcut_scripts() -> None:
     assert "http://127.0.0.1:3000" in start
     assert "BetExplorer Monitor.command" in shortcut
     assert "BetExplorer Monitor.desktop" in shortcut
+
+
+def test_unix_launcher_cleans_up_process_tree_on_terminal_close() -> None:
+    start = read_repo_file("scripts/start-unix.sh")
+
+    assert "trap cleanup EXIT INT TERM HUP" in start
+    assert "kill_tree()" in start
+    assert "pgrep -P" in start
 
 
 def test_client_launch_guide_has_nontechnical_steps() -> None:

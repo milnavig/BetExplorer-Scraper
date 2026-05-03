@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Dist = Join-Path $Root "dist"
 $PackageDir = Join-Path $Dist "BetExplorer-Monitor-Client"
 $ZipPath = Join-Path $Dist "BetExplorer-Monitor-Client.zip"

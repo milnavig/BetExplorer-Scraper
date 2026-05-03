@@ -406,7 +406,7 @@ async def test_run_once_finalizes_stored_match_after_capture_window_when_missing
     assert result["due"] == 1
     assert result["captured"] == 1
     assert transport.match_odds_calls == 1
-    assert row["capture_phase"] == "FINALIZING"
+    assert row["capture_phase"] == "FINALIZED"
     assert row["next_capture_at"] is None
     assert row["finalized_at"] == now.isoformat()
     assert row["bookmaker_count"] == 2

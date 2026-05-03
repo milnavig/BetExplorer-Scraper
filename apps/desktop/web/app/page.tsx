@@ -697,11 +697,6 @@ export default function Dashboard() {
             tone="bad"
           />
           <Metric label="Bookmakers" value={bookmakers.length} />
-          <Metric
-            label="Poll seconds"
-            value={status?.final_capture_poll_interval_seconds}
-          />
-          <Metric label="Concurrency" value={status?.max_concurrent_captures} />
         </section>
 
         <section className="coverage-strip">
@@ -1598,8 +1593,8 @@ function requiredAvailability(match: MatchRow) {
 
 function displayTiming(match: MatchRow) {
   if (match.timing_status !== "UNKNOWN") return match.timing_status;
-  if (match.capture_phase) return match.capture_phase;
   if (match.finalized_at) return "FINALIZED";
+  if (match.capture_phase) return match.capture_phase;
   if (match.next_capture_at) return "SCHEDULED";
   return "UNKNOWN";
 }

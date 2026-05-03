@@ -39,7 +39,7 @@ class CaptureService:
             SchedulerConfig(
                 upcoming_window_minutes=self.odds_capture_window_minutes,
                 recently_started_window_minutes=settings.recently_started_window_minutes,
-                max_match_age_after_kickoff_minutes=settings.max_match_age_after_kickoff_minutes,
+                max_match_age_after_kickoff_minutes=settings.finalize_after_kickoff_minutes,
                 monitoring_capture_poll_interval_seconds=settings.monitoring_capture_poll_interval_seconds,
                 final_capture_poll_interval_seconds=settings.final_capture_poll_interval_seconds,
                 final_capture_fast_window_minutes=settings.final_capture_fast_window_minutes,
@@ -217,7 +217,8 @@ class CaptureService:
                 async with semaphore:
                     self._set_progress(active=self._progress["active"] + 1, current_event_id=event_id)
                     ok = await self.capture_match(match_id, event_id, source_url)
-                    self.database.mark_match_captured(match_id, utc_now(), next_capture_at, phase, finalized_at)
+                    stored_phase = "FINALIZED" if finalized_at is not None else phase
+                    self.database.mark_match_captured(match_id, utc_now(), next_capture_at, stored_phase, finalized_at)
                     captured += 1 if ok else 0
                     failed += 0 if ok else 1
                     self._set_progress(

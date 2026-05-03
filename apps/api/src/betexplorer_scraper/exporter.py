@@ -1,30 +1,25 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
 import pandas as pd
 
 from .models import DiscoveredMatch, OddsSnapshot
-from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
+from .snapshot_metrics import parse_timezone_offset_seconds
 
 
 def final_odds_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], timezone_offset: str = "+0") -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for match, snapshot in items:
         row: dict[str, object] = {
-            "captured_at": snapshot.captured_at.isoformat(),
-            "kickoff_time": match.kickoff_time.isoformat() if match.kickoff_time else None,
-            "final_snapshot_age_to_kickoff_seconds": final_snapshot_age_to_kickoff_seconds(
-                match.kickoff_time,
-                snapshot.captured_at,
-                timezone_offset,
-            ),
+            "captured_at": format_export_datetime(snapshot.captured_at, timezone_offset, stored_as_utc=True),
+            "kickoff_time": format_export_datetime(match.kickoff_time, timezone_offset),
             "status": export_status(match),
             "match_status": match.status,
-            "timing_status": match.timing_status.value,
             "capture_phase": match.capture_phase,
-            "finalized_at": match.finalized_at.isoformat() if match.finalized_at else None,
+            "finalized_at": format_export_datetime(match.finalized_at, timezone_offset),
             "league": match.league,
             "home_team": match.home_team,
             "away_team": match.away_team,
@@ -63,20 +58,15 @@ def final_odds_long_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], time
     rows: list[dict[str, object]] = []
     for match, snapshot in items:
         required_bookmakers = {required.strip().lower() for required in snapshot.required_bookmakers}
+        labels = selection_labels(match, snapshot.market)
         for odds in snapshot.bookmaker_odds:
             row: dict[str, object] = {
-                "captured_at": snapshot.captured_at.isoformat(),
-                "kickoff_time": match.kickoff_time.isoformat() if match.kickoff_time else None,
-                "final_snapshot_age_to_kickoff_seconds": final_snapshot_age_to_kickoff_seconds(
-                    match.kickoff_time,
-                    snapshot.captured_at,
-                    timezone_offset,
-                ),
+                "captured_at": format_export_datetime(snapshot.captured_at, timezone_offset, stored_as_utc=True),
+                "kickoff_time": format_export_datetime(match.kickoff_time, timezone_offset),
                 "status": export_status(match),
                 "match_status": match.status,
-                "timing_status": match.timing_status.value,
                 "capture_phase": match.capture_phase,
-                "finalized_at": match.finalized_at.isoformat() if match.finalized_at else None,
+                "finalized_at": format_export_datetime(match.finalized_at, timezone_offset),
                 "league": match.league,
                 "home_team": match.home_team,
                 "away_team": match.away_team,
@@ -91,11 +81,11 @@ def final_odds_long_rows(items: list[tuple[DiscoveredMatch, OddsSnapshot]], time
                 "bookmaker_id": odds.bookmaker_id,
                 "betexplorer_bookmaker_id": odds.betexplorer_bookmaker_id,
                 "is_required_bookmaker": odds.normalized_bookmaker in required_bookmakers,
-                "selection_1": "selection_1",
+                "selection_1": labels[0],
                 "selection_1_odds": odds.home_odds,
-                "selection_2": "selection_2",
+                "selection_2": labels[1],
                 "selection_2_odds": odds.draw_odds,
-                "selection_3": "selection_3",
+                "selection_3": labels[2],
                 "selection_3_odds": odds.away_odds,
                 "raw_row_text": odds.raw_row_text,
                 "raw_attributes_json": json.dumps(odds.raw_attributes, ensure_ascii=False),
@@ -114,6 +104,40 @@ def export_status(match: DiscoveredMatch) -> str:
     if match.status and match.status != "scheduled":
         return match.status.upper()
     return "CAPTURED"
+
+
+def format_export_datetime(
+    value: datetime | None,
+    timezone_offset: str,
+    stored_as_utc: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    offset_seconds = parse_timezone_offset_seconds(timezone_offset)
+    local_value = value + timedelta(seconds=offset_seconds) if stored_as_utc else value
+    return f"{local_value.isoformat()}{format_timezone_offset(timezone_offset)}"
+
+
+def format_timezone_offset(timezone_offset: str) -> str:
+    offset_seconds = parse_timezone_offset_seconds(timezone_offset)
+    sign = "+" if offset_seconds >= 0 else "-"
+    absolute = abs(offset_seconds)
+    hours, remainder = divmod(absolute, 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def selection_labels(match: DiscoveredMatch, market: str) -> tuple[str | None, str | None, str | None]:
+    market_key = market.lower()
+    if market_key == "ou":
+        return ("Over", "Under", None)
+    if market_key == "bts":
+        return ("Yes", "No", None)
+    if market_key == "dc":
+        return ("1X", "12", "X2")
+    if market_key in {"ah", "ha", "dnb"}:
+        return (match.home_team, match.away_team, None)
+    return (match.home_team, "Draw", match.away_team)
 
 
 def export_final_odds(

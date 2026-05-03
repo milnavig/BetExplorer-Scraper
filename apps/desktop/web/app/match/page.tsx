@@ -297,11 +297,8 @@ export default function MatchPage() {
         <section className="capture-config-strip">
           <span title={tooltipFor("Browser TZ")}>Browser TZ <strong>{clientTimezone}</strong></span>
           <span title={tooltipFor("BetExplorer TZ")}>BetExplorer TZ <strong>UTC{status?.betexplorer_timezone_offset ?? "-"}</strong></span>
-          <span title={tooltipFor("Poll")}>Poll <strong>{status?.monitoring_capture_poll_interval_seconds ?? "-"}s / {status?.final_capture_poll_interval_seconds ?? "-"}s</strong></span>
           <span title={tooltipFor("Discovery")}>Discovery <strong>{status?.discovery_poll_interval_seconds ?? "-"}s</strong></span>
           <span title={tooltipFor("Heartbeat")}>Heartbeat <strong>{status?.scheduler_tick_seconds ?? "-"}s</strong></span>
-          <span title={tooltipFor("Concurrency")}>Concurrency <strong>{status?.max_concurrent_captures ?? "-"}</strong></span>
-          <span title={tooltipFor("Market concurrency")}>Markets <strong>{status?.max_concurrent_markets_per_match ?? "-"}</strong></span>
           <span title={tooltipFor("Window")}>Odds lookahead <strong>{status?.odds_capture_lookahead_hours ?? "-"}h</strong></span>
           <span title={tooltipFor("Results")}>Results <strong>{status?.result_capture_lookback_hours ?? "-"}h</strong></span>
         </section>
@@ -732,11 +729,8 @@ function tooltipFor(label: string) {
   const text: Record<string, string> = {
     "Browser TZ": "Timezone reported by this browser.",
     "BetExplorer TZ": "Timezone offset sent to BetExplorer via the my_timezone cookie.",
-    Poll: "Odds polling cadence: normal capture window / final fast window.",
     Discovery: "How often the app refreshes the BetExplorer match list.",
     Heartbeat: "How often the scheduler loop wakes up.",
-    Concurrency: "Maximum due matches captured in parallel.",
-    "Market concurrency": "Maximum market endpoints captured in parallel inside one match.",
     Window: "Hours before kickoff when active odds capture begins.",
     Results: "How far back finished matches are checked for one-time result capture.",
     Kickoff: "BetExplorer kickoff time in the configured BetExplorer/client timezone.",
@@ -764,8 +758,8 @@ function tooltipFor(label: string) {
 
 function displayTiming(match: MatchRow) {
   if (match.timing_status !== "UNKNOWN") return match.timing_status;
-  if (match.capture_phase) return match.capture_phase;
   if (match.finalized_at) return "FINALIZED";
+  if (match.capture_phase) return match.capture_phase;
   if (match.next_capture_at) return "SCHEDULED";
   return "UNKNOWN";
 }

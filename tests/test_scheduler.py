@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from betexplorer_scraper.models import DiscoveredMatch, TimingStatus
+from betexplorer_scraper.config import Settings
 from betexplorer_scraper.scheduler import Scheduler, SchedulerConfig
 
 
@@ -112,6 +113,29 @@ def test_match_is_finalized_after_post_kickoff_capture_window() -> None:
     assert decision.phase == "FINALIZED"
     assert decision.should_capture is False
     assert decision.finalized_at == now
+
+
+def test_finalize_after_kickoff_minutes_can_be_set_from_config_env(monkeypatch) -> None:
+    monkeypatch.setenv("FINALIZE_AFTER_KICKOFF_MINUTES", "5")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.finalize_after_kickoff_minutes == 5
+
+
+def test_legacy_max_match_age_after_kickoff_env_still_sets_finalize_window(monkeypatch) -> None:
+    monkeypatch.delenv("FINALIZE_AFTER_KICKOFF_MINUTES", raising=False)
+    monkeypatch.setenv("MAX_MATCH_AGE_AFTER_KICKOFF_MINUTES", "6")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.finalize_after_kickoff_minutes == 6
+
+
+def test_finalize_after_kickoff_minutes_can_be_set_by_field_name() -> None:
+    settings = Settings(_env_file=None, finalize_after_kickoff_minutes=7)
+
+    assert settings.finalize_after_kickoff_minutes == 7
 
 
 def test_late_match_without_previous_capture_gets_one_recovery_capture() -> None:
