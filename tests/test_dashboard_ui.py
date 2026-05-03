@@ -101,3 +101,22 @@ def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
     assert "loadDashboardData" in page
     assert "setInterval(() => void load(), 5000)" not in page
     assert "api<MatchRow[]>(\"/api/matches\")" in page
+
+
+def test_selected_match_odds_rows_render_incrementally() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+
+    assert "ODDS_RENDER_BATCH" in page
+    assert "renderedBookmakers" in page
+    assert "filteredBookmakers.map((row)" not in page
+    assert "oddsListMoreRef" in page
+    assert "Load more odds rows" in page
+    assert "startTransition(() => setDetail(nextDetail))" in page
+
+    assert "ODDS_RENDER_BATCH" in match_page
+    assert "renderedGroupedOddsRows" in match_page
+    assert "groupedOddsRows.map((item)" not in match_page
+    assert "oddsListMoreRef" in match_page
+    assert "Load more odds rows" in match_page
+    assert "startTransition(() => setDetail(nextDetail))" in match_page

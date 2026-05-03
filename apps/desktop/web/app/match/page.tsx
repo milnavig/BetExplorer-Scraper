@@ -16,6 +16,7 @@ import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
 const MATCH_RENDER_BATCH = 80;
+const ODDS_RENDER_BATCH = 160;
 
 type MatchRow = {
   id: string;
@@ -141,7 +142,9 @@ export default function MatchPage() {
   const [clientTimezone, setClientTimezone] = useState("-");
   const selectedIdRef = useRef<string | null>(null);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
+  const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
   const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
+  const [oddsRenderLimit, setOddsRenderLimit] = useState(ODDS_RENDER_BATCH);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
@@ -178,7 +181,7 @@ export default function MatchPage() {
     let active = true;
     api<MatchDetail>(`/api/matches/${selectedId}`)
       .then((nextDetail) => {
-        if (active) setDetail(nextDetail);
+        if (active) startTransition(() => setDetail(nextDetail));
       })
       .catch((nextError) => setError(nextError instanceof Error ? nextError.message : "Failed to load match detail"));
     return () => {
@@ -253,6 +256,32 @@ export default function MatchPage() {
   const requiredRows = filteredOdds.filter((row) => REQUIRED_BOOKMAKERS.has(row.normalized_bookmaker));
   const marketCounts = useMemo(() => marketCountsFor(detail?.bookmaker_odds ?? []), [detail]);
   const groupedOddsRows = useMemo(() => groupOddsRows(filteredOdds), [filteredOdds]);
+  useEffect(() => {
+    setOddsRenderLimit(ODDS_RENDER_BATCH);
+  }, [marketFilter, oddsQuery, requiredOnly, selectedId]);
+
+  const renderedGroupedOddsRows = useMemo(
+    () => groupedOddsRows.slice(0, oddsRenderLimit),
+    [groupedOddsRows, oddsRenderLimit],
+  );
+  const hasMoreOddsRows = renderedGroupedOddsRows.length < groupedOddsRows.length;
+  const loadMoreOddsRows = () =>
+    setOddsRenderLimit((value) =>
+      Math.min(value + ODDS_RENDER_BATCH, groupedOddsRows.length),
+    );
+
+  useEffect(() => {
+    const node = oddsListMoreRef.current;
+    if (!node || !hasMoreOddsRows || !("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreOddsRows();
+      },
+      { rootMargin: "320px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [groupedOddsRows.length, hasMoreOddsRows]);
   const timezoneOffset = status?.betexplorer_timezone_offset ?? "+0";
   const formatSchedule = (value?: string | null) => formatScheduleDate(value, timezoneOffset);
   const formatUtc = (value?: string | null) => formatUtcDate(value, timezoneOffset);
@@ -461,7 +490,7 @@ export default function MatchPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {groupedOddsRows.map((item) =>
+                    {renderedGroupedOddsRows.map((item) =>
                       item.type === "market" ? (
                         <tr key={`market-${item.market}`} className="market-group-row">
                           <td colSpan={10}>
@@ -486,6 +515,18 @@ export default function MatchPage() {
                     )}
                   </tbody>
                 </table>
+                {groupedOddsRows.length > 0 ? (
+                  <div className="list-footer" ref={oddsListMoreRef}>
+                    <span>
+                      Showing {renderedGroupedOddsRows.length} of {groupedOddsRows.length} odds rows
+                    </span>
+                    {hasMoreOddsRows ? (
+                      <button type="button" onClick={loadMoreOddsRows}>
+                        Load more odds rows
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
               </div>
             </section>
 

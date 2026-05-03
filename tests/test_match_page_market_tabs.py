@@ -22,7 +22,7 @@ def test_match_page_table_groups_rows_by_market_inside_tbody() -> None:
     page = (ROOT / "apps/desktop/web/app/match/page.tsx").read_text(encoding="utf-8")
     styles = (ROOT / "apps/desktop/web/app/globals.css").read_text(encoding="utf-8")
 
-    assert "groupedOddsRows.map" in page
+    assert "renderedGroupedOddsRows.map" in page
     assert 'className="market-group-row"' in page
     assert "colSpan={10}" in page
     assert "groupOddsRows(filteredOdds)" in page

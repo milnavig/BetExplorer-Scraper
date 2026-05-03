@@ -18,6 +18,7 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
 const MATCH_RENDER_BATCH = 80;
+const ODDS_RENDER_BATCH = 120;
 const DASHBOARD_STATUS_REFRESH_MS = 5000;
 const DASHBOARD_FULL_REFRESH_MS = 30000;
 
@@ -296,7 +297,9 @@ export default function Dashboard() {
   const [nowMs, setNowMs] = useState(() => Date.now());
   const selectedIdRef = useRef<string | null>(null);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
+  const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
   const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
+  const [oddsRenderLimit, setOddsRenderLimit] = useState(ODDS_RENDER_BATCH);
 
   useEffect(() => {
     selectedIdRef.current = selectedId;
@@ -413,7 +416,7 @@ export default function Dashboard() {
     let active = true;
     api<MatchDetail>(`/api/matches/${selectedId}`)
       .then((nextDetail) => {
-        if (active) setDetail(nextDetail);
+        if (active) startTransition(() => setDetail(nextDetail));
       })
       .catch((nextError) =>
         setError(
@@ -514,6 +517,33 @@ export default function Dashboard() {
       return requiredOk && marketOk && queryOk;
     });
   }, [bookmakerQuery, detail, marketFilter, requiredOnly]);
+
+  useEffect(() => {
+    setOddsRenderLimit(ODDS_RENDER_BATCH);
+  }, [bookmakerQuery, marketFilter, requiredOnly, selectedId]);
+
+  const renderedBookmakers = useMemo(
+    () => filteredBookmakers.slice(0, oddsRenderLimit),
+    [filteredBookmakers, oddsRenderLimit],
+  );
+  const hasMoreOddsRows = renderedBookmakers.length < filteredBookmakers.length;
+  const loadMoreOddsRows = () =>
+    setOddsRenderLimit((value) =>
+      Math.min(value + ODDS_RENDER_BATCH, filteredBookmakers.length),
+    );
+
+  useEffect(() => {
+    const node = oddsListMoreRef.current;
+    if (!node || !hasMoreOddsRows || !("IntersectionObserver" in window)) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreOddsRows();
+      },
+      { rootMargin: "320px" },
+    );
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [filteredBookmakers.length, hasMoreOddsRows]);
 
   useEffect(() => {
     setMatchRenderLimit(MATCH_RENDER_BATCH);
@@ -1166,7 +1196,7 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody>
-                {filteredBookmakers.map((row) => (
+                {renderedBookmakers.map((row) => (
                   <tr
                     key={row.id}
                     className={
@@ -1191,6 +1221,18 @@ export default function Dashboard() {
                 ))}
               </tbody>
             </table>
+            {filteredBookmakers.length > 0 ? (
+              <div className="list-footer" ref={oddsListMoreRef}>
+                <span>
+                  Showing {renderedBookmakers.length} of {filteredBookmakers.length} odds rows
+                </span>
+                {hasMoreOddsRows ? (
+                  <button type="button" onClick={loadMoreOddsRows}>
+                    Load more odds rows
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </section>
 
