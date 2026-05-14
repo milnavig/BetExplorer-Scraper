@@ -12,9 +12,11 @@ apps/api/src/betexplorer_scraper/clock.py
 apps/api/src/betexplorer_scraper/config.py
 apps/api/src/betexplorer_scraper/database.py
 apps/api/src/betexplorer_scraper/exporter.py
+apps/api/src/betexplorer_scraper/historical.py
 apps/api/src/betexplorer_scraper/models.py
 apps/api/src/betexplorer_scraper/parsers.py
 apps/api/src/betexplorer_scraper/scheduler.py
+apps/api/src/betexplorer_scraper/snapshot_metrics.py
 apps/api/src/betexplorer_scraper/timing.py
 apps/api/src/betexplorer_scraper/transport.py
 apps/api/src/betexplorer_scraper/utils.py
@@ -24,9 +26,14 @@ apps/api/src/betexplorer_scraper.egg-info/SOURCES.txt
 apps/api/src/betexplorer_scraper.egg-info/dependency_links.txt
 apps/api/src/betexplorer_scraper.egg-info/requires.txt
 apps/api/src/betexplorer_scraper.egg-info/top_level.txt
+tests/test_api_historical.py
 tests/test_capture_scheduler.py
+tests/test_dashboard_ui.py
 tests/test_database.py
 tests/test_exporter.py
+tests/test_historical_signals.py
+tests/test_launch_packaging.py
+tests/test_match_page_market_tabs.py
 tests/test_parser.py
 tests/test_scheduler.py
 tests/test_timing.py

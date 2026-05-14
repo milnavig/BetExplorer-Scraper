@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     export_dir: Path = Field(default=Path("data/exports"))
     raw_snapshot_dir: Path = Field(default=Path("data/raw_snapshots"))
     log_dir: Path = Field(default=Path("data/logs"))
+    historical_database_root: Path = Field(default=Path("SAMPLE_DATABASE"))
     enable_browser_automation: bool = False
 
     @property

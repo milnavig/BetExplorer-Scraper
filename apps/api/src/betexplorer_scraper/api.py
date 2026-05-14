@@ -16,10 +16,12 @@ from .capture import CaptureService
 from .config import get_settings
 from .database import Database
 from .exporter import export_final_odds
+from .historical import HistoricalDocxImporter
 
 settings = get_settings()
 database = Database(settings.database_path, timezone_offset=settings.betexplorer_timezone_offset)
 service = CaptureService(settings, database)
+historical_importer = HistoricalDocxImporter(database)
 
 scheduler_task: asyncio.Task[None] | None = None
 scheduler_started_at: datetime | None = None
@@ -76,6 +78,10 @@ class ExportRequest(BaseModel):
     date: str | None = None
     format: str = "csv"
     layout: str = "wide"
+
+
+class SignalRecomputeRequest(BaseModel):
+    archive_played: bool = True
 
 
 @app.get("/api/status")
@@ -161,6 +167,47 @@ def logs() -> list[dict[str, object]]:
 @app.get("/api/bookmakers")
 def bookmakers() -> list[dict[str, object]]:
     return database.bookmaker_coverage()
+
+
+@app.get("/api/historical/import-status")
+def historical_import_status() -> dict[str, object]:
+    result = database.historical_import_status()
+    result["root"] = str(settings.historical_database_root)
+    result["root_exists"] = settings.historical_database_root.exists()
+    return result
+
+
+@app.post("/api/historical/import")
+def historical_import() -> dict[str, int]:
+    result = historical_importer.import_roots([settings.historical_database_root])
+    recompute = database.recompute_historical_signals()
+    archive = database.archive_played_matches()
+    return {**result, **{f"recompute_{key}": value for key, value in recompute.items()}, **archive}
+
+
+@app.get("/api/signals")
+def signals(
+    dataset: str = "all",
+    bookmaker: str = "all",
+    signal_type: str = "all",
+    min_sample: int = 1,
+) -> list[dict[str, object]]:
+    return database.list_signals(dataset=dataset, bookmaker=bookmaker, signal_type=signal_type, min_sample=min_sample)
+
+
+@app.post("/api/signals/recompute")
+def recompute_signals(request: SignalRecomputeRequest) -> dict[str, int]:
+    result = database.recompute_historical_signals()
+    archive = database.archive_played_matches() if request.archive_played else {"archived": 0}
+    return {**result, **archive}
+
+
+@app.get("/api/signals/{match_id}")
+def match_signals(match_id: str) -> list[dict[str, object]]:
+    detail = database.match_detail(match_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Match not found")
+    return database.list_signals(match_id=match_id)
 
 
 @app.get("/api/exports")

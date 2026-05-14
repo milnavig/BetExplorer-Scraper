@@ -15,6 +15,7 @@ Local monitoring system for tracking BetExplorer football matches, capturing fin
 - Captures finished match results once for matches discovered within `RESULT_CAPTURE_LOOKBACK_HOURS`, default 24 hours.
 - Uses Bwin and Unibet as required bookmaker quality checks by default.
 - Saves matches, snapshots, bookmaker odds, attempts, logs, and scheduler state to DuckDB.
+- Imports the client file-based DOCX historical odds database and shows Bwin/Unibet historical signals.
 - Exports CSV/XLSX.
 - Provides a local monitoring UI.
 
@@ -79,6 +80,7 @@ SCHEDULER_TICK_SECONDS=10
 MAX_CONCURRENT_CAPTURES=6
 RETRY_DELAY_SECONDS=1
 DATABASE_PATH=data/betexplorer.duckdb
+HISTORICAL_DATABASE_ROOT=SAMPLE_DATABASE
 ```
 
 `BETEXPLORER_TIMEZONE_OFFSET` is important: BetExplorer changes the visible "today" schedule based on the `my_timezone` cookie. For Kyiv time keep `+3`, otherwise the scraper can see the previous UTC day and `Next capture` may look empty or stale.
@@ -164,6 +166,30 @@ Exports are written to:
 ```text
 data/exports/
 ```
+
+## Historical Odds Signals
+
+Milestone 2 adds a local historical matching layer for the client DOCX database. Configure:
+
+```env
+HISTORICAL_DATABASE_ROOT=SAMPLE_DATABASE
+```
+
+The importer scans dataset folders named like `Odds`, `Gebruikbare odds`, `*ODDS`, or `*Usable Odds`, reads DOCX tables, and stores normalized historical odds/results in DuckDB. It does not modify the original DOCX files.
+
+From the dashboard:
+
+- Click `Import DOCX` in `Historical signals` to import changed DOCX files and recompute signals.
+- Click `Recompute` after new final Bwin/Unibet odds are captured.
+- Filter signals by dataset, bookmaker, signal type, and minimum sample size.
+
+API endpoints:
+
+- `GET /api/historical/import-status`
+- `POST /api/historical/import`
+- `GET /api/signals`
+- `GET /api/signals/{match_id}`
+- `POST /api/signals/recompute`
 
 Export status fields:
 

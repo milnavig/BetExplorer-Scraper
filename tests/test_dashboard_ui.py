@@ -92,6 +92,28 @@ def test_dashboard_tooltips_explain_metrics_with_operational_context() -> None:
         assert phrase in page
 
 
+def test_dashboard_renders_historical_signal_controls() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+
+    expected_phrases = [
+        "Historical signals",
+        "api<HistoricalSignal[]>(\"/api/signals\")",
+        "api<HistoricalImportStatus>(\"/api/historical/import-status\")",
+        "api<HistoricalImportResult>(\"/api/historical/import\"",
+        "api<SignalRecomputeResult>(\"/api/signals/recompute\"",
+        "signalDatasetFilter",
+        "signalBookmakerFilter",
+        "signalTypeFilter",
+        "minSignalSample",
+        "Home Win %",
+        "BTTS",
+        "Double Chance",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page
+
+
 def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
     page = read_repo_file("apps/desktop/web/app/page.tsx")
 

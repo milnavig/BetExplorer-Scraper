@@ -10,6 +10,7 @@ from threading import RLock
 import duckdb
 
 from .clock import utc_now
+from .historical import NEIGHBOR_TOLERANCE, ONE_DRAW_MIN_SAMPLE, compute_outcome_stats, normalize_odds, normalize_score
 from .models import BookmakerOdds, CaptureType, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
 from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
 
@@ -130,6 +131,97 @@ class Database:
                 event VARCHAR,
                 event_id VARCHAR,
                 details_json VARCHAR
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_import_files (
+                source_file VARCHAR PRIMARY KEY,
+                dataset VARCHAR,
+                fingerprint VARCHAR,
+                records INTEGER,
+                warnings INTEGER,
+                imported_at TIMESTAMP
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_records (
+                id VARCHAR PRIMARY KEY,
+                dataset VARCHAR,
+                source_file VARCHAR,
+                source_home_bucket DOUBLE,
+                source_away_file DOUBLE,
+                query_home_odds DOUBLE,
+                query_draw_odds DOUBLE,
+                query_away_odds DOUBLE,
+                historical_home_odds DOUBLE,
+                historical_draw_odds DOUBLE,
+                historical_away_odds DOUBLE,
+                full_time_score VARCHAR,
+                half_time_score VARCHAR,
+                parse_status VARCHAR,
+                parse_warning VARCHAR,
+                imported_at TIMESTAMP
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_signals (
+                id VARCHAR PRIMARY KEY,
+                match_id VARCHAR,
+                event_id VARCHAR,
+                league VARCHAR,
+                home_team VARCHAR,
+                away_team VARCHAR,
+                kickoff_time TIMESTAMP,
+                capture_phase VARCHAR,
+                bookmaker VARCHAR,
+                normalized_bookmaker VARCHAR,
+                dataset VARCHAR,
+                signal_type VARCHAR,
+                current_home_odds DOUBLE,
+                current_draw_odds DOUBLE,
+                current_away_odds DOUBLE,
+                sample_size INTEGER,
+                home_win_pct DOUBLE,
+                draw_pct DOUBLE,
+                away_win_pct DOUBLE,
+                over_0_5_pct DOUBLE,
+                over_1_5_pct DOUBLE,
+                over_2_5_pct DOUBLE,
+                btts_pct DOUBLE,
+                double_chance_1x_pct DOUBLE,
+                double_chance_x2_pct DOUBLE,
+                double_chance_12_pct DOUBLE,
+                historical_scores_json VARCHAR,
+                source_files_json VARCHAR,
+                created_at TIMESTAMP
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS played_match_archive (
+                match_id VARCHAR PRIMARY KEY,
+                event_id VARCHAR,
+                league VARCHAR,
+                home_team VARCHAR,
+                away_team VARCHAR,
+                kickoff_time TIMESTAMP,
+                finalized_at TIMESTAMP,
+                result_captured_at TIMESTAMP,
+                full_time_score VARCHAR,
+                bwin_home_odds DOUBLE,
+                bwin_draw_odds DOUBLE,
+                bwin_away_odds DOUBLE,
+                unibet_home_odds DOUBLE,
+                unibet_draw_odds DOUBLE,
+                unibet_away_odds DOUBLE,
+                archived_at TIMESTAMP
             )
             """
         )
@@ -537,6 +629,368 @@ class Database:
             "INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?, ?)",
             [str(uuid.uuid4()), utc_now(), level, module, event, event_id, json.dumps(details or {})],
         )
+
+    @_locked
+    def historical_file_is_current(self, source_file: str, fingerprint: str) -> bool:
+        row = self.connection.execute(
+            "SELECT fingerprint FROM historical_import_files WHERE source_file = ?",
+            [source_file],
+        ).fetchone()
+        return bool(row and row[0] == fingerprint)
+
+    @_locked
+    def replace_historical_records(self, source_file: str, records: list[dict[str, object]]) -> None:
+        now = utc_now()
+        self.connection.execute("DELETE FROM historical_records WHERE source_file = ?", [source_file])
+        for row in records:
+            self.connection.execute(
+                """
+                INSERT INTO historical_records (
+                    id, dataset, source_file, source_home_bucket, source_away_file,
+                    query_home_odds, query_draw_odds, query_away_odds,
+                    historical_home_odds, historical_draw_odds, historical_away_odds,
+                    full_time_score, half_time_score, parse_status, parse_warning, imported_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    str(uuid.uuid4()),
+                    row["dataset"],
+                    row.get("source_file", source_file),
+                    row.get("source_home_bucket"),
+                    row.get("source_away_file"),
+                    row["query_home_odds"],
+                    row["query_draw_odds"],
+                    row["query_away_odds"],
+                    row.get("historical_home_odds"),
+                    row.get("historical_draw_odds"),
+                    row.get("historical_away_odds"),
+                    row["full_time_score"],
+                    row.get("half_time_score"),
+                    row.get("parse_status", "parsed"),
+                    row.get("parse_warning"),
+                    now,
+                ],
+            )
+
+    @_locked
+    def record_historical_import_file(
+        self,
+        source_file: str,
+        dataset: str,
+        fingerprint: str,
+        records: int,
+        warnings: int,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO historical_import_files
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (source_file) DO UPDATE SET
+                dataset = excluded.dataset,
+                fingerprint = excluded.fingerprint,
+                records = excluded.records,
+                warnings = excluded.warnings,
+                imported_at = excluded.imported_at
+            """,
+            [source_file, dataset, fingerprint, records, warnings, utc_now()],
+        )
+
+    @_locked
+    def list_historical_records(self, limit: int = 500) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT dataset, source_file, source_home_bucket, source_away_file,
+                   query_home_odds, query_draw_odds, query_away_odds,
+                   historical_home_odds, historical_draw_odds, historical_away_odds,
+                   full_time_score, half_time_score, parse_status, parse_warning
+            FROM historical_records
+            ORDER BY dataset, source_file, CASE parse_status WHEN 'parsed' THEN 0 ELSE 1 END, full_time_score, id
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        columns = [col[0] for col in self.connection.description]
+        return [self._serialize(dict(zip(columns, row))) for row in rows]
+
+    @_locked
+    def historical_import_status(self) -> dict[str, object]:
+        records = self.connection.execute("SELECT COUNT(*) FROM historical_records").fetchone()[0]
+        files = self.connection.execute("SELECT COUNT(*) FROM historical_import_files").fetchone()[0]
+        warnings = self.connection.execute(
+            "SELECT COALESCE(SUM(warnings), 0) FROM historical_import_files"
+        ).fetchone()[0]
+        datasets = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT DISTINCT dataset FROM historical_records ORDER BY dataset"
+            ).fetchall()
+            if row[0]
+        ]
+        last_import = self.connection.execute("SELECT MAX(imported_at) FROM historical_import_files").fetchone()[0]
+        return {
+            "records": records,
+            "files": files,
+            "warnings": warnings,
+            "datasets": datasets,
+            "last_import": last_import.isoformat() if last_import else None,
+        }
+
+    @_locked
+    def recompute_historical_signals(self) -> dict[str, int]:
+        self.connection.execute("DELETE FROM historical_signals")
+        candidates = self._signal_candidates()
+        inserted = 0
+        for candidate in candidates:
+            for signal_type, records in self._historical_record_groups_for_candidate(candidate):
+                if not records:
+                    continue
+                inserted += self._insert_historical_signal(candidate, signal_type, records)
+        return {"matches_evaluated": len({row["match_id"] for row in candidates}), "signals": inserted}
+
+    def _signal_candidates(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT m.id AS match_id, m.betexplorer_match_id AS event_id, m.league, m.home_team, m.away_team,
+                   m.kickoff_time, m.capture_phase, m.finalized_at,
+                   o.bookmaker, o.normalized_bookmaker, o.home_odds, o.draw_odds, o.away_odds
+            FROM matches m
+            JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE AND lower(s.market) = '1x2'
+            JOIN bookmaker_odds o ON o.snapshot_id = s.id
+            WHERE o.normalized_bookmaker IN ('bwin', 'unibet')
+              AND o.home_odds IS NOT NULL
+              AND o.draw_odds IS NOT NULL
+              AND o.away_odds IS NOT NULL
+            ORDER BY m.kickoff_time NULLS LAST, m.home_team, o.normalized_bookmaker
+            """
+        ).fetchall()
+        columns = [col[0] for col in self.connection.description]
+        return [dict(zip(columns, row)) for row in rows]
+
+    def _historical_record_groups_for_candidate(
+        self,
+        candidate: dict[str, object],
+    ) -> list[tuple[str, list[dict[str, object]]]]:
+        home = normalize_odds(candidate["home_odds"])
+        draw = normalize_odds(candidate["draw_odds"])
+        away = normalize_odds(candidate["away_odds"])
+        if home is None or draw is None or away is None:
+            return []
+        exact = self._fetch_historical_records(
+            """
+            query_home_odds = ? AND query_draw_odds = ? AND query_away_odds = ?
+            """,
+            [home, draw, away],
+        )
+        neighbor = self._fetch_historical_records(
+            """
+            ABS(query_home_odds - ?) <= ?
+            AND ABS(query_draw_odds - ?) <= ?
+            AND ABS(query_away_odds - ?) <= ?
+            AND NOT (query_home_odds = ? AND query_draw_odds = ? AND query_away_odds = ?)
+            """,
+            [home, NEIGHBOR_TOLERANCE, draw, NEIGHBOR_TOLERANCE, away, NEIGHBOR_TOLERANCE, home, draw, away],
+        )
+        draw_records = self._fetch_historical_records(
+            "ABS(query_draw_odds - ?) <= ?",
+            [draw, NEIGHBOR_TOLERANCE],
+        )
+        groups = [("exact_odds", exact), ("neighbor_odds", neighbor)]
+        if len(draw_records) >= ONE_DRAW_MIN_SAMPLE:
+            groups.append(("one_draw", draw_records))
+        return groups
+
+    def _fetch_historical_records(self, where_sql: str, params: list[object]) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            f"""
+            SELECT dataset, source_file, full_time_score
+            FROM historical_records
+            WHERE full_time_score IS NOT NULL AND {where_sql}
+            ORDER BY dataset, source_file, id
+            """,
+            params,
+        ).fetchall()
+        return [dict(zip(["dataset", "source_file", "full_time_score"], row)) for row in rows]
+
+    def _insert_historical_signal(
+        self,
+        candidate: dict[str, object],
+        signal_type: str,
+        records: list[dict[str, object]],
+    ) -> int:
+        grouped: dict[str, list[dict[str, object]]] = {}
+        for record in records:
+            grouped.setdefault(str(record["dataset"]), []).append(record)
+        inserted = 0
+        for dataset, dataset_records in grouped.items():
+            scores = [str(record["full_time_score"]) for record in dataset_records]
+            stats = compute_outcome_stats(scores)
+            source_files = sorted({str(record["source_file"]) for record in dataset_records})[:20]
+            historical_scores = scores[:10]
+            self.connection.execute(
+                """
+                INSERT INTO historical_signals VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                [
+                    str(uuid.uuid4()),
+                    candidate["match_id"],
+                    candidate["event_id"],
+                    candidate["league"],
+                    candidate["home_team"],
+                    candidate["away_team"],
+                    candidate["kickoff_time"],
+                    self._effective_capture_phase(candidate.get("capture_phase"), candidate.get("finalized_at")),
+                    candidate["bookmaker"],
+                    candidate["normalized_bookmaker"],
+                    dataset,
+                    signal_type,
+                    normalize_odds(candidate["home_odds"]),
+                    normalize_odds(candidate["draw_odds"]),
+                    normalize_odds(candidate["away_odds"]),
+                    stats["sample_size"],
+                    stats["home_win_pct"],
+                    stats["draw_pct"],
+                    stats["away_win_pct"],
+                    stats["over_0_5_pct"],
+                    stats["over_1_5_pct"],
+                    stats["over_2_5_pct"],
+                    stats["btts_pct"],
+                    stats["double_chance_1x_pct"],
+                    stats["double_chance_x2_pct"],
+                    stats["double_chance_12_pct"],
+                    json.dumps(historical_scores),
+                    json.dumps(source_files),
+                    utc_now(),
+                ],
+            )
+            inserted += 1
+        return inserted
+
+    @_locked
+    def list_signals(
+        self,
+        match_id: str | None = None,
+        dataset: str | None = None,
+        bookmaker: str | None = None,
+        signal_type: str | None = None,
+        min_sample: int = 1,
+    ) -> list[dict[str, object]]:
+        clauses = ["sample_size >= ?"]
+        params: list[object] = [min_sample]
+        if match_id:
+            clauses.append("match_id = ?")
+            params.append(match_id)
+        if dataset and dataset != "all":
+            clauses.append("dataset = ?")
+            params.append(dataset)
+        if bookmaker and bookmaker != "all":
+            clauses.append("normalized_bookmaker = ?")
+            params.append(bookmaker.lower())
+        if signal_type and signal_type != "all":
+            clauses.append("signal_type = ?")
+            params.append(signal_type)
+        rows = self.connection.execute(
+            f"""
+            SELECT *
+            FROM historical_signals
+            WHERE {' AND '.join(clauses)}
+            ORDER BY kickoff_time NULLS LAST, sample_size DESC, signal_type, normalized_bookmaker
+            LIMIT 500
+            """,
+            params,
+        ).fetchall()
+        columns = [col[0] for col in self.connection.description]
+        signals = [self._serialize(dict(zip(columns, row))) for row in rows]
+        for signal in signals:
+            signal["historical_scores"] = json.loads(str(signal.pop("historical_scores_json") or "[]"))
+            signal["source_files"] = json.loads(str(signal.pop("source_files_json") or "[]"))
+        return signals
+
+    @_locked
+    def archive_played_matches(self) -> dict[str, int]:
+        rows = self.connection.execute(
+            """
+            SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team,
+                   m.kickoff_time, m.finalized_at, m.result_captured_at, m.live_score,
+                   o.normalized_bookmaker, o.home_odds, o.draw_odds, o.away_odds
+            FROM matches m
+            JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE AND lower(s.market) = '1x2'
+            JOIN bookmaker_odds o ON o.snapshot_id = s.id AND o.normalized_bookmaker IN ('bwin', 'unibet')
+            WHERE m.result_captured_at IS NOT NULL
+            ORDER BY m.id, o.normalized_bookmaker
+            """
+        ).fetchall()
+        grouped: dict[str, dict[str, object]] = {}
+        for row in rows:
+            item = grouped.setdefault(
+                row[0],
+                {
+                    "match_id": row[0],
+                    "event_id": row[1],
+                    "league": row[2],
+                    "home_team": row[3],
+                    "away_team": row[4],
+                    "kickoff_time": row[5],
+                    "finalized_at": row[6],
+                    "result_captured_at": row[7],
+                    "full_time_score": normalize_score(str(row[8]).replace(":", "-") if row[8] else None),
+                    "bwin": None,
+                    "unibet": None,
+                },
+            )
+            item[str(row[9])] = (row[10], row[11], row[12])
+        archived = 0
+        for item in grouped.values():
+            if not item.get("full_time_score") or not item.get("bwin") or not item.get("unibet"):
+                continue
+            bwin = item["bwin"]
+            unibet = item["unibet"]
+            self.connection.execute(
+                """
+                INSERT INTO played_match_archive VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (match_id) DO UPDATE SET
+                    finalized_at = excluded.finalized_at,
+                    result_captured_at = excluded.result_captured_at,
+                    full_time_score = excluded.full_time_score,
+                    bwin_home_odds = excluded.bwin_home_odds,
+                    bwin_draw_odds = excluded.bwin_draw_odds,
+                    bwin_away_odds = excluded.bwin_away_odds,
+                    unibet_home_odds = excluded.unibet_home_odds,
+                    unibet_draw_odds = excluded.unibet_draw_odds,
+                    unibet_away_odds = excluded.unibet_away_odds,
+                    archived_at = excluded.archived_at
+                """,
+                [
+                    item["match_id"],
+                    item["event_id"],
+                    item["league"],
+                    item["home_team"],
+                    item["away_team"],
+                    item["kickoff_time"],
+                    item["finalized_at"],
+                    item["result_captured_at"],
+                    item["full_time_score"],
+                    bwin[0],  # type: ignore[index]
+                    bwin[1],  # type: ignore[index]
+                    bwin[2],  # type: ignore[index]
+                    unibet[0],  # type: ignore[index]
+                    unibet[1],  # type: ignore[index]
+                    unibet[2],  # type: ignore[index]
+                    utc_now(),
+                ],
+            )
+            archived += 1
+        return {"archived": archived}
+
+    @_locked
+    def list_played_match_archive(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            "SELECT * FROM played_match_archive ORDER BY result_captured_at DESC LIMIT 500"
+        ).fetchall()
+        columns = [col[0] for col in self.connection.description]
+        return [self._serialize(dict(zip(columns, row))) for row in rows]
 
     @_locked
     def status(self, now: datetime | None = None) -> dict[str, object]:

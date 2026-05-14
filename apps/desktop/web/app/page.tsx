@@ -233,6 +233,63 @@ type CaptureRunResult = {
   results_checked: number;
 };
 
+type HistoricalImportStatus = {
+  records: number;
+  files: number;
+  warnings: number;
+  datasets: string[];
+  last_import: string | null;
+  root: string;
+  root_exists: boolean;
+};
+
+type HistoricalSignal = {
+  id: string;
+  match_id: string;
+  event_id: string;
+  league: string | null;
+  home_team: string;
+  away_team: string;
+  kickoff_time: string | null;
+  capture_phase: string | null;
+  bookmaker: string;
+  normalized_bookmaker: string;
+  dataset: string;
+  signal_type: string;
+  current_home_odds: number;
+  current_draw_odds: number;
+  current_away_odds: number;
+  sample_size: number;
+  home_win_pct: number;
+  draw_pct: number;
+  away_win_pct: number;
+  over_0_5_pct: number;
+  over_1_5_pct: number;
+  over_2_5_pct: number;
+  btts_pct: number;
+  double_chance_1x_pct: number;
+  double_chance_x2_pct: number;
+  double_chance_12_pct: number;
+  historical_scores: string[];
+  source_files: string[];
+};
+
+type SignalRecomputeResult = {
+  matches_evaluated: number;
+  signals: number;
+  archived: number;
+};
+
+type HistoricalImportResult = {
+  files_seen: number;
+  files_imported: number;
+  records_imported: number;
+  warnings: number;
+  recompute_matches_evaluated: number;
+  recompute_signals: number;
+  archived: number;
+};
+
 type MatchFilter =
   | "all"
   | "with_odds"
@@ -282,10 +339,17 @@ export default function Dashboard() {
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [bookmakers, setBookmakers] = useState<BookmakerCoverage[]>([]);
   const [exports, setExports] = useState<ExportFile[]>([]);
+  const [signals, setSignals] = useState<HistoricalSignal[]>([]);
+  const [historicalImportStatus, setHistoricalImportStatus] =
+    useState<HistoricalImportStatus | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
   const [matchQuery, setMatchQuery] = useState("");
   const [bookmakerQuery, setBookmakerQuery] = useState("");
+  const [signalDatasetFilter, setSignalDatasetFilter] = useState("all");
+  const [signalBookmakerFilter, setSignalBookmakerFilter] = useState("all");
+  const [signalTypeFilter, setSignalTypeFilter] = useState("all");
+  const [minSignalSample, setMinSignalSample] = useState(1);
   const [matchFilter, setMatchFilter] = useState<MatchFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("capture_desc");
   const [marketFilter, setMarketFilter] = useState("all_markets");
@@ -313,6 +377,8 @@ export default function Dashboard() {
     nextLogs: LogRow[],
     nextBookmakers: BookmakerCoverage[],
     nextExports: ExportFile[],
+    nextSignals: HistoricalSignal[],
+    nextHistoricalImportStatus: HistoricalImportStatus,
   ) => {
     startTransition(() => {
       setStatus(nextStatus);
@@ -322,6 +388,8 @@ export default function Dashboard() {
       setLogs(nextLogs);
       setBookmakers(nextBookmakers);
       setExports(nextExports);
+      setSignals(nextSignals);
+      setHistoricalImportStatus(nextHistoricalImportStatus);
       const currentSelectedId = selectedIdRef.current;
       if (
         (!currentSelectedId ||
@@ -349,6 +417,8 @@ export default function Dashboard() {
         nextLogs,
         nextBookmakers,
         nextExports,
+        nextSignals,
+        nextHistoricalImportStatus,
       ] = await Promise.all([
         api<Status>("/api/status"),
         api<MatchRow[]>("/api/matches"),
@@ -357,6 +427,8 @@ export default function Dashboard() {
         api<LogRow[]>("/api/logs"),
         api<BookmakerCoverage[]>("/api/bookmakers"),
         api<ExportFile[]>("/api/exports"),
+        api<HistoricalSignal[]>("/api/signals"),
+        api<HistoricalImportStatus>("/api/historical/import-status"),
       ]);
       applyDashboardData(
         nextStatus,
@@ -366,6 +438,8 @@ export default function Dashboard() {
         nextLogs,
         nextBookmakers,
         nextExports,
+        nextSignals,
+        nextHistoricalImportStatus,
       );
     } catch (nextError) {
       setError(
@@ -576,6 +650,25 @@ export default function Dashboard() {
     () => marketCountsFor(detail?.bookmaker_odds ?? []),
     [detail],
   );
+  const filteredSignals = useMemo(() => {
+    return signals.filter((signal) => {
+      const datasetOk =
+        signalDatasetFilter === "all" || signal.dataset === signalDatasetFilter;
+      const bookmakerOk =
+        signalBookmakerFilter === "all" ||
+        signal.normalized_bookmaker === signalBookmakerFilter;
+      const typeOk =
+        signalTypeFilter === "all" || signal.signal_type === signalTypeFilter;
+      const sampleOk = signal.sample_size >= minSignalSample;
+      return datasetOk && bookmakerOk && typeOk && sampleOk;
+    });
+  }, [
+    minSignalSample,
+    signalBookmakerFilter,
+    signalDatasetFilter,
+    signals,
+    signalTypeFilter,
+  ]);
 
   const selectedMatch =
     detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
@@ -630,6 +723,53 @@ export default function Dashboard() {
     });
   };
 
+  const recomputeSignals = () => {
+    startTransition(async () => {
+      setError(null);
+      try {
+        await api<SignalRecomputeResult>("/api/signals/recompute", {
+          method: "POST",
+          body: JSON.stringify({ archive_played: true }),
+        });
+        const [nextSignals, nextHistoricalImportStatus] = await Promise.all([
+          api<HistoricalSignal[]>("/api/signals"),
+          api<HistoricalImportStatus>("/api/historical/import-status"),
+        ]);
+        setSignals(nextSignals);
+        setHistoricalImportStatus(nextHistoricalImportStatus);
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Signal recompute failed",
+        );
+      }
+    });
+  };
+
+  const importHistoricalDatabase = () => {
+    startTransition(async () => {
+      setError(null);
+      try {
+        await api<HistoricalImportResult>("/api/historical/import", {
+          method: "POST",
+        });
+        const [nextSignals, nextHistoricalImportStatus] = await Promise.all([
+          api<HistoricalSignal[]>("/api/signals"),
+          api<HistoricalImportStatus>("/api/historical/import-status"),
+        ]);
+        setSignals(nextSignals);
+        setHistoricalImportStatus(nextHistoricalImportStatus);
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Historical import failed",
+        );
+      }
+    });
+  };
+
   return (
     <main className={isPending ? "shell is-pending" : "shell"}>
       <aside className="sidebar">
@@ -657,6 +797,9 @@ export default function Dashboard() {
           </a>
           <a href="#odds" title={tooltipFor("Odds nav")}>
             Odds
+          </a>
+          <a href="#signals" title="Jump to historical matching signals.">
+            Signals
           </a>
           <a href="#attempts" title={tooltipFor("Attempts nav")}>
             Attempts
@@ -1133,6 +1276,149 @@ export default function Dashboard() {
               <p className="empty">No match selected.</p>
             )}
           </div>
+        </section>
+
+        <section className="panel signals-panel" id="signals">
+          <div className="panel-head">
+            <div>
+              <h3>Historical signals</h3>
+              <p>
+                {filteredSignals.length} visible of {signals.length} ·{" "}
+                {historicalImportStatus
+                  ? `${historicalImportStatus.records} historical records from ${historicalImportStatus.files} DOCX files`
+                  : "Historical database status loading"}
+              </p>
+            </div>
+            <div className="toolbar">
+              <button
+                type="button"
+                onClick={importHistoricalDatabase}
+                disabled={isPending}
+                title="Import changed DOCX files from the configured historical database root, then recompute signals."
+              >
+                <Download size={16} />
+                Import DOCX
+              </button>
+              <button
+                type="button"
+                onClick={recomputeSignals}
+                disabled={isPending}
+                title="Recompute signals from imported historical records and archive played matches."
+              >
+                <RefreshCcw className="refresh-icon" size={16} />
+                Recompute
+              </button>
+              <label className="select-filter" title="Filter by historical dataset">
+                <Filter size={14} />
+                <select
+                  value={signalDatasetFilter}
+                  onChange={(event) => setSignalDatasetFilter(event.target.value)}
+                >
+                  <option value="all">All datasets</option>
+                  <option value="Odds">Odds</option>
+                  <option value="Usable Odds">Usable Odds</option>
+                </select>
+              </label>
+              <label className="select-filter" title="Filter by required bookmaker">
+                <Filter size={14} />
+                <select
+                  value={signalBookmakerFilter}
+                  onChange={(event) => setSignalBookmakerFilter(event.target.value)}
+                >
+                  <option value="all">All bookmakers</option>
+                  <option value="bwin">Bwin</option>
+                  <option value="unibet">Unibet</option>
+                </select>
+              </label>
+              <label className="select-filter" title="Filter by signal type">
+                <Filter size={14} />
+                <select
+                  value={signalTypeFilter}
+                  onChange={(event) => setSignalTypeFilter(event.target.value)}
+                >
+                  <option value="all">All signals</option>
+                  <option value="exact_odds">Exact odds</option>
+                  <option value="neighbor_odds">Neighbor odds</option>
+                  <option value="one_draw">One draw</option>
+                </select>
+              </label>
+              <label className="sample-filter" title="Minimum historical sample size">
+                Min sample
+                <input
+                  type="number"
+                  min={1}
+                  value={minSignalSample}
+                  onChange={(event) =>
+                    setMinSignalSample(Math.max(1, Number(event.target.value) || 1))
+                  }
+                />
+              </label>
+            </div>
+          </div>
+          <div className="signal-status">
+            <span>
+              Import root{" "}
+              <strong>
+                {historicalImportStatus?.root_exists ? "available" : "missing"}
+              </strong>
+            </span>
+            <span>
+              Warnings <strong>{historicalImportStatus?.warnings ?? 0}</strong>
+            </span>
+            <span>
+              Last import{" "}
+              <strong>{formatUtc(historicalImportStatus?.last_import)}</strong>
+            </span>
+          </div>
+          {filteredSignals.length > 0 ? (
+            <div className="signal-grid">
+              {filteredSignals.slice(0, 24).map((signal) => (
+                <article className="signal-card" key={signal.id}>
+                  <div className="signal-card-head">
+                    <div>
+                      <span className="signal-type">
+                        {signalTypeLabel(signal.signal_type)}
+                      </span>
+                      <strong>
+                        {signal.home_team} - {signal.away_team}
+                      </strong>
+                      <small>
+                        {signal.dataset} · {signal.bookmaker} ·{" "}
+                        {formatSchedule(signal.kickoff_time)}
+                      </small>
+                    </div>
+                    <span className="signal-sample">{signal.sample_size}</span>
+                  </div>
+                  <div className="signal-odds">
+                    <span>
+                      Bwin/Unibet line <strong>{signalOdds(signal)}</strong>
+                    </span>
+                  </div>
+                  <div className="signal-stats">
+                    <Info label="Home Win %" value={formatPct(signal.home_win_pct)} />
+                    <Info label="Draw %" value={formatPct(signal.draw_pct)} />
+                    <Info label="Away Win %" value={formatPct(signal.away_win_pct)} />
+                    <Info label="Over 2.5" value={formatPct(signal.over_2_5_pct)} />
+                    <Info label="BTTS" value={formatPct(signal.btts_pct)} />
+                    <Info
+                      label="Double Chance"
+                      value={`1X ${formatPct(signal.double_chance_1x_pct)} · X2 ${formatPct(signal.double_chance_x2_pct)} · 12 ${formatPct(signal.double_chance_12_pct)}`}
+                    />
+                  </div>
+                  <div className="score-strip">
+                    {signal.historical_scores.slice(0, 8).map((score, index) => (
+                      <span key={`${signal.id}-${score}-${index}`}>{score}</span>
+                    ))}
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="empty">
+              No historical signals match the current filters. Import the DOCX
+              database or recompute after final Bwin/Unibet odds are captured.
+            </p>
+          )}
         </section>
 
         <section className="panel" id="odds">
@@ -2098,6 +2384,23 @@ function relativeTime(ms: number) {
       : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
   if (overdue) return `overdue ${value}`;
   return value;
+}
+
+function signalTypeLabel(value: string) {
+  const labels: Record<string, string> = {
+    exact_odds: "Exact odds",
+    neighbor_odds: "Neighbor odds",
+    one_draw: "One draw",
+  };
+  return labels[value] ?? value;
+}
+
+function signalOdds(signal: HistoricalSignal) {
+  return `${formatOdd(signal.current_home_odds)} / ${formatOdd(signal.current_draw_odds)} / ${formatOdd(signal.current_away_odds)}`;
+}
+
+function formatPct(value: number | null | undefined) {
+  return value == null ? "-" : `${value.toFixed(1)}%`;
 }
 
 function formatBytes(value: number) {

@@ -459,3 +459,18 @@ def test_database_read_methods_are_safe_for_fastapi_threadpool_concurrency() -> 
 
     assert len(results) == 300
     assert all(result is not None for result in results)
+
+
+def test_database_exposes_historical_import_status_before_import() -> None:
+    db_path = Path("data/test_tmp/test_historical_status.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+
+    status = db.historical_import_status()
+
+    assert status["records"] == 0
+    assert status["files"] == 0
+    assert status["warnings"] == 0
+    assert status["datasets"] == []

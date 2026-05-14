@@ -9,6 +9,8 @@ data/test_tmp/
 data/exports/
 data/raw_snapshots/
 data/logs/
+SAMPLE_DATABASE/
+SAMPLE_DATABASE.zip
 node_modules/
 .next/
 dist/

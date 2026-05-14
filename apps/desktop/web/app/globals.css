@@ -1071,6 +1071,132 @@ code {
   vertical-align: bottom;
 }
 
+.signals-panel {
+  margin-bottom: 16px;
+}
+
+.sample-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.sample-filter input {
+  width: 54px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.signal-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.signal-status span,
+.signal-odds {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfd;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.signal-status strong,
+.signal-odds strong {
+  color: var(--text);
+}
+
+.signal-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.signal-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.signal-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.signal-card-head strong,
+.signal-card-head small {
+  display: block;
+}
+
+.signal-card-head strong {
+  margin-top: 5px;
+  font-size: 15px;
+}
+
+.signal-type {
+  display: inline-flex;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: #eaf6f9;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.signal-sample {
+  display: grid;
+  min-width: 38px;
+  height: 32px;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 800;
+}
+
+.signal-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.signal-stats .info-cell {
+  box-shadow: none;
+}
+
+.score-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.score-strip span {
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #edf3f5;
+  color: #31424d;
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .empty {
   padding: 16px 4px;
   color: var(--muted);
@@ -1176,7 +1302,8 @@ code {
   .coverage-strip,
   .info-grid,
   .kv-grid,
-  .required-cards {
+  .required-cards,
+  .signal-stats {
     grid-template-columns: repeat(2, 1fr);
   }
 
