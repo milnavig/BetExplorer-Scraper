@@ -18,6 +18,7 @@ const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
 const MATCH_RENDER_BATCH = 80;
+const MATCH_PAGE_SIZE = 120;
 const ODDS_RENDER_BATCH = 120;
 const DASHBOARD_STATUS_REFRESH_MS = 5000;
 const DASHBOARD_FULL_REFRESH_MS = 30000;
@@ -259,6 +260,15 @@ type HistoricalSignal = {
   current_home_odds: number;
   current_draw_odds: number;
   current_away_odds: number;
+  matched_odds_home: number | null;
+  matched_odds_draw: number | null;
+  matched_odds_away: number | null;
+  odds_distance_home: number | null;
+  odds_distance_draw: number | null;
+  odds_distance_away: number | null;
+  similarity_score: number;
+  match_explanation: string;
+  signal_rank: number;
   sample_size: number;
   home_win_pct: number;
   draw_pct: number;
@@ -272,6 +282,28 @@ type HistoricalSignal = {
   double_chance_12_pct: number;
   historical_scores: string[];
   source_files: string[];
+};
+
+type HistoricalSignalGroup = {
+  id: string;
+  match_id: string;
+  event_id: string;
+  league: string | null;
+  home_team: string;
+  away_team: string;
+  kickoff_time: string | null;
+  datasets: string[];
+  signal_types: string[];
+  signals: HistoricalSignal[];
+  bestSignal: HistoricalSignal;
+  historical_scores: string[];
+};
+
+type MatchPageResult = {
+  items: MatchRow[];
+  total: number;
+  offset: number;
+  limit: number;
 };
 
 type SignalRecomputeResult = {
@@ -334,6 +366,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 export default function Dashboard() {
   const [status, setStatus] = useState<Status | null>(null);
   const [matches, setMatches] = useState<MatchRow[]>([]);
+  const [matchesTotal, setMatchesTotal] = useState(0);
   const [snapshots, setSnapshots] = useState<SnapshotRow[]>([]);
   const [attempts, setAttempts] = useState<AttemptRow[]>([]);
   const [logs, setLogs] = useState<LogRow[]>([]);
@@ -350,16 +383,20 @@ export default function Dashboard() {
   const [signalBookmakerFilter, setSignalBookmakerFilter] = useState("all");
   const [signalTypeFilter, setSignalTypeFilter] = useState("all");
   const [minSignalSample, setMinSignalSample] = useState(1);
+  const [minSignalSimilarity, setMinSignalSimilarity] = useState(70);
+  const [actionableSignalsOnly, setActionableSignalsOnly] = useState(true);
   const [matchFilter, setMatchFilter] = useState<MatchFilter>("all");
   const [sortMode, setSortMode] = useState<SortMode>("capture_desc");
   const [marketFilter, setMarketFilter] = useState("all_markets");
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [lastRun, setLastRun] = useState<CaptureRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isLoadingMatches, setIsLoadingMatches] = useState(false);
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const selectedIdRef = useRef<string | null>(null);
+  const didLoadInitialMatchesRef = useRef(false);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
   const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
   const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
@@ -369,9 +406,20 @@ export default function Dashboard() {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
 
+  const matchesPagePath = (offset: number) => {
+    const params = new URLSearchParams({
+      q: matchQuery,
+      filter: matchFilter,
+      sort: sortMode,
+      offset: String(offset),
+      limit: String(MATCH_PAGE_SIZE),
+    });
+    return `/api/matches-page?${params.toString()}`;
+  };
+
   const applyDashboardData = (
     nextStatus: Status,
-    nextMatches: MatchRow[],
+    nextMatchesPage: MatchPageResult,
     nextSnapshots: SnapshotRow[],
     nextAttempts: AttemptRow[],
     nextLogs: LogRow[],
@@ -382,7 +430,9 @@ export default function Dashboard() {
   ) => {
     startTransition(() => {
       setStatus(nextStatus);
-      setMatches(nextMatches);
+      setMatches(nextMatchesPage.items);
+      setMatchesTotal(nextMatchesPage.total);
+      didLoadInitialMatchesRef.current = true;
       setSnapshots(nextSnapshots);
       setAttempts(nextAttempts);
       setLogs(nextLogs);
@@ -393,12 +443,12 @@ export default function Dashboard() {
       const currentSelectedId = selectedIdRef.current;
       if (
         (!currentSelectedId ||
-          !nextMatches.some((match) => match.id === currentSelectedId)) &&
-        nextMatches.length > 0
+          !nextMatchesPage.items.some((match) => match.id === currentSelectedId)) &&
+        nextMatchesPage.items.length > 0
       ) {
         const nextSelectedId = (
-          nextMatches.find((match) => match.bookmaker_count > 0) ??
-          nextMatches[0]
+          nextMatchesPage.items.find((match) => match.bookmaker_count > 0) ??
+          nextMatchesPage.items[0]
         ).id;
         selectedIdRef.current = nextSelectedId;
         setSelectedId(nextSelectedId);
@@ -411,7 +461,7 @@ export default function Dashboard() {
     try {
       const [
         nextStatus,
-        nextMatches,
+        nextMatchesPage,
         nextSnapshots,
         nextAttempts,
         nextLogs,
@@ -421,7 +471,7 @@ export default function Dashboard() {
         nextHistoricalImportStatus,
       ] = await Promise.all([
         api<Status>("/api/status"),
-        api<MatchRow[]>("/api/matches"),
+        api<MatchPageResult>(matchesPagePath(0)),
         api<SnapshotRow[]>("/api/snapshots"),
         api<AttemptRow[]>("/api/attempts"),
         api<LogRow[]>("/api/logs"),
@@ -432,7 +482,7 @@ export default function Dashboard() {
       ]);
       applyDashboardData(
         nextStatus,
-        nextMatches,
+        nextMatchesPage,
         nextSnapshots,
         nextAttempts,
         nextLogs,
@@ -447,6 +497,40 @@ export default function Dashboard() {
           ? nextError.message
           : "Failed to load API data",
       );
+    }
+  };
+
+  const loadMatchesPage = async (
+    offset = 0,
+    mode: "replace" | "append" = "replace",
+  ) => {
+    setIsLoadingMatches(true);
+    try {
+      const nextPage = await api<MatchPageResult>(matchesPagePath(offset));
+      startTransition(() => {
+        setMatches((current) =>
+          mode === "append" ? [...current, ...nextPage.items] : nextPage.items,
+        );
+        setMatchesTotal(nextPage.total);
+        if (mode === "replace") {
+          setMatchRenderLimit(MATCH_RENDER_BATCH);
+          const nextSelected =
+            nextPage.items.find((match) => match.bookmaker_count > 0) ??
+            nextPage.items[0];
+          if (nextSelected) {
+            selectedIdRef.current = nextSelected.id;
+            setSelectedId(nextSelected.id);
+          }
+        }
+      });
+    } catch (nextError) {
+      setError(
+        nextError instanceof Error
+          ? nextError.message
+          : "Failed to load matches page",
+      );
+    } finally {
+      setIsLoadingMatches(false);
     }
   };
 
@@ -504,66 +588,14 @@ export default function Dashboard() {
     };
   }, [selectedId]);
 
+  useEffect(() => {
+    if (!didLoadInitialMatchesRef.current) return;
+    void loadMatchesPage(0, "replace");
+  }, [matchFilter, matchQuery, sortMode]);
+
   const timezoneOffset = status?.betexplorer_timezone_offset ?? "+0";
 
-  const filteredMatches = useMemo(() => {
-    const query = matchQuery.trim().toLowerCase();
-    const visible = matches.filter((match) => {
-      const stateOk =
-        matchFilter === "all" ||
-        (matchFilter === "with_odds" && match.bookmaker_count > 0) ||
-        (matchFilter === "req_full" && match.quality_status === "COMPLETE") ||
-        (matchFilter === "req_partial" && match.quality_status === "PARTIAL") ||
-        (matchFilter === "req_missing" && match.quality_status === "FAILED") ||
-        (matchFilter === "missing_bwin" &&
-          match.bookmaker_count > 0 &&
-          !match.has_bwin) ||
-        (matchFilter === "missing_unibet" &&
-          match.bookmaker_count > 0 &&
-          !match.has_unibet) ||
-        (matchFilter === "capture_miss" &&
-          Boolean(match.finalized_at) &&
-          match.bookmaker_count === 0 &&
-          match.attempt_count > 0) ||
-        (matchFilter === "skipped_old" &&
-          Boolean(match.finalized_at) &&
-          match.bookmaker_count === 0 &&
-          match.attempt_count === 0) ||
-        (matchFilter === "due" && Boolean(match.next_capture_at)) ||
-        (matchFilter === "finalized" && Boolean(match.finalized_at)) ||
-        (matchFilter === "new" && !match.quality_status);
-      const queryOk =
-        !query ||
-        [
-          match.league,
-          match.home_team,
-          match.away_team,
-          match.event_id,
-          qualityLabel(match.quality_status),
-          displayTiming(match),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-          .includes(query);
-      return stateOk && queryOk;
-    });
-    return visible.sort((left, right) => {
-      if (sortMode === "kickoff_asc")
-        return (
-          timestamp(left.kickoff_time, timezoneOffset) -
-          timestamp(right.kickoff_time, timezoneOffset)
-        );
-      if (sortMode === "bookmakers_desc")
-        return right.bookmaker_count - left.bookmaker_count;
-      if (sortMode === "attempts_desc")
-        return right.attempt_count - left.attempt_count;
-      return (
-        timestamp(right.captured_at, timezoneOffset) -
-        timestamp(left.captured_at, timezoneOffset)
-      );
-    });
-  }, [matches, matchFilter, matchQuery, sortMode, timezoneOffset]);
+  const filteredMatches = useMemo(() => matches, [matches]);
 
   const filteredBookmakers = useMemo(() => {
     const rows = detail?.bookmaker_odds ?? [];
@@ -627,11 +659,20 @@ export default function Dashboard() {
     () => filteredMatches.slice(0, matchRenderLimit),
     [filteredMatches, matchRenderLimit],
   );
-  const hasMoreMatches = renderedMatches.length < filteredMatches.length;
-  const loadMoreMatches = () =>
-    setMatchRenderLimit((value) =>
-      Math.min(value + MATCH_RENDER_BATCH, filteredMatches.length),
-    );
+  const hasMoreLoadedMatches = renderedMatches.length < filteredMatches.length;
+  const hasMoreServerMatches = matches.length < matchesTotal;
+  const hasMoreMatches = hasMoreLoadedMatches || hasMoreServerMatches;
+  const loadMoreMatches = () => {
+    if (hasMoreLoadedMatches) {
+      setMatchRenderLimit((value) =>
+        Math.min(value + MATCH_RENDER_BATCH, filteredMatches.length),
+      );
+      return;
+    }
+    if (hasMoreServerMatches && !isLoadingMatches) {
+      void loadMatchesPage(matches.length, "append");
+    }
+  };
 
   useEffect(() => {
     const node = matchListMoreRef.current;
@@ -644,13 +685,18 @@ export default function Dashboard() {
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [filteredMatches.length, hasMoreMatches]);
+  }, [filteredMatches.length, hasMoreMatches, isLoadingMatches, matches.length]);
 
   const marketCounts = useMemo(
     () => marketCountsFor(detail?.bookmaker_odds ?? []),
     [detail],
   );
   const filteredSignals = useMemo(() => {
+    const matchesWithPrimarySignals = new Set(
+      signals
+        .filter((signal) => signal.signal_type === "exact_odds" || signal.signal_type === "neighbor_odds")
+        .map((signal) => signal.match_id),
+    );
     return signals.filter((signal) => {
       const datasetOk =
         signalDatasetFilter === "all" || signal.dataset === signalDatasetFilter;
@@ -660,15 +706,26 @@ export default function Dashboard() {
       const typeOk =
         signalTypeFilter === "all" || signal.signal_type === signalTypeFilter;
       const sampleOk = signal.sample_size >= minSignalSample;
-      return datasetOk && bookmakerOk && typeOk && sampleOk;
+      const similarityOk = signal.similarity_score >= minSignalSimilarity;
+      const actionableOk =
+        !actionableSignalsOnly ||
+        signal.signal_type !== "one_draw" ||
+        matchesWithPrimarySignals.has(signal.match_id);
+      return datasetOk && bookmakerOk && typeOk && sampleOk && similarityOk && actionableOk;
     });
   }, [
+    actionableSignalsOnly,
+    minSignalSimilarity,
     minSignalSample,
     signalBookmakerFilter,
     signalDatasetFilter,
     signals,
     signalTypeFilter,
   ]);
+  const groupedSignals = useMemo(
+    () => groupHistoricalSignals(filteredSignals),
+    [filteredSignals],
+  );
 
   const selectedMatch =
     detail?.match ?? matches.find((match) => match.id === selectedId) ?? null;
@@ -718,6 +775,24 @@ export default function Dashboard() {
       } catch (nextError) {
         setError(
           nextError instanceof Error ? nextError.message : "Export failed",
+        );
+      }
+    });
+  };
+
+  const exportPlayedArchive = (format: ExportFormat) => {
+    startTransition(async () => {
+      setError(null);
+      try {
+        const result = await api<ExportResult>("/api/exports/played-archive", {
+          method: "POST",
+          body: JSON.stringify({ format }),
+        });
+        window.location.assign(`${API_BASE}${result.download_url}`);
+        await loadDashboardData();
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error ? nextError.message : "Archive export failed",
         );
       }
     });
@@ -916,6 +991,14 @@ export default function Dashboard() {
               <Download size={16} />
               Long XLSX
             </button>
+            <button
+              onClick={() => exportPlayedArchive("csv")}
+              disabled={isPending}
+              title={tooltipFor("Export archive CSV")}
+            >
+              <Download size={16} />
+              Archive CSV
+            </button>
           </div>
         </header>
 
@@ -1003,7 +1086,8 @@ export default function Dashboard() {
               <div>
                 <h3>Matches</h3>
                 <p>
-                  {filteredMatches.length} visible of {matches.length}
+                  {renderedMatches.length} rendered · {matches.length} loaded of{" "}
+                  {matchesTotal}
                 </p>
               </div>
               <label className="search" title={tooltipFor("Match search")}>
@@ -1086,15 +1170,16 @@ export default function Dashboard() {
               {filteredMatches.length > 0 ? (
                 <div className="list-footer" ref={matchListMoreRef}>
                   <span>
-                    Showing {renderedMatches.length} of {filteredMatches.length}
+                    Showing {renderedMatches.length} rendered, {matches.length} loaded of {matchesTotal}
                   </span>
                   {hasMoreMatches ? (
                     <button
                       type="button"
                       onClick={loadMoreMatches}
                       title={tooltipFor("Load more matches")}
+                      disabled={isLoadingMatches}
                     >
-                      Load more matches
+                      {isLoadingMatches ? "Loading matches" : "Load more matches"}
                     </button>
                   ) : null}
                 </div>
@@ -1283,7 +1368,7 @@ export default function Dashboard() {
             <div>
               <h3>Historical signals</h3>
               <p>
-                {filteredSignals.length} visible of {signals.length} ·{" "}
+                {groupedSignals.length} match cards from {filteredSignals.length} signals ·{" "}
                 {historicalImportStatus
                   ? `${historicalImportStatus.records} historical records from ${historicalImportStatus.files} DOCX files`
                   : "Historical database status loading"}
@@ -1294,10 +1379,10 @@ export default function Dashboard() {
                 type="button"
                 onClick={importHistoricalDatabase}
                 disabled={isPending}
-                title="Import changed DOCX files from the configured historical database root, then recompute signals."
+                title="Manually rescan changed DOCX files from the configured historical database root, then recompute signals."
               >
                 <Download size={16} />
-                Import DOCX
+                Rescan DOCX
               </button>
               <button
                 type="button"
@@ -1353,6 +1438,26 @@ export default function Dashboard() {
                   }
                 />
               </label>
+              <label className="sample-filter" title="Minimum historical odds similarity">
+                Min similarity
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  value={minSignalSimilarity}
+                  onChange={(event) =>
+                    setMinSignalSimilarity(Math.min(100, Math.max(0, Number(event.target.value) || 0)))
+                  }
+                />
+              </label>
+              <label className="toggle" title="Show exact/neighbor matches first and hide one-draw-only noise">
+                <input
+                  type="checkbox"
+                  checked={actionableSignalsOnly}
+                  onChange={(event) => setActionableSignalsOnly(event.target.checked)}
+                />
+                Actionable only
+              </label>
             </div>
           </div>
           <div className="signal-status">
@@ -1370,53 +1475,69 @@ export default function Dashboard() {
               <strong>{formatUtc(historicalImportStatus?.last_import)}</strong>
             </span>
           </div>
-          {filteredSignals.length > 0 ? (
-            <div className="signal-grid">
-              {filteredSignals.slice(0, 24).map((signal) => (
-                <article className="signal-card" key={signal.id}>
+          {groupedSignals.length > 0 ? (
+            <div className="signal-grid" aria-label="compact actionable feed">
+              {groupedSignals.slice(0, 24).map((group) => (
+                <article className="signal-card signal-feed-card" key={group.id}>
                   <div className="signal-card-head">
                     <div>
                       <span className="signal-type">
-                        {signalTypeLabel(signal.signal_type)}
+                        {group.signal_types.map(signalTypeLabel).join(" + ")}
+                      </span>
+                      <span
+                        className={similarityBadgeClass(group.bestSignal)}
+                        title={`${group.bestSignal.similarity_score} similarity score`}
+                      >
+                        {signalSimilarityBadge(group.bestSignal)}
                       </span>
                       <strong>
-                        {signal.home_team} - {signal.away_team}
+                        {group.home_team} - {group.away_team}
                       </strong>
                       <small>
-                        {signal.dataset} · {signal.bookmaker} ·{" "}
-                        {formatSchedule(signal.kickoff_time)}
+                        {group.datasets.join(" + ")} ·{" "}
+                        {formatSchedule(group.kickoff_time)}
                       </small>
+                      <small>{signalPrimaryReason(group.bestSignal)}</small>
+                      <small>Signal strength {signalStrengthLabel(group.bestSignal)}</small>
                     </div>
-                    <span className="signal-sample">{signal.sample_size}</span>
+                    <span className="signal-sample">{group.bestSignal.sample_size}</span>
                   </div>
-                  <div className="signal-odds">
+                  <div className="signal-odds signal-bookmakers">
                     <span>
-                      Bwin/Unibet line <strong>{signalOdds(signal)}</strong>
+                      Bwin <strong>{signalGroupBookmakerOdds(group, "bwin")}</strong>
+                    </span>
+                    <span>
+                      Unibet <strong>{signalGroupBookmakerOdds(group, "unibet")}</strong>
                     </span>
                   </div>
                   <div className="signal-stats">
-                    <Info label="Home Win %" value={formatPct(signal.home_win_pct)} />
-                    <Info label="Draw %" value={formatPct(signal.draw_pct)} />
-                    <Info label="Away Win %" value={formatPct(signal.away_win_pct)} />
-                    <Info label="Over 2.5" value={formatPct(signal.over_2_5_pct)} />
-                    <Info label="BTTS" value={formatPct(signal.btts_pct)} />
+                    <Info label="Home Win %" value={formatPct(group.bestSignal.home_win_pct)} />
+                    <Info label="Draw %" value={formatPct(group.bestSignal.draw_pct)} />
+                    <Info label="Away Win %" value={formatPct(group.bestSignal.away_win_pct)} />
+                    <Info label="Over 2.5" value={formatPct(group.bestSignal.over_2_5_pct)} />
+                    <Info label="BTTS" value={formatPct(group.bestSignal.btts_pct)} />
                     <Info
                       label="Double Chance"
-                      value={`1X ${formatPct(signal.double_chance_1x_pct)} · X2 ${formatPct(signal.double_chance_x2_pct)} · 12 ${formatPct(signal.double_chance_12_pct)}`}
+                      value={`1X ${formatPct(group.bestSignal.double_chance_1x_pct)} · X2 ${formatPct(group.bestSignal.double_chance_x2_pct)} · 12 ${formatPct(group.bestSignal.double_chance_12_pct)}`}
                     />
                   </div>
                   <div className="score-strip">
-                    {signal.historical_scores.slice(0, 8).map((score, index) => (
-                      <span key={`${signal.id}-${score}-${index}`}>{score}</span>
+                    <small>Top historical outcomes</small>
+                    {group.historical_scores.slice(0, 8).map((score, index) => (
+                      <span key={`${group.id}-${score}-${index}`}>{score}</span>
                     ))}
                   </div>
+                  <a className="explain-link" href={`/match?id=${encodeURIComponent(group.match_id)}`}>
+                    Explain signal
+                  </a>
                 </article>
               ))}
             </div>
           ) : (
             <p className="empty">
-              No historical signals match the current filters. Import the DOCX
-              database or recompute after final Bwin/Unibet odds are captured.
+              {historicalImportStatus?.records === 0
+                ? "Historical DOCX index is empty."
+                : "No historical match for current Bwin/Unibet odds."}
             </p>
           )}
         </section>
@@ -2015,6 +2136,8 @@ function tooltipFor(label: string) {
       "Generate the wide Excel export with the same columns as the wide CSV.",
     "Export long XLSX":
       "Generate the long Excel export with the same rows as Long CSV.",
+    "Export archive CSV":
+      "Generate a CSV from the local played-match archive with finalized Bwin/Unibet odds and final scores. This does not modify the original DOCX database.",
     Matches:
       "Total rows in the matches table. This includes discovered, scheduled, finalized, finished, and matches without odds.",
     Captured:
@@ -2395,8 +2518,85 @@ function signalTypeLabel(value: string) {
   return labels[value] ?? value;
 }
 
-function signalOdds(signal: HistoricalSignal) {
+function groupHistoricalSignals(
+  signals: HistoricalSignal[],
+): HistoricalSignalGroup[] {
+  const groups = new Map<string, HistoricalSignal[]>();
+  for (const signal of signals) {
+    const group = groups.get(signal.match_id) ?? [];
+    group.push(signal);
+    groups.set(signal.match_id, group);
+  }
+  return [...groups.entries()]
+    .map(([matchId, groupSignals]) => {
+      const bestSignal = groupSignals.reduce((best, signal) =>
+        compareSignals(signal, best) < 0 ? signal : best,
+      );
+      return {
+        id: matchId,
+        match_id: matchId,
+        event_id: bestSignal.event_id,
+        league: bestSignal.league,
+        home_team: bestSignal.home_team,
+        away_team: bestSignal.away_team,
+        kickoff_time: bestSignal.kickoff_time,
+        datasets: uniqueSorted(groupSignals.map((signal) => signal.dataset)),
+        signal_types: uniqueSorted(
+          groupSignals.map((signal) => signal.signal_type),
+        ),
+        signals: groupSignals,
+        bestSignal,
+        historical_scores: uniqueSorted(
+          groupSignals.flatMap((signal) => signal.historical_scores),
+        ),
+      };
+    })
+    .sort((left, right) => compareSignals(left.bestSignal, right.bestSignal));
+}
+
+function signalGroupBookmakerOdds(
+  group: HistoricalSignalGroup,
+  normalizedBookmaker: string,
+) {
+  const signal = group.signals.find(
+    (item) => item.normalized_bookmaker === normalizedBookmaker,
+  );
+  if (!signal) return "-";
   return `${formatOdd(signal.current_home_odds)} / ${formatOdd(signal.current_draw_odds)} / ${formatOdd(signal.current_away_odds)}`;
+}
+
+function uniqueSorted(values: string[]) {
+  return [...new Set(values.filter(Boolean))].sort();
+}
+
+function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
+  const rank = (left.signal_rank ?? 99) - (right.signal_rank ?? 99);
+  if (rank !== 0) return rank;
+  const similarity = (right.similarity_score ?? 0) - (left.similarity_score ?? 0);
+  if (similarity !== 0) return similarity;
+  return right.sample_size - left.sample_size;
+}
+
+function signalSimilarityBadge(signal: HistoricalSignal) {
+  return `Similarity ${formatPct(signal.similarity_score)}`;
+}
+
+function similarityBadgeClass(signal: HistoricalSignal) {
+  const score = signal.similarity_score ?? 0;
+  if (score >= 95) return "similarity-badge strong";
+  if (score >= 70) return "similarity-badge medium";
+  return "similarity-badge weak";
+}
+
+function signalPrimaryReason(signal: HistoricalSignal) {
+  return signal.match_explanation || signalTypeLabel(signal.signal_type);
+}
+
+function signalStrengthLabel(signal: HistoricalSignal) {
+  if (signal.signal_type === "exact_odds" && signal.sample_size >= 5) return "High";
+  if (signal.signal_type === "neighbor_odds" && signal.similarity_score >= 70 && signal.sample_size >= 5) return "High";
+  if (signal.sample_size >= 3) return "Medium";
+  return "Low";
 }
 
 function formatPct(value: number | null | undefined) {

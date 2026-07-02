@@ -186,6 +186,15 @@ class Database:
                 current_home_odds DOUBLE,
                 current_draw_odds DOUBLE,
                 current_away_odds DOUBLE,
+                matched_odds_home DOUBLE,
+                matched_odds_draw DOUBLE,
+                matched_odds_away DOUBLE,
+                odds_distance_home DOUBLE,
+                odds_distance_draw DOUBLE,
+                odds_distance_away DOUBLE,
+                similarity_score DOUBLE,
+                match_explanation VARCHAR,
+                signal_rank INTEGER,
                 sample_size INTEGER,
                 home_win_pct DOUBLE,
                 draw_pct DOUBLE,
@@ -203,6 +212,15 @@ class Database:
             )
             """
         )
+        self._ensure_column("historical_signals", "matched_odds_home", "DOUBLE")
+        self._ensure_column("historical_signals", "matched_odds_draw", "DOUBLE")
+        self._ensure_column("historical_signals", "matched_odds_away", "DOUBLE")
+        self._ensure_column("historical_signals", "odds_distance_home", "DOUBLE")
+        self._ensure_column("historical_signals", "odds_distance_draw", "DOUBLE")
+        self._ensure_column("historical_signals", "odds_distance_away", "DOUBLE")
+        self._ensure_column("historical_signals", "similarity_score", "DOUBLE")
+        self._ensure_column("historical_signals", "match_explanation", "VARCHAR")
+        self._ensure_column("historical_signals", "signal_rank", "INTEGER")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS played_match_archive (
@@ -803,14 +821,17 @@ class Database:
     def _fetch_historical_records(self, where_sql: str, params: list[object]) -> list[dict[str, object]]:
         rows = self.connection.execute(
             f"""
-            SELECT dataset, source_file, full_time_score
+            SELECT dataset, source_file, query_home_odds, query_draw_odds, query_away_odds, full_time_score
             FROM historical_records
             WHERE full_time_score IS NOT NULL AND {where_sql}
             ORDER BY dataset, source_file, id
             """,
             params,
         ).fetchall()
-        return [dict(zip(["dataset", "source_file", "full_time_score"], row)) for row in rows]
+        return [
+            dict(zip(["dataset", "source_file", "query_home_odds", "query_draw_odds", "query_away_odds", "full_time_score"], row))
+            for row in rows
+        ]
 
     def _insert_historical_signal(
         self,
@@ -825,12 +846,35 @@ class Database:
         for dataset, dataset_records in grouped.items():
             scores = [str(record["full_time_score"]) for record in dataset_records]
             stats = compute_outcome_stats(scores)
+            explanation = _signal_explanation(signal_type)
+            signal_rank = _signal_rank(signal_type)
+            similarity = _signal_similarity(candidate, signal_type, dataset_records)
+            matched_home = _average_odds(dataset_records, "query_home_odds")
+            matched_draw = _average_odds(dataset_records, "query_draw_odds")
+            matched_away = _average_odds(dataset_records, "query_away_odds")
+            current_home = normalize_odds(candidate["home_odds"])
+            current_draw = normalize_odds(candidate["draw_odds"])
+            current_away = normalize_odds(candidate["away_odds"])
+            distance_home = _odds_distance(current_home, matched_home)
+            distance_draw = _odds_distance(current_draw, matched_draw)
+            distance_away = _odds_distance(current_away, matched_away)
             source_files = sorted({str(record["source_file"]) for record in dataset_records})[:20]
             historical_scores = scores[:10]
             self.connection.execute(
                 """
-                INSERT INTO historical_signals VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                INSERT INTO historical_signals (
+                    id, match_id, event_id, league, home_team, away_team, kickoff_time, capture_phase,
+                    bookmaker, normalized_bookmaker, dataset, signal_type,
+                    current_home_odds, current_draw_odds, current_away_odds,
+                    matched_odds_home, matched_odds_draw, matched_odds_away,
+                    odds_distance_home, odds_distance_draw, odds_distance_away,
+                    similarity_score, match_explanation, signal_rank,
+                    sample_size, home_win_pct, draw_pct, away_win_pct,
+                    over_0_5_pct, over_1_5_pct, over_2_5_pct, btts_pct,
+                    double_chance_1x_pct, double_chance_x2_pct, double_chance_12_pct,
+                    historical_scores_json, source_files_json, created_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )
                 """,
                 [
@@ -846,9 +890,18 @@ class Database:
                     candidate["normalized_bookmaker"],
                     dataset,
                     signal_type,
-                    normalize_odds(candidate["home_odds"]),
-                    normalize_odds(candidate["draw_odds"]),
-                    normalize_odds(candidate["away_odds"]),
+                    current_home,
+                    current_draw,
+                    current_away,
+                    matched_home,
+                    matched_draw,
+                    matched_away,
+                    distance_home,
+                    distance_draw,
+                    distance_away,
+                    similarity,
+                    explanation,
+                    signal_rank,
                     stats["sample_size"],
                     stats["home_win_pct"],
                     stats["draw_pct"],
@@ -896,7 +949,8 @@ class Database:
             SELECT *
             FROM historical_signals
             WHERE {' AND '.join(clauses)}
-            ORDER BY kickoff_time NULLS LAST, sample_size DESC, signal_type, normalized_bookmaker
+            ORDER BY COALESCE(signal_rank, 99), COALESCE(similarity_score, 0) DESC, sample_size DESC,
+                     kickoff_time NULLS LAST, normalized_bookmaker
             LIMIT 500
             """,
             params,
@@ -1151,6 +1205,75 @@ class Database:
         return [self._with_final_snapshot_age(self._serialize(dict(zip(columns, row)))) for row in rows]
 
     @_locked
+    def list_matches_page(
+        self,
+        query: str = "",
+        match_filter: str = "all",
+        sort_mode: str = "capture_desc",
+        offset: int = 0,
+        limit: int = 120,
+    ) -> dict[str, object]:
+        rows = self.list_matches()
+        visible = [row for row in rows if self._match_row_visible(row, query, match_filter)]
+        visible.sort(key=lambda row: self._match_sort_key(row, sort_mode), reverse=sort_mode in {"capture_desc", "bookmakers_desc", "attempts_desc"})
+        safe_offset = max(0, offset)
+        safe_limit = min(max(1, limit), 500)
+        return {
+            "items": visible[safe_offset : safe_offset + safe_limit],
+            "total": len(visible),
+            "offset": safe_offset,
+            "limit": safe_limit,
+        }
+
+    def _match_row_visible(self, row: dict[str, object], query: str, match_filter: str) -> bool:
+        bookmaker_count = int(row.get("bookmaker_count") or 0)
+        attempt_count = int(row.get("attempt_count") or 0)
+        quality_status = row.get("quality_status")
+        finalized = bool(row.get("finalized_at"))
+        state_ok = (
+            match_filter == "all"
+            or (match_filter == "with_odds" and bookmaker_count > 0)
+            or (match_filter == "req_full" and quality_status == "COMPLETE")
+            or (match_filter == "req_partial" and quality_status == "PARTIAL")
+            or (match_filter == "req_missing" and quality_status == "FAILED")
+            or (match_filter == "missing_bwin" and bookmaker_count > 0 and not row.get("has_bwin"))
+            or (match_filter == "missing_unibet" and bookmaker_count > 0 and not row.get("has_unibet"))
+            or (match_filter == "capture_miss" and finalized and bookmaker_count == 0 and attempt_count > 0)
+            or (match_filter == "skipped_old" and finalized and bookmaker_count == 0 and attempt_count == 0)
+            or (match_filter == "due" and bool(row.get("next_capture_at")))
+            or (match_filter == "finalized" and finalized)
+            or (match_filter == "new" and not quality_status)
+        )
+        if not state_ok:
+            return False
+        needle = query.strip().lower()
+        if not needle:
+            return True
+        haystack = " ".join(
+            str(value)
+            for value in [
+                row.get("league"),
+                row.get("home_team"),
+                row.get("away_team"),
+                row.get("event_id"),
+                row.get("quality_status"),
+                row.get("capture_phase"),
+                row.get("timing_status"),
+            ]
+            if value
+        ).lower()
+        return needle in haystack
+
+    def _match_sort_key(self, row: dict[str, object], sort_mode: str) -> object:
+        if sort_mode == "kickoff_asc":
+            return row.get("kickoff_time") or ""
+        if sort_mode == "bookmakers_desc":
+            return int(row.get("bookmaker_count") or 0)
+        if sort_mode == "attempts_desc":
+            return int(row.get("attempt_count") or 0)
+        return row.get("captured_at") or ""
+
+    @_locked
     def match_detail(self, match_id: str) -> dict[str, object] | None:
         match = next((row for row in self.list_matches() if row["id"] == match_id), None)
         if not match:
@@ -1353,3 +1476,81 @@ class Database:
         if finalized_at:
             return "FINALIZED"
         return capture_phase
+
+
+def _average_odds(records: list[dict[str, object]], field: str) -> float | None:
+    values = [normalize_odds(record.get(field)) for record in records]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return round(sum(values) / len(values), 2)
+
+
+def _odds_distance(current: float | None, matched: float | None) -> float | None:
+    if current is None or matched is None:
+        return None
+    return round(abs(current - matched), 2)
+
+
+def _signal_explanation(signal_type: str) -> str:
+    if signal_type == "exact_odds":
+        return "Exact 1X2 odds"
+    if signal_type == "neighbor_odds":
+        return "Nearby odds within 0.05"
+    if signal_type == "one_draw":
+        return "Draw-only historical pattern"
+    return "Historical odds pattern"
+
+
+def _signal_rank(signal_type: str) -> int:
+    if signal_type == "exact_odds":
+        return 1
+    if signal_type == "neighbor_odds":
+        return 2
+    if signal_type == "one_draw":
+        return 3
+    return 99
+
+
+def _signal_similarity(candidate: dict[str, object], signal_type: str, records: list[dict[str, object]]) -> float:
+    home = normalize_odds(candidate.get("home_odds"))
+    draw = normalize_odds(candidate.get("draw_odds"))
+    away = normalize_odds(candidate.get("away_odds"))
+    if signal_type == "exact_odds":
+        return 100.0
+    if signal_type == "one_draw":
+        return _draw_similarity(draw, records)
+    if signal_type == "neighbor_odds":
+        if home is None or draw is None or away is None:
+            return 0.0
+        distances: list[float] = []
+        for record in records:
+            record_home = normalize_odds(record.get("query_home_odds"))
+            record_draw = normalize_odds(record.get("query_draw_odds"))
+            record_away = normalize_odds(record.get("query_away_odds"))
+            if record_home is None or record_draw is None or record_away is None:
+                continue
+            distances.extend(
+                [
+                    abs(home - record_home) / NEIGHBOR_TOLERANCE,
+                    abs(draw - record_draw) / NEIGHBOR_TOLERANCE,
+                    abs(away - record_away) / NEIGHBOR_TOLERANCE,
+                ]
+            )
+        if not distances:
+            return 0.0
+        return round(min(99.0, max(0.0, 100.0 * (1.0 - (sum(distances) / len(distances))))), 1)
+    return 0.0
+
+
+def _draw_similarity(draw: float | None, records: list[dict[str, object]]) -> float:
+    if draw is None:
+        return 0.0
+    distances: list[float] = []
+    for record in records:
+        record_draw = normalize_odds(record.get("query_draw_odds"))
+        if record_draw is not None:
+            distances.append(abs(draw - record_draw) / NEIGHBOR_TOLERANCE)
+    if not distances:
+        return 0.0
+    return round(max(0.0, 100.0 * (1.0 - (sum(distances) / len(distances)))), 1)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from threading import Lock
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -166,6 +167,27 @@ class HistoricalDocxImporter:
                 warnings.append(warning)
 
         return records, warnings
+
+
+class HistoricalSignalAutoRefresh:
+    def __init__(self, database: Database, importer: HistoricalDocxImporter, roots: list[Path]) -> None:
+        self.database = database
+        self.importer = importer
+        self.roots = roots
+        self._lock = Lock()
+
+    def refresh(self, reason: str) -> dict[str, int]:
+        with self._lock:
+            import_result = self.importer.import_roots(self.roots)
+            recompute_result = self.database.recompute_historical_signals()
+            archive_result = self.database.archive_played_matches()
+            result = {
+                **import_result,
+                **{f"recompute_{key}": value for key, value in recompute_result.items()},
+                **archive_result,
+            }
+            self.database.log("info", "historical", "auto_refresh_completed", details={"reason": reason, **result})
+            return result
 
 
 def _record(

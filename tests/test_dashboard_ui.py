@@ -101,17 +101,70 @@ def test_dashboard_renders_historical_signal_controls() -> None:
         "api<HistoricalImportStatus>(\"/api/historical/import-status\")",
         "api<HistoricalImportResult>(\"/api/historical/import\"",
         "api<SignalRecomputeResult>(\"/api/signals/recompute\"",
+        "api<ExportResult>(\"/api/exports/played-archive\"",
+        "exportPlayedArchive",
+        "Export archive CSV",
         "signalDatasetFilter",
         "signalBookmakerFilter",
         "signalTypeFilter",
         "minSignalSample",
+        "minSignalSimilarity",
+        "actionableSignalsOnly",
+        "Min similarity",
+        "Actionable only",
+        "similarityBadgeClass",
         "Home Win %",
         "BTTS",
         "Double Chance",
+        "groupedSignals",
+        "signalGroupBookmakerOdds(group, \"bwin\")",
+        "signalGroupBookmakerOdds(group, \"unibet\")",
     ]
 
     for phrase in expected_phrases:
         assert phrase in page
+
+
+def test_dashboard_renders_actionable_signal_feed() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    styles = read_repo_file("apps/desktop/web/app/globals.css")
+
+    expected_phrases = [
+        "compact actionable feed",
+        "signalSimilarityBadge",
+        "signalPrimaryReason",
+        "group.bestSignal.similarity_score",
+        "Explain signal",
+        "signalStrengthLabel",
+        "Top historical outcomes",
+        "No historical match for current Bwin/Unibet odds",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page
+    assert ".similarity-badge" in styles
+    assert ".signal-feed-card" in styles
+    assert ".outcome-bars" in styles
+
+
+def test_dashboard_uses_chunked_match_acquisition_and_render_derender_hints() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    css = read_repo_file("apps/desktop/web/app/globals.css")
+
+    expected_phrases = [
+        "type MatchPageResult",
+        "MATCH_PAGE_SIZE",
+        "matchesPagePath",
+        "loadMatchesPage",
+        "api<MatchPageResult>(matchesPagePath",
+        "hasMoreServerMatches",
+        "isLoadingMatches",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page
+    assert "content-visibility: auto" in css
+    assert "contain-intrinsic-size" in css
 
 
 def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
@@ -122,7 +175,7 @@ def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
     assert "loadStatusOnly" in page
     assert "loadDashboardData" in page
     assert "setInterval(() => void load(), 5000)" not in page
-    assert "api<MatchRow[]>(\"/api/matches\")" in page
+    assert "api<MatchPageResult>(matchesPagePath(0))" in page
 
 
 def test_selected_match_odds_rows_render_incrementally() -> None:
@@ -141,4 +194,5 @@ def test_selected_match_odds_rows_render_incrementally() -> None:
     assert "groupedOddsRows.map((item)" not in match_page
     assert "oddsListMoreRef" in match_page
     assert "Load more odds rows" in match_page
-    assert "startTransition(() => setDetail(nextDetail))" in match_page
+    assert "setDetail(nextDetail);" in match_page
+    assert "setSignals(nextSignals);" in match_page

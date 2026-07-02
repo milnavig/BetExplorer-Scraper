@@ -81,6 +81,8 @@ MAX_CONCURRENT_CAPTURES=6
 RETRY_DELAY_SECONDS=1
 DATABASE_PATH=data/betexplorer.duckdb
 HISTORICAL_DATABASE_ROOT=SAMPLE_DATABASE
+HISTORICAL_AUTO_IMPORT=true
+HISTORICAL_AUTO_RECOMPUTE=true
 ```
 
 `BETEXPLORER_TIMEZONE_OFFSET` is important: BetExplorer changes the visible "today" schedule based on the `my_timezone` cookie. For Kyiv time keep `+3`, otherwise the scraper can see the previous UTC day and `Next capture` may look empty or stale.
@@ -173,14 +175,18 @@ Milestone 2 adds a local historical matching layer for the client DOCX database.
 
 ```env
 HISTORICAL_DATABASE_ROOT=SAMPLE_DATABASE
+HISTORICAL_AUTO_IMPORT=true
+HISTORICAL_AUTO_RECOMPUTE=true
 ```
 
 The importer scans dataset folders named like `Odds`, `Gebruikbare odds`, `*ODDS`, or `*Usable Odds`, reads DOCX tables, and stores normalized historical odds/results in DuckDB. It does not modify the original DOCX files.
 
 From the dashboard:
 
-- Click `Import DOCX` in `Historical signals` to import changed DOCX files and recompute signals.
-- Click `Recompute` after new final Bwin/Unibet odds are captured.
+- The API automatically scans the configured DOCX folder on startup.
+- After new Bwin/Unibet odds or finished results are captured, the API automatically recomputes historical signals and the played-match archive.
+- Click `Rescan DOCX` only when the DOCX folder changed while the API was already running.
+- Click `Recompute` only for manual debugging or forced refresh.
 - Filter signals by dataset, bookmaker, signal type, and minimum sample size.
 
 API endpoints:
@@ -190,6 +196,9 @@ API endpoints:
 - `GET /api/signals`
 - `GET /api/signals/{match_id}`
 - `POST /api/signals/recompute`
+- `POST /api/exports/played-archive`
+
+Played-match archive exports are written as `played_match_archive_YYYY-MM-DD.csv` or `.xlsx` in `data/exports/`. They use the local archive table with finalized Bwin/Unibet odds and final scores; the original DOCX database remains read-only.
 
 Export status fields:
 
@@ -253,15 +262,17 @@ npm --prefix apps/desktop audit
 
 - `GET /api/status`
 - `GET /api/matches`
+- `GET /api/matches-page`
 - `GET /api/matches/{id}`
 - `GET /api/snapshots`
 - `GET /api/logs`
 - `POST /api/capture/run-once`
 - `POST /api/exports/final-odds`
+- `POST /api/exports/played-archive`
 
 ## Notes
 
 - The scraper is HTTP-first. Browser automation is intentionally left as a fallback interface, not the default.
 - `CAPTURE_MARKET=all` discovers BetExplorer market tabs from the match page, for example `1x2`, `ou`, `ah`, `dc`, and `bts`. Set it to a single market id like `1x2` to restrict capture.
 - Odds rows use generic `Odd 1`, `Odd 2`, `Odd 3` columns because markets can be two-outcome or three-outcome.
-- Matching against the client historical database is not implemented yet.
+- Historical matching is file-based: configure `HISTORICAL_DATABASE_ROOT`, keep the original DOCX files read-only, and let DuckDB hold the local searchable index/signals.

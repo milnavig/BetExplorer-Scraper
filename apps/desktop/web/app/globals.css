@@ -524,6 +524,8 @@ small {
   text-align: left;
   cursor: pointer;
   transition: border-color 150ms ease, background 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+  content-visibility: auto;
+  contain-intrinsic-size: 60px;
 }
 
 .match-row:hover,
@@ -806,6 +808,8 @@ code {
   border-radius: 6px;
   background: #fbfcfd;
   animation: row-in 300ms ease both;
+  content-visibility: auto;
+  contain-intrinsic-size: 72px;
 }
 
 .compact-row .quality,
@@ -973,6 +977,11 @@ code {
   margin-top: 0;
 }
 
+.match-signal-layout {
+  display: grid;
+  gap: 10px;
+}
+
 .required-cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1114,6 +1123,12 @@ code {
   font-size: 12px;
 }
 
+.signal-bookmakers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
 .signal-status strong,
 .signal-odds strong {
   color: var(--text);
@@ -1132,6 +1147,12 @@ code {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fbfcfd;
+  content-visibility: auto;
+  contain-intrinsic-size: 260px;
+}
+
+.signal-feed-card {
+  border-left: 4px solid var(--accent);
 }
 
 .signal-card-head {
@@ -1153,12 +1174,36 @@ code {
 
 .signal-type {
   display: inline-flex;
+  margin-right: 6px;
   padding: 3px 7px;
   border-radius: 6px;
   background: #eaf6f9;
   color: var(--accent);
   font-size: 11px;
   font-weight: 800;
+}
+
+.similarity-badge {
+  display: inline-flex;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.similarity-badge.strong {
+  background: #e9f7ef;
+  color: #19764a;
+}
+
+.similarity-badge.medium {
+  background: #fff6df;
+  color: #8a5b00;
+}
+
+.similarity-badge.weak {
+  background: #f2f4f5;
+  color: #667780;
 }
 
 .signal-sample {
@@ -1188,6 +1233,13 @@ code {
   gap: 6px;
 }
 
+.score-strip small {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
 .score-strip span {
   padding: 4px 7px;
   border-radius: 6px;
@@ -1195,6 +1247,209 @@ code {
   color: #31424d;
   font-size: 12px;
   font-weight: 800;
+}
+
+.explain-link {
+  display: inline-flex;
+  justify-content: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.odds-intelligence-panel {
+  border-color: #c8dfe5;
+  background: #f8fbfc;
+}
+
+.intelligence-odds-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.odds-bookmaker-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.odds-bookmaker-card > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.odds-bookmaker-card.missing {
+  opacity: 0.62;
+}
+
+.large-prices .price-chip strong {
+  font-size: 18px;
+}
+
+.comparison-brief {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1.6fr);
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.comparison-brief h4,
+.section-explainer h4 {
+  margin: 0 0 5px;
+  font-size: 15px;
+}
+
+.comparison-brief p,
+.section-explainer p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.comparison-brief-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.signal-summary-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.signal-summary-card h4,
+.why-matched h4 {
+  margin: 8px 0 4px;
+  font-size: 15px;
+}
+
+.signal-summary-card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.summary-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.outcome-bars {
+  display: grid;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.section-explainer {
+  margin-bottom: 3px;
+}
+
+.outcome-bar {
+  display: grid;
+  grid-template-columns: 90px 54px minmax(90px, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.outcome-bar strong {
+  color: var(--text);
+}
+
+.outcome-bar div {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e7edf0;
+}
+
+.outcome-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+}
+
+.secondary-signal-stats {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+
+.why-matched {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  overflow-x: auto;
+}
+
+.why-matched table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.why-matched th,
+.why-matched td {
+  padding: 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+}
+
+.score-examples {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.score-examples details {
+  display: grid;
+  gap: 8px;
+}
+
+.score-examples summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.score-examples button {
+  width: fit-content;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f5f8f9;
+  color: var(--muted);
 }
 
 .empty {

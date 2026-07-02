@@ -174,3 +174,55 @@ def export_final_odds(
     else:
         raise ValueError("format must be csv or xlsx")
     return path
+
+
+def export_played_match_archive(
+    rows: list[dict[str, object]],
+    export_dir: Path,
+    date_slug: str,
+    fmt: str,
+    timezone_offset: str = "+0",
+) -> Path:
+    export_dir.mkdir(parents=True, exist_ok=True)
+    fmt = fmt.lower()
+    filename = f"played_match_archive_{date_slug}.{fmt}"
+    path = export_dir / filename
+    export_rows = [_played_archive_export_row(row, timezone_offset) for row in rows]
+    frame = pd.DataFrame(export_rows)
+    if fmt == "csv":
+        frame.to_csv(path, index=False)
+    elif fmt == "xlsx":
+        frame.to_excel(path, index=False)
+    else:
+        raise ValueError("format must be csv or xlsx")
+    return path
+
+
+def _played_archive_export_row(row: dict[str, object], timezone_offset: str) -> dict[str, object]:
+    return {
+        "event_id": row.get("event_id"),
+        "league": row.get("league"),
+        "home_team": row.get("home_team"),
+        "away_team": row.get("away_team"),
+        "kickoff_time": _format_archive_datetime(row.get("kickoff_time"), timezone_offset),
+        "finalized_at": _format_archive_datetime(row.get("finalized_at"), timezone_offset, stored_as_utc=True),
+        "result_captured_at": _format_archive_datetime(row.get("result_captured_at"), timezone_offset, stored_as_utc=True),
+        "full_time_score": row.get("full_time_score"),
+        "bwin_home_odds": row.get("bwin_home_odds"),
+        "bwin_draw_odds": row.get("bwin_draw_odds"),
+        "bwin_away_odds": row.get("bwin_away_odds"),
+        "unibet_home_odds": row.get("unibet_home_odds"),
+        "unibet_draw_odds": row.get("unibet_draw_odds"),
+        "unibet_away_odds": row.get("unibet_away_odds"),
+        "archived_at": _format_archive_datetime(row.get("archived_at"), timezone_offset, stored_as_utc=True),
+    }
+
+
+def _format_archive_datetime(value: object, timezone_offset: str, stored_as_utc: bool = False) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return format_export_datetime(value, timezone_offset, stored_as_utc)
+    if isinstance(value, str) and value:
+        return format_export_datetime(datetime.fromisoformat(value), timezone_offset, stored_as_utc)
+    return None

@@ -27,3 +27,40 @@ def test_match_page_table_groups_rows_by_market_inside_tbody() -> None:
     assert "colSpan={10}" in page
     assert "groupOddsRows(filteredOdds)" in page
     assert ".market-group-row td" in styles
+
+
+def test_match_page_renders_historical_signals_for_selected_match() -> None:
+    page = (ROOT / "apps/desktop/web/app/match/page.tsx").read_text(encoding="utf-8")
+
+    expected_phrases = [
+        "type HistoricalSignal",
+        "const [signals, setSignals]",
+        "api<HistoricalSignal[]>(`/api/signals/${selectedId}`)",
+        "Odds intelligence panel",
+        "oddsReadinessMessage",
+        "What are we comparing?",
+        "Compared with historical database",
+        "Matched by",
+        "Used for match",
+        "Historical outcome stats from",
+        "Percentages are calculated from historical matches",
+        "Example historical full-time scores",
+        "View all matched scores",
+        "Signal strength",
+        "SignalSummaryCard",
+        "OutcomeBars",
+        "Why matched",
+        "Current odds",
+        "Matched historical odds",
+        "Similarity",
+        "Waiting for Unibet final 1X2 odds",
+        "No historical match for current Bwin/Unibet odds",
+        "signalGroupBookmakerOdds(signals, \"bwin\")",
+        "signalGroupBookmakerOdds(signals, \"unibet\")",
+        "Home Win %",
+        "BTTS",
+        "Double Chance",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page

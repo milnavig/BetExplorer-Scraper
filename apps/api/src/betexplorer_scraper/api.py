@@ -15,13 +15,18 @@ from .clock import utc_now
 from .capture import CaptureService
 from .config import get_settings
 from .database import Database
-from .exporter import export_final_odds
-from .historical import HistoricalDocxImporter
+from .exporter import export_final_odds, export_played_match_archive
+from .historical import HistoricalDocxImporter, HistoricalSignalAutoRefresh
 
 settings = get_settings()
 database = Database(settings.database_path, timezone_offset=settings.betexplorer_timezone_offset)
 service = CaptureService(settings, database)
 historical_importer = HistoricalDocxImporter(database)
+historical_auto_refresh = HistoricalSignalAutoRefresh(
+    database,
+    historical_importer,
+    [settings.historical_database_root],
+)
 
 scheduler_task: asyncio.Task[None] | None = None
 scheduler_started_at: datetime | None = None
@@ -37,7 +42,8 @@ async def _api_scheduler_loop() -> None:
         try:
             scheduler_next_run_at = None
             scheduler_cycle_started_at = utc_now()
-            await service.run_once(trigger="api_scheduler", force_discovery=False)
+            result = await service.run_once(trigger="api_scheduler", force_discovery=False)
+            _refresh_historical_after_capture(result, "api_scheduler")
             scheduler_last_error = None
             scheduler_next_run_at = utc_now() + timedelta(seconds=settings.scheduler_tick_seconds)
         except asyncio.CancelledError:
@@ -51,6 +57,8 @@ async def _api_scheduler_loop() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global scheduler_task, scheduler_started_at
+    if settings.historical_auto_import:
+        _refresh_historical_signals("startup")
     if settings.enable_api_scheduler:
         scheduler_started_at = utc_now()
         scheduler_task = asyncio.create_task(_api_scheduler_loop())
@@ -82,6 +90,31 @@ class ExportRequest(BaseModel):
 
 class SignalRecomputeRequest(BaseModel):
     archive_played: bool = True
+
+
+def _refresh_historical_signals(reason: str) -> dict[str, int]:
+    try:
+        return historical_auto_refresh.refresh(reason)
+    except Exception as exc:
+        database.log("error", "historical", "auto_refresh_failed", details={"reason": reason, "error": str(exc)})
+        return {
+            "files_seen": 0,
+            "files_imported": 0,
+            "records_imported": 0,
+            "warnings": 0,
+            "recompute_matches_evaluated": 0,
+            "recompute_signals": 0,
+            "archived": 0,
+        }
+
+
+def _refresh_historical_after_capture(result: dict[str, int], reason: str) -> dict[str, int]:
+    if not settings.historical_auto_recompute:
+        return result
+    if result.get("captured", 0) <= 0 and result.get("results_captured", 0) <= 0:
+        return result
+    historical_result = _refresh_historical_signals(reason)
+    return {**result, **{f"historical_{key}": value for key, value in historical_result.items()}}
 
 
 @app.get("/api/status")
@@ -141,6 +174,17 @@ def matches() -> list[dict[str, object]]:
     return database.list_matches()
 
 
+@app.get("/api/matches-page")
+def matches_page(
+    q: str = "",
+    filter: str = "all",
+    sort: str = "capture_desc",
+    offset: int = 0,
+    limit: int = 120,
+) -> dict[str, object]:
+    return database.list_matches_page(query=q, match_filter=filter, sort_mode=sort, offset=offset, limit=limit)
+
+
 @app.get("/api/matches/{match_id}")
 def match_detail(match_id: str) -> dict[str, object]:
     detail = database.match_detail(match_id)
@@ -174,6 +218,8 @@ def historical_import_status() -> dict[str, object]:
     result = database.historical_import_status()
     result["root"] = str(settings.historical_database_root)
     result["root_exists"] = settings.historical_database_root.exists()
+    result["auto_import"] = settings.historical_auto_import
+    result["auto_recompute"] = settings.historical_auto_recompute
     return result
 
 
@@ -215,7 +261,12 @@ def exports() -> list[dict[str, object]]:
     if not settings.export_dir.exists():
         return []
     files = []
-    for path in sorted(settings.export_dir.glob("final_odds_*.*"), key=lambda item: item.stat().st_mtime, reverse=True):
+    paths = [
+        path
+        for pattern in ("final_odds_*.*", "played_match_archive_*.*")
+        for path in settings.export_dir.glob(pattern)
+    ]
+    for path in sorted(paths, key=lambda item: item.stat().st_mtime, reverse=True):
         if path.suffix.lower() not in {".csv", ".xlsx"}:
             continue
         stat = path.stat()
@@ -233,7 +284,8 @@ def exports() -> list[dict[str, object]]:
 
 @app.post("/api/capture/run-once")
 async def capture_run_once() -> dict[str, int]:
-    return await service.run_once()
+    result = await service.run_once()
+    return _refresh_historical_after_capture(result, "capture_run_once")
 
 
 @app.post("/api/exports/final-odds")
@@ -249,6 +301,24 @@ def export_final_odds_endpoint(request: ExportRequest) -> dict[str, str]:
             fmt,
             settings.betexplorer_timezone_offset,
             layout,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"path": str(path), "filename": path.name, "download_url": f"/api/exports/{path.name}"}
+
+
+@app.post("/api/exports/played-archive")
+def export_played_archive_endpoint(request: ExportRequest) -> dict[str, str]:
+    fmt = request.format.lower()
+    date_slug = request.date or utc_now().strftime("%Y-%m-%d")
+    database.archive_played_matches()
+    try:
+        path = export_played_match_archive(
+            database.list_played_match_archive(),
+            settings.export_dir,
+            date_slug,
+            fmt,
+            settings.betexplorer_timezone_offset,
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error

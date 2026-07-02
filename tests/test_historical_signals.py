@@ -6,7 +6,7 @@ from pathlib import Path
 from docx import Document
 
 from betexplorer_scraper.database import Database
-from betexplorer_scraper.historical import HistoricalDocxImporter, compute_outcome_stats
+from betexplorer_scraper.historical import HistoricalDocxImporter, HistoricalSignalAutoRefresh, compute_outcome_stats
 from betexplorer_scraper.models import BookmakerOdds, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
 
 
@@ -95,6 +95,32 @@ def test_historical_importer_separates_usable_odds_dataset(tmp_path: Path) -> No
     assert db.list_historical_records()[0]["dataset"] == "Usable Odds"
 
 
+def test_historical_auto_refresh_imports_docx_and_recomputes_signals(tmp_path: Path) -> None:
+    root = tmp_path / "SAMPLE_DATABASE"
+    _write_docx(
+        root / "2.00 Sample_Database ODDS" / "3.00" / "ODDS.docx",
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.00", "3.40", "3.00", "1-0.", "0-0."],
+        ],
+    )
+    db = Database(tmp_path / "auto_refresh.duckdb")
+    match_id = _seed_match_with_required_1x2(db)
+    refresh = HistoricalSignalAutoRefresh(db, HistoricalDocxImporter(db), [root])
+
+    first = refresh.refresh(reason="test-startup")
+    second = refresh.refresh(reason="test-idle")
+
+    signals = db.list_signals(match_id=match_id)
+    assert first["files_seen"] == 1
+    assert first["files_imported"] == 1
+    assert first["recompute_signals"] >= 1
+    assert second["files_seen"] == 1
+    assert second["files_imported"] == 0
+    assert signals[0]["signal_type"] == "exact_odds"
+    assert signals[0]["historical_scores"] == ["1-0"]
+
+
 def test_signal_stats_calculate_outcomes_totals_btts_and_double_chance() -> None:
     stats = compute_outcome_stats(["2-1", "0-0", "1-2", "2-2"])
 
@@ -179,7 +205,24 @@ def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path)
     assert exact["sample_size"] == 1
     assert exact["home_win_pct"] == 100.0
     assert exact["historical_scores"] == ["2-1"]
+    assert exact["similarity_score"] == 100.0
+    assert exact["signal_rank"] == 1
+    assert exact["match_explanation"] == "Exact 1X2 odds"
+    assert exact["matched_odds_home"] == 2.0
+    assert exact["matched_odds_draw"] == 3.4
+    assert exact["matched_odds_away"] == 3.0
+    assert exact["odds_distance_home"] == 0.0
+    assert exact["odds_distance_draw"] == 0.0
+    assert exact["odds_distance_away"] == 0.0
+    neighbor = next(signal for signal in signals if signal["bookmaker"] == "Bwin" and signal["signal_type"] == "neighbor_odds")
+    assert neighbor["signal_rank"] == 2
+    assert neighbor["match_explanation"] == "Nearby odds within 0.05"
+    assert neighbor["matched_odds_away"] == 3.05
+    assert neighbor["odds_distance_away"] == 0.05
+    assert neighbor["similarity_score"] == 66.7
     one_draw = next(signal for signal in signals if signal["signal_type"] == "one_draw")
+    assert one_draw["signal_rank"] == 3
+    assert one_draw["match_explanation"] == "Draw-only historical pattern"
     assert one_draw["sample_size"] == 2
     assert one_draw["draw_pct"] == 50.0
     assert match_signals
