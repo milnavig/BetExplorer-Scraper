@@ -64,3 +64,14 @@ def test_match_page_renders_historical_signals_for_selected_match() -> None:
 
     for phrase in expected_phrases:
         assert phrase in page
+
+
+def test_match_page_labels_one_draw_similarity_as_draw_only_not_full_confidence() -> None:
+    page = (ROOT / "apps/desktop/web/app/match/page.tsx").read_text(encoding="utf-8")
+    styles = (ROOT / "apps/desktop/web/app/globals.css").read_text(encoding="utf-8")
+
+    assert 'signal.signal_type === "one_draw"' in page
+    assert "Draw-only ${formatPct(signal.similarity_score)}" in page
+    assert "<span className={similarityBadgeClass(signal)}>{signalSimilarityBadge(signal)}</span>" in page
+    assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
+    assert ".similarity-badge.draw-only" in styles

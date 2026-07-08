@@ -2578,10 +2578,12 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
+  if (signal.signal_type === "one_draw") return `Draw-only ${formatPct(signal.similarity_score)}`;
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 
 function similarityBadgeClass(signal: HistoricalSignal) {
+  if (signal.signal_type === "one_draw") return "similarity-badge draw-only";
   const score = signal.similarity_score ?? 0;
   if (score >= 95) return "similarity-badge strong";
   if (score >= 70) return "similarity-badge medium";

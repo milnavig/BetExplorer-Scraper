@@ -1206,6 +1206,11 @@ code {
   color: #667780;
 }
 
+.similarity-badge.draw-only {
+  background: #f4eefc;
+  color: #6b3fa0;
+}
+
 .signal-sample {
   display: grid;
   min-width: 38px;

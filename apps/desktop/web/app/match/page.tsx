@@ -794,7 +794,7 @@ function SignalSummaryCard({ signal }: { signal: HistoricalSignal }) {
   return (
     <div className="signal-summary-card">
       <div>
-        <span className={similarityBadgeClass(signal)}>Similarity {formatPct(signal.similarity_score)}</span>
+        <span className={similarityBadgeClass(signal)}>{signalSimilarityBadge(signal)}</span>
         <h4>{signalTypeLabel(signal.signal_type)}</h4>
         <p>{signal.match_explanation}</p>
       </div>
@@ -988,10 +988,16 @@ function usedForMatch(signal: HistoricalSignal, side: "home" | "draw" | "away") 
 }
 
 function similarityBadgeClass(signal: HistoricalSignal) {
+  if (signal.signal_type === "one_draw") return "similarity-badge draw-only";
   const score = signal.similarity_score ?? 0;
   if (score >= 95) return "similarity-badge strong";
   if (score >= 70) return "similarity-badge medium";
   return "similarity-badge weak";
+}
+
+function signalSimilarityBadge(signal: HistoricalSignal) {
+  if (signal.signal_type === "one_draw") return `Draw-only ${formatPct(signal.similarity_score)}`;
+  return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 
 function oddsReadinessMessage(match: MatchRow, signals: HistoricalSignal[]) {
