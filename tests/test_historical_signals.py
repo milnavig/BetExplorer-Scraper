@@ -228,6 +228,148 @@ def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path)
     assert match_signals
 
 
+def test_database_does_not_emit_one_draw_without_primary_odds_match(tmp_path: Path) -> None:
+    db = Database(tmp_path / "draw_only_noise.duckdb")
+    _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "draw_only.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "draw_only.docx",
+                "source_home_bucket": 5.00,
+                "source_away_file": 5.00,
+                "query_home_odds": 5.00,
+                "query_draw_odds": 3.40,
+                "query_away_odds": 5.00,
+                "historical_home_odds": 5.00,
+                "historical_draw_odds": 3.40,
+                "historical_away_odds": 5.00,
+                "full_time_score": "1-1",
+                "half_time_score": "0-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+            {
+                "dataset": "Odds",
+                "source_file": "draw_only.docx",
+                "source_home_bucket": 6.00,
+                "source_away_file": 6.00,
+                "query_home_odds": 6.00,
+                "query_draw_odds": 3.42,
+                "query_away_odds": 6.00,
+                "historical_home_odds": 6.00,
+                "historical_draw_odds": 3.42,
+                "historical_away_odds": 6.00,
+                "full_time_score": "2-2",
+                "half_time_score": "1-1",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+        ],
+    )
+
+    summary = db.recompute_historical_signals()
+
+    assert summary["signals"] == 0
+    assert db.list_signals() == []
+
+
+def test_list_signals_can_filter_to_actionable_matches(tmp_path: Path) -> None:
+    db = Database(tmp_path / "actionable_signals.duckdb")
+    match_id = _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "sample.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "sample.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.40,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.00,
+                "historical_draw_odds": 3.40,
+                "historical_away_odds": 3.00,
+                "full_time_score": "1-0",
+                "half_time_score": "0-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+        ],
+    )
+    db.recompute_historical_signals()
+
+    assert db.list_signals(match_id=match_id, actionable_after=datetime(2026, 5, 14, 19, 50))
+    assert db.list_signals(match_id=match_id, actionable_after=datetime(2026, 5, 14, 20, 30)) == []
+
+    db.update_match_schedule(match_id, "FINALIZED", None, datetime(2026, 5, 14, 20, 5))
+
+    assert db.list_signals(match_id=match_id, actionable_after=datetime(2026, 5, 14, 19, 50)) == []
+
+
+def test_list_signals_can_filter_archive_by_exact_date_and_list_signal_days(tmp_path: Path) -> None:
+    db = Database(tmp_path / "signal_days.duckdb")
+    first_match_id = _seed_match_with_required_1x2(db)
+    second_match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="signal456",
+            source_url="https://www.betexplorer.com/football/test/signal456/",
+            league="Signal League",
+            home_team="Later",
+            away_team="Visitor",
+            kickoff_time=datetime(2026, 5, 15, 18, 30),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    db.save_snapshot(
+        second_match_id,
+        OddsSnapshot(
+            event_id="signal456",
+            market="1x2",
+            captured_at=datetime(2026, 5, 15, 18, 20),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 2.00, 3.40, 3.00),
+            ],
+        ),
+    )
+    db.replace_historical_records(
+        "sample.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "sample.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.40,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.00,
+                "historical_draw_odds": 3.40,
+                "historical_away_odds": 3.00,
+                "full_time_score": "1-0",
+                "half_time_score": "0-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+        ],
+    )
+
+    db.recompute_historical_signals()
+
+    first_day_signals = db.list_signals(match_date="2026-05-14")
+    second_day_signals = db.list_signals(match_date="2026-05-15")
+    days = db.list_signal_days()
+
+    assert {signal["match_id"] for signal in first_day_signals} == {first_match_id}
+    assert {signal["match_id"] for signal in second_day_signals} == {second_match_id}
+    assert [day["date"] for day in days] == ["2026-05-14", "2026-05-15"]
+    assert all(day["matches"] == 1 for day in days)
+
+
 def test_database_archives_played_matches_with_required_bookmaker_odds(tmp_path: Path) -> None:
     db = Database(tmp_path / "archive.duckdb")
     match_id = _seed_match_with_required_1x2(db)
@@ -241,3 +383,17 @@ def test_database_archives_played_matches_with_required_bookmaker_odds(tmp_path:
     assert rows[0]["bwin_home_odds"] == 2.0
     assert rows[0]["unibet_away_odds"] == 3.1
     assert rows[0]["full_time_score"] == "2-1"
+
+
+def test_played_match_archive_expands_historical_signal_pool(tmp_path: Path) -> None:
+    db = Database(tmp_path / "archive_signals.duckdb")
+    match_id = _seed_match_with_required_1x2(db)
+    db.mark_result_captured(match_id, "2:1", datetime(2026, 5, 14, 22, 0))
+    db.archive_played_matches()
+
+    summary = db.recompute_historical_signals()
+    signals = db.list_signals(match_id=match_id)
+
+    assert summary["signals"] >= 2
+    assert {signal["dataset"] for signal in signals} >= {"Played archive Bwin", "Played archive Unibet"}
+    assert all(signal["sample_size"] >= 1 for signal in signals)

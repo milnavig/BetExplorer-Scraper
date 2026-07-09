@@ -51,7 +51,7 @@ class HttpBetExplorerTransport(BetExplorerTransport):
 
     async def fetch_football_date(self, target_date: date) -> RawResponse:
         url = (
-            f"{self.base_url}/football/"
+            f"{self.base_url}/football/results/"
             f"?year={target_date.year}&month={target_date.month:02d}&day={target_date.day:02d}"
         )
         return await self._get(url, {"Accept": "text/html,*/*"})

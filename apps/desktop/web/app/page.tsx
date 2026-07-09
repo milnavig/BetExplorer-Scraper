@@ -3,13 +3,21 @@
 import {
   Activity,
   AlertTriangle,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Clock3,
+  Database,
   Download,
   ExternalLink,
   Filter,
   Play,
   RefreshCcw,
   Search,
+  Server,
   Table2,
+  CalendarDays,
+  Upload,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
@@ -22,6 +30,7 @@ const MATCH_PAGE_SIZE = 120;
 const ODDS_RENDER_BATCH = 120;
 const DASHBOARD_STATUS_REFRESH_MS = 5000;
 const DASHBOARD_FULL_REFRESH_MS = 30000;
+const DETAIL_TABLE_PREVIEW_ROWS = 60;
 
 type Status = {
   running: boolean;
@@ -306,6 +315,13 @@ type MatchPageResult = {
   limit: number;
 };
 
+type MatchDay = {
+  date: string;
+  matches: number;
+  due_or_scheduled: number;
+  active: number;
+};
+
 type SignalRecomputeResult = {
   matches_evaluated: number;
   signals: number;
@@ -351,6 +367,13 @@ type SchedulerState = {
   label: string;
   detail: string;
 };
+type TopbarStat = {
+  label: string;
+  value: string;
+  detail: string;
+  icon: ReactNode;
+  tone?: "good" | "warn" | "bad" | "idle";
+};
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
@@ -372,21 +395,19 @@ export default function Dashboard() {
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [bookmakers, setBookmakers] = useState<BookmakerCoverage[]>([]);
   const [exports, setExports] = useState<ExportFile[]>([]);
-  const [signals, setSignals] = useState<HistoricalSignal[]>([]);
+  const [selectedSignals, setSelectedSignals] = useState<HistoricalSignal[]>([]);
   const [historicalImportStatus, setHistoricalImportStatus] =
     useState<HistoricalImportStatus | null>(null);
+  const [matchDays, setMatchDays] = useState<MatchDay[]>([]);
+  const [selectedMatchDate, setSelectedMatchDate] = useState(() => todayDateSlug());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
   const [matchQuery, setMatchQuery] = useState("");
   const [bookmakerQuery, setBookmakerQuery] = useState("");
-  const [signalDatasetFilter, setSignalDatasetFilter] = useState("all");
-  const [signalBookmakerFilter, setSignalBookmakerFilter] = useState("all");
-  const [signalTypeFilter, setSignalTypeFilter] = useState("all");
-  const [minSignalSample, setMinSignalSample] = useState(1);
-  const [minSignalSimilarity, setMinSignalSimilarity] = useState(70);
-  const [actionableSignalsOnly, setActionableSignalsOnly] = useState(true);
+  const [debugOpen, setDebugOpen] = useState(false);
+  const [downloadMenuOpen, setDownloadMenuOpen] = useState(false);
   const [matchFilter, setMatchFilter] = useState<MatchFilter>("all");
-  const [sortMode, setSortMode] = useState<SortMode>("capture_desc");
+  const [sortMode, setSortMode] = useState<SortMode>("kickoff_asc");
   const [marketFilter, setMarketFilter] = useState("all_markets");
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [lastRun, setLastRun] = useState<CaptureRunResult | null>(null);
@@ -396,6 +417,8 @@ export default function Dashboard() {
   const [clientTimezone, setClientTimezone] = useState("-");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const selectedIdRef = useRef<string | null>(null);
+  const detailCacheRef = useRef<Map<string, MatchDetail>>(new Map());
+  const signalCacheRef = useRef<Map<string, HistoricalSignal[]>>(new Map());
   const didLoadInitialMatchesRef = useRef(false);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
   const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
@@ -411,6 +434,7 @@ export default function Dashboard() {
       q: matchQuery,
       filter: matchFilter,
       sort: sortMode,
+      date: selectedMatchDate,
       offset: String(offset),
       limit: String(MATCH_PAGE_SIZE),
     });
@@ -425,8 +449,8 @@ export default function Dashboard() {
     nextLogs: LogRow[],
     nextBookmakers: BookmakerCoverage[],
     nextExports: ExportFile[],
-    nextSignals: HistoricalSignal[],
     nextHistoricalImportStatus: HistoricalImportStatus,
+    nextMatchDays: MatchDay[],
   ) => {
     startTransition(() => {
       setStatus(nextStatus);
@@ -438,8 +462,8 @@ export default function Dashboard() {
       setLogs(nextLogs);
       setBookmakers(nextBookmakers);
       setExports(nextExports);
-      setSignals(nextSignals);
       setHistoricalImportStatus(nextHistoricalImportStatus);
+      setMatchDays(nextMatchDays);
       const currentSelectedId = selectedIdRef.current;
       if (
         (!currentSelectedId ||
@@ -467,8 +491,8 @@ export default function Dashboard() {
         nextLogs,
         nextBookmakers,
         nextExports,
-        nextSignals,
         nextHistoricalImportStatus,
+        nextMatchDays,
       ] = await Promise.all([
         api<Status>("/api/status"),
         api<MatchPageResult>(matchesPagePath(0)),
@@ -477,8 +501,8 @@ export default function Dashboard() {
         api<LogRow[]>("/api/logs"),
         api<BookmakerCoverage[]>("/api/bookmakers"),
         api<ExportFile[]>("/api/exports"),
-        api<HistoricalSignal[]>("/api/signals"),
         api<HistoricalImportStatus>("/api/historical/import-status"),
+        api<MatchDay[]>("/api/match-days"),
       ]);
       applyDashboardData(
         nextStatus,
@@ -488,8 +512,8 @@ export default function Dashboard() {
         nextLogs,
         nextBookmakers,
         nextExports,
-        nextSignals,
         nextHistoricalImportStatus,
+        nextMatchDays,
       );
     } catch (nextError) {
       setError(
@@ -569,12 +593,35 @@ export default function Dashboard() {
   useEffect(() => {
     if (!selectedId) {
       setDetail(null);
+      setSelectedSignals([]);
       return;
     }
     let active = true;
-    api<MatchDetail>(`/api/matches/${selectedId}`)
-      .then((nextDetail) => {
-        if (active) startTransition(() => setDetail(nextDetail));
+    const cachedDetail = detailCacheRef.current.get(selectedId);
+    const cachedSignals = signalCacheRef.current.get(selectedId);
+    if (cachedDetail) {
+      setDetail(cachedDetail);
+    } else {
+      setDetail((current) => (current?.match.id === selectedId ? current : null));
+    }
+    if (cachedSignals) {
+      setSelectedSignals(cachedSignals);
+    } else {
+      setSelectedSignals([]);
+    }
+    Promise.all([
+      api<MatchDetail>(`/api/matches/${selectedId}`),
+      api<HistoricalSignal[]>(`/api/signals/${selectedId}`),
+    ])
+      .then(([nextDetail, nextSignals]) => {
+        detailCacheRef.current.set(selectedId, nextDetail);
+        signalCacheRef.current.set(selectedId, nextSignals);
+        if (active) {
+          startTransition(() => {
+            setDetail(nextDetail);
+            setSelectedSignals(nextSignals);
+          });
+        }
       })
       .catch((nextError) =>
         setError(
@@ -591,7 +638,16 @@ export default function Dashboard() {
   useEffect(() => {
     if (!didLoadInitialMatchesRef.current) return;
     void loadMatchesPage(0, "replace");
-  }, [matchFilter, matchQuery, sortMode]);
+  }, [matchFilter, matchQuery, selectedMatchDate, sortMode]);
+
+  useEffect(() => {
+    if (matchDays.length === 0) return;
+    if (matchDays.some((day) => day.date === selectedMatchDate)) return;
+    const preferred = preferredMatchDate(matchDays, todayDateSlug());
+    if (preferred && preferred !== selectedMatchDate) {
+      setSelectedMatchDate(preferred);
+    }
+  }, [matchDays, selectedMatchDate]);
 
   const timezoneOffset = status?.betexplorer_timezone_offset ?? "+0";
 
@@ -691,40 +747,9 @@ export default function Dashboard() {
     () => marketCountsFor(detail?.bookmaker_odds ?? []),
     [detail],
   );
-  const filteredSignals = useMemo(() => {
-    const matchesWithPrimarySignals = new Set(
-      signals
-        .filter((signal) => signal.signal_type === "exact_odds" || signal.signal_type === "neighbor_odds")
-        .map((signal) => signal.match_id),
-    );
-    return signals.filter((signal) => {
-      const datasetOk =
-        signalDatasetFilter === "all" || signal.dataset === signalDatasetFilter;
-      const bookmakerOk =
-        signalBookmakerFilter === "all" ||
-        signal.normalized_bookmaker === signalBookmakerFilter;
-      const typeOk =
-        signalTypeFilter === "all" || signal.signal_type === signalTypeFilter;
-      const sampleOk = signal.sample_size >= minSignalSample;
-      const similarityOk = signal.similarity_score >= minSignalSimilarity;
-      const actionableOk =
-        !actionableSignalsOnly ||
-        signal.signal_type !== "one_draw" ||
-        matchesWithPrimarySignals.has(signal.match_id);
-      return datasetOk && bookmakerOk && typeOk && sampleOk && similarityOk && actionableOk;
-    });
-  }, [
-    actionableSignalsOnly,
-    minSignalSimilarity,
-    minSignalSample,
-    signalBookmakerFilter,
-    signalDatasetFilter,
-    signals,
-    signalTypeFilter,
-  ]);
-  const groupedSignals = useMemo(
-    () => groupHistoricalSignals(filteredSignals),
-    [filteredSignals],
+  const selectedSignalGroups = useMemo(
+    () => groupHistoricalSignals(selectedSignals),
+    [selectedSignals],
   );
 
   const selectedMatch =
@@ -737,6 +762,10 @@ export default function Dashboard() {
   const schedulerStateValue = useMemo(
     () => schedulerState(status, nowMs),
     [nowMs, status],
+  );
+  const topbarStats = useMemo(
+    () => buildTopbarStats(status, historicalImportStatus, nowMs, timezoneOffset),
+    [historicalImportStatus, nowMs, status, timezoneOffset],
   );
   const formatSchedule = (
     value: string | null | undefined,
@@ -806,11 +835,18 @@ export default function Dashboard() {
           method: "POST",
           body: JSON.stringify({ archive_played: true }),
         });
-        const [nextSignals, nextHistoricalImportStatus] = await Promise.all([
-          api<HistoricalSignal[]>("/api/signals"),
+        signalCacheRef.current.clear();
+        const currentSelectedId = selectedIdRef.current;
+        const [nextSelectedSignals, nextHistoricalImportStatus] = await Promise.all([
+          currentSelectedId
+            ? api<HistoricalSignal[]>(`/api/signals/${currentSelectedId}`)
+            : Promise.resolve([]),
           api<HistoricalImportStatus>("/api/historical/import-status"),
         ]);
-        setSignals(nextSignals);
+        if (currentSelectedId) {
+          signalCacheRef.current.set(currentSelectedId, nextSelectedSignals);
+        }
+        setSelectedSignals(nextSelectedSignals);
         setHistoricalImportStatus(nextHistoricalImportStatus);
       } catch (nextError) {
         setError(
@@ -829,11 +865,18 @@ export default function Dashboard() {
         await api<HistoricalImportResult>("/api/historical/import", {
           method: "POST",
         });
-        const [nextSignals, nextHistoricalImportStatus] = await Promise.all([
-          api<HistoricalSignal[]>("/api/signals"),
+        signalCacheRef.current.clear();
+        const currentSelectedId = selectedIdRef.current;
+        const [nextSelectedSignals, nextHistoricalImportStatus] = await Promise.all([
+          currentSelectedId
+            ? api<HistoricalSignal[]>(`/api/signals/${currentSelectedId}`)
+            : Promise.resolve([]),
           api<HistoricalImportStatus>("/api/historical/import-status"),
         ]);
-        setSignals(nextSignals);
+        if (currentSelectedId) {
+          signalCacheRef.current.set(currentSelectedId, nextSelectedSignals);
+        }
+        setSelectedSignals(nextSelectedSignals);
         setHistoricalImportStatus(nextHistoricalImportStatus);
       } catch (nextError) {
         setError(
@@ -856,6 +899,7 @@ export default function Dashboard() {
         </div>
         <nav className="nav">
           <a href="#overview" title={tooltipFor("Overview nav")}>
+            <Activity size={15} />
             Overview
           </a>
           {/* <a href="#matches" title={tooltipFor("Matches nav")}>Matches</a> */}
@@ -868,136 +912,141 @@ export default function Dashboard() {
             }
             title={tooltipFor("Match page nav")}
           >
+            <Table2 size={15} />
             Match page
           </a>
           <a href="#odds" title={tooltipFor("Odds nav")}>
+            <Database size={15} />
             Odds
           </a>
-          <a href="#signals" title="Jump to historical matching signals.">
+          <a href="/signals" title="Open historical matching signals page.">
+            <Activity size={15} />
             Signals
           </a>
           <a href="#attempts" title={tooltipFor("Attempts nav")}>
+            <Clock3 size={15} />
             Attempts
           </a>
           <a href="#exports" title={tooltipFor("Exports nav")}>
+            <Download size={15} />
             Exports
           </a>
         </nav>
-        <div className="side-note">
-          <span>Last run</span>
-          <strong title={tooltipFor("Last run")}>
-            {formatUtc(status?.last_run, true)}
-          </strong>
-          <small title={tooltipFor("Next run")}>
-            Next run{" "}
-            {status?.capture_progress?.running
-              ? "after current cycle"
-              : formatUtc(status?.next_run, true)}
-          </small>
-          <small title={tooltipFor("Next capture")}>
-            Next capture {formatSchedule(status?.next_capture, true)}
-          </small>
-          <small title={tooltipFor("Last odds")}>
-            Last odds {formatUtc(status?.last_capture, true)}
-          </small>
-          <small title={tooltipFor("Discovery")}>
-            Discovery{" "}
-            {formatSchedule(status?.capture_progress?.next_discovery_at, true)}
-          </small>
-          <small title={tooltipFor("Browser TZ")}>
-            Browser TZ {clientTimezone}
-          </small>
-          <small title={tooltipFor("BetExplorer TZ")}>
-            BetExplorer TZ UTC{status?.betexplorer_timezone_offset ?? "-"}
-          </small>
-          <small title={tooltipFor("Result capture")}>
-            Results {status?.result_captured_matches ?? 0} /{" "}
-            {status?.result_capture_lookback_hours ?? "-"}h lookback
-          </small>
-          <small>
-            {latestExport
-              ? `Latest export ${latestExport.filename}`
-              : "No exports yet"}
-          </small>
-          <span
-            className={`scheduler-state ${schedulerStateValue.className}`}
-            title={schedulerStateValue.detail}
-          >
-            {schedulerStateValue.label}
-          </span>
-          <div className="side-progress">
-            {progressItems.map((item) => (
-              <ProgressBar key={item.label} {...item} />
-            ))}
-          </div>
-        </div>
       </aside>
 
       <section className="workspace">
-        <header className="topbar">
-          <div>
-            <p className="eyeline">Local API: {API_BASE}</p>
-            <h2>
-              <span className="live-dot" />
-              Monitoring console
-            </h2>
+        <header className="client-topbar">
+          <div className="client-status-strip" aria-label="client status summary">
+            {topbarStats.map((item) => (
+              <StatusChip key={item.label} {...item} />
+            ))}
           </div>
-          <div className="actions">
+          <div className="topbar-actions">
             <button
+              type="button"
               onClick={() => void loadDashboardData()}
               disabled={isPending}
               title={tooltipFor("Refresh data")}
+              aria-label="Refresh data"
+              className="icon-action refresh-action"
             >
               <RefreshCcw className="refresh-icon" size={16} />
-              Refresh
             </button>
             <button
+              type="button"
               onClick={runCapture}
               disabled={isPending}
               title={tooltipFor("Run once")}
+              className="primary-action"
             >
               <Play size={16} />
-              Run once
+              Force recapture
             </button>
             <button
-              onClick={() => exportOdds("csv", "wide")}
+              type="button"
+              onClick={importHistoricalDatabase}
               disabled={isPending}
-              title={tooltipFor("Export CSV")}
+              title="Import DOCX historical database from the configured sample database folder."
+              className="icon-action"
+              data-testid="import-docx-trigger"
             >
-              <Download size={16} />
-              CSV
+              <Upload size={16} />
+              Import DOCX
             </button>
+            <div className="download-menu">
+              <button
+                type="button"
+                onClick={() => setDownloadMenuOpen((value) => !value)}
+                disabled={isPending}
+                title={tooltipFor("Exports")}
+                className="icon-action"
+                aria-expanded={downloadMenuOpen}
+                data-testid="download-menu-trigger"
+              >
+                <Download size={16} />
+                Download
+                <ChevronDown size={14} />
+              </button>
+              {downloadMenuOpen ? (
+                <div className="download-options" role="menu">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDownloadMenuOpen(false);
+                      exportOdds("csv", "wide");
+                    }}
+                  >
+                    CSV
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDownloadMenuOpen(false);
+                      exportOdds("csv", "long");
+                    }}
+                  >
+                    Long CSV
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDownloadMenuOpen(false);
+                      exportOdds("xlsx", "wide");
+                    }}
+                  >
+                    XLSX
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDownloadMenuOpen(false);
+                      exportOdds("xlsx", "long");
+                    }}
+                  >
+                    Long XLSX
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDownloadMenuOpen(false);
+                      exportPlayedArchive("csv");
+                    }}
+                  >
+                    Archive CSV
+                  </button>
+                </div>
+              ) : null}
+            </div>
             <button
-              onClick={() => exportOdds("csv", "long")}
-              disabled={isPending}
-              title={tooltipFor("Export long CSV")}
+              type="button"
+              onClick={() => setDebugOpen((value) => !value)}
+              className="icon-action details-toggle"
+              aria-expanded={debugOpen}
+              title="Show or hide technical details"
+              data-testid="details-toggle"
             >
-              <Download size={16} />
-              Long CSV
-            </button>
-            <button
-              onClick={() => exportOdds("xlsx", "wide")}
-              disabled={isPending}
-              title={tooltipFor("Export XLSX")}
-            >
-              <Download size={16} />
-              XLSX
-            </button>
-            <button
-              onClick={() => exportOdds("xlsx", "long")}
-              disabled={isPending}
-              title={tooltipFor("Export long XLSX")}
-            >
-              <Download size={16} />
-              Long XLSX
-            </button>
-            <button
-              onClick={() => exportPlayedArchive("csv")}
-              disabled={isPending}
-              title={tooltipFor("Export archive CSV")}
-            >
-              <Download size={16} />
-              Archive CSV
+              Details
+              <ChevronDown size={14} />
             </button>
           </div>
         </header>
@@ -1018,66 +1067,145 @@ export default function Dashboard() {
           </div>
         ) : null}
 
-        <section className="metrics" id="overview">
-          <Metric label="Matches" value={status?.matches} />
-          <Metric
-            label="Captured"
-            value={status?.captured_matches}
-            tone="good"
-          />
-          <Metric
-            label="Capture miss"
-            value={status?.capture_missed_matches}
-            tone="bad"
-          />
-          <Metric
-            label="Skipped old"
-            value={status?.skipped_out_of_window_matches}
-          />
-          <Metric
-            label="Due captures"
-            value={status?.due_matches}
-            tone="warn"
-          />
-          <Metric label="Results" value={status?.result_captured_matches} />
-          <Metric label="Final snapshots" value={status?.snapshots} />
-          <Metric label="Attempts" value={status?.snapshot_attempts} />
-          <Metric label="Bookmaker rows" value={status?.bookmaker_rows} />
-          <Metric label="Row attempts" value={status?.bookmaker_row_attempts} />
-          <Metric
-            label="Req complete"
-            value={status?.complete_snapshots}
-            tone="good"
-          />
-          <Metric
-            label="Req partial"
-            value={status?.partial_snapshots}
-            tone="warn"
-          />
-          <Metric
-            label="Req missing"
-            value={status?.failed_snapshots}
-            tone="bad"
-          />
-          <Metric label="Bookmakers" value={bookmakers.length} />
+        <section
+          className={debugOpen ? "debug-overview expanded" : "debug-overview"}
+          id="overview"
+        >
+          <div className="debug-head">
+            <div>
+              <h3>Technical details</h3>
+              <p>Scheduler, capture quality, bookmaker coverage, and export diagnostics.</p>
+            </div>
+            <span
+              className={`scheduler-state ${schedulerStateValue.className}`}
+              title={schedulerStateValue.detail}
+            >
+              {schedulerStateValue.label}
+            </span>
+          </div>
+          <div className="debug-body">
+            <div className="runtime-grid">
+              <Info label="Last run" value={formatUtc(status?.last_run, true)} />
+              <Info
+                label="Next run"
+                value={
+                  status?.capture_progress?.running
+                    ? "after current cycle"
+                    : formatUtc(status?.next_run, true)
+                }
+              />
+              <Info label="Next capture" value={formatSchedule(status?.next_capture, true)} />
+              <Info label="Last odds" value={formatUtc(status?.last_capture, true)} />
+              <Info
+                label="Discovery"
+                value={formatSchedule(status?.capture_progress?.next_discovery_at, true)}
+              />
+              <Info label="Browser TZ" value={clientTimezone} />
+              <Info
+                label="BetExplorer TZ"
+                value={`UTC${status?.betexplorer_timezone_offset ?? "-"}`}
+              />
+              <Info
+                label="Result capture"
+                value={`${status?.result_captured_matches ?? 0} / ${status?.result_capture_lookback_hours ?? "-"}h`}
+              />
+              <Info
+                label="Latest export"
+                value={latestExport ? latestExport.filename : "No exports yet"}
+              />
+            </div>
+            <div className="side-progress debug-progress">
+              {progressItems.map((item) => (
+                <ProgressBar key={item.label} {...item} />
+              ))}
+            </div>
+            <section className="metrics">
+              <Metric label="Matches" value={status?.matches} />
+              <Metric
+                label="Captured"
+                value={status?.captured_matches}
+                tone="good"
+              />
+              <Metric
+                label="Capture miss"
+                value={status?.capture_missed_matches}
+                tone="bad"
+              />
+              <Metric
+                label="Skipped old"
+                value={status?.skipped_out_of_window_matches}
+              />
+              <Metric
+                label="Due captures"
+                value={status?.due_matches}
+                tone="warn"
+              />
+              <Metric label="Results" value={status?.result_captured_matches} />
+              <Metric label="Final snapshots" value={status?.snapshots} />
+              <Metric label="Attempts" value={status?.snapshot_attempts} />
+              <Metric label="Bookmaker rows" value={status?.bookmaker_rows} />
+              <Metric label="Row attempts" value={status?.bookmaker_row_attempts} />
+              <Metric
+                label="Req complete"
+                value={status?.complete_snapshots}
+                tone="good"
+              />
+              <Metric
+                label="Req partial"
+                value={status?.partial_snapshots}
+                tone="warn"
+              />
+              <Metric
+                label="Req missing"
+                value={status?.failed_snapshots}
+                tone="bad"
+              />
+              <Metric label="Bookmakers" value={bookmakers.length} />
+            </section>
+            <section className="coverage-strip compact-coverage">
+              {bookmakers.map((bookmaker) => (
+                <div
+                  className={
+                    REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker)
+                      ? "coverage required"
+                      : "coverage"
+                  }
+                  key={bookmaker.normalized_bookmaker}
+                  title={`${bookmaker.bookmaker}: seen in ${bookmaker.matches} matches and ${bookmaker.rows} final odds rows.`}
+                >
+                  <span>{bookmaker.bookmaker}</span>
+                  <strong>{bookmaker.matches}</strong>
+                  <small>{formatUtc(bookmaker.last_seen)}</small>
+                </div>
+              ))}
+            </section>
+          </div>
         </section>
 
-        <section className="coverage-strip">
-          {bookmakers.map((bookmaker) => (
-            <div
-              className={
-                REQUIRED_BOOKMAKERS.has(bookmaker.normalized_bookmaker)
-                  ? "coverage required"
-                  : "coverage"
-              }
-              key={bookmaker.normalized_bookmaker}
-              title={`${bookmaker.bookmaker}: seen in ${bookmaker.matches} matches and ${bookmaker.rows} final odds rows.`}
-            >
-              <span>{bookmaker.bookmaker}</span>
-              <strong>{bookmaker.matches}</strong>
-              <small>{formatUtc(bookmaker.last_seen)}</small>
-            </div>
-          ))}
+        <section className="day-selector" aria-label="match day selector">
+          <button
+            type="button"
+            onClick={() => setSelectedMatchDate((value) => adjacentMatchDate(matchDays, value, -1) ?? value)}
+            disabled={!adjacentMatchDate(matchDays, selectedMatchDate, -1)}
+            title="Previous day with matches"
+          >
+            <ChevronLeft size={16} />
+          </button>
+          <div>
+            <CalendarDays size={16} />
+            <strong>{formatSelectedDay(selectedMatchDate)}</strong>
+            <small>
+              {selectedMatchDay(matchDays, selectedMatchDate)?.matches ?? 0} matches
+            </small>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSelectedMatchDate((value) => adjacentMatchDate(matchDays, value, 1) ?? value)}
+            disabled={!adjacentMatchDate(matchDays, selectedMatchDate, 1)}
+            title="Next day with matches"
+          >
+            <ChevronRight size={16} />
+          </button>
         </section>
 
         <section className="split">
@@ -1286,6 +1414,11 @@ export default function Dashboard() {
                   />
                 </div>
 
+                <SelectedSignalPanel
+                  groups={selectedSignalGroups}
+                  selectedMatch={selectedMatch}
+                />
+
                 <div className="section-stack">
                   <MiniTable title="Snapshots" icon={<Table2 size={15} />}>
                     <thead>
@@ -1298,7 +1431,7 @@ export default function Dashboard() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(detail?.snapshots ?? []).map((snapshot) => (
+                      {(detail?.snapshots ?? []).slice(0, DETAIL_TABLE_PREVIEW_ROWS).map((snapshot) => (
                         <tr key={snapshot.id}>
                           <td>{formatUtc(snapshot.captured_at)}</td>
                           <td>
@@ -1319,6 +1452,12 @@ export default function Dashboard() {
                       ))}
                     </tbody>
                   </MiniTable>
+                  {(detail?.snapshots.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
+                    <p className="table-note">
+                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.snapshots.length} snapshots.
+                      Open full page for the complete capture history.
+                    </p>
+                  ) : null}
 
                   <MiniTable
                     title="Match attempts"
@@ -1334,7 +1473,7 @@ export default function Dashboard() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(detail?.attempts ?? []).map((attempt) => (
+                      {(detail?.attempts ?? []).slice(0, DETAIL_TABLE_PREVIEW_ROWS).map((attempt) => (
                         <tr key={attempt.id}>
                           <td>{attempt.attempt_number}</td>
                           <td>
@@ -1355,191 +1494,18 @@ export default function Dashboard() {
                       ))}
                     </tbody>
                   </MiniTable>
+                  {(detail?.attempts.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
+                    <p className="table-note">
+                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.attempts.length} attempts.
+                      Open full page for the complete retry history.
+                    </p>
+                  ) : null}
                 </div>
               </>
             ) : (
               <p className="empty">No match selected.</p>
             )}
           </div>
-        </section>
-
-        <section className="panel signals-panel" id="signals">
-          <div className="panel-head">
-            <div>
-              <h3>Historical signals</h3>
-              <p>
-                {groupedSignals.length} match cards from {filteredSignals.length} signals ·{" "}
-                {historicalImportStatus
-                  ? `${historicalImportStatus.records} historical records from ${historicalImportStatus.files} DOCX files`
-                  : "Historical database status loading"}
-              </p>
-            </div>
-            <div className="toolbar">
-              <button
-                type="button"
-                onClick={importHistoricalDatabase}
-                disabled={isPending}
-                title="Manually rescan changed DOCX files from the configured historical database root, then recompute signals."
-              >
-                <Download size={16} />
-                Rescan DOCX
-              </button>
-              <button
-                type="button"
-                onClick={recomputeSignals}
-                disabled={isPending}
-                title="Recompute signals from imported historical records and archive played matches."
-              >
-                <RefreshCcw className="refresh-icon" size={16} />
-                Recompute
-              </button>
-              <label className="select-filter" title="Filter by historical dataset">
-                <Filter size={14} />
-                <select
-                  value={signalDatasetFilter}
-                  onChange={(event) => setSignalDatasetFilter(event.target.value)}
-                >
-                  <option value="all">All datasets</option>
-                  <option value="Odds">Odds</option>
-                  <option value="Usable Odds">Usable Odds</option>
-                </select>
-              </label>
-              <label className="select-filter" title="Filter by required bookmaker">
-                <Filter size={14} />
-                <select
-                  value={signalBookmakerFilter}
-                  onChange={(event) => setSignalBookmakerFilter(event.target.value)}
-                >
-                  <option value="all">All bookmakers</option>
-                  <option value="bwin">Bwin</option>
-                  <option value="unibet">Unibet</option>
-                </select>
-              </label>
-              <label className="select-filter" title="Filter by signal type">
-                <Filter size={14} />
-                <select
-                  value={signalTypeFilter}
-                  onChange={(event) => setSignalTypeFilter(event.target.value)}
-                >
-                  <option value="all">All signals</option>
-                  <option value="exact_odds">Exact odds</option>
-                  <option value="neighbor_odds">Neighbor odds</option>
-                  <option value="one_draw">One draw</option>
-                </select>
-              </label>
-              <label className="sample-filter" title="Minimum historical sample size">
-                Min sample
-                <input
-                  type="number"
-                  min={1}
-                  value={minSignalSample}
-                  onChange={(event) =>
-                    setMinSignalSample(Math.max(1, Number(event.target.value) || 1))
-                  }
-                />
-              </label>
-              <label className="sample-filter" title="Minimum historical odds similarity">
-                Min similarity
-                <input
-                  type="number"
-                  min={0}
-                  max={100}
-                  value={minSignalSimilarity}
-                  onChange={(event) =>
-                    setMinSignalSimilarity(Math.min(100, Math.max(0, Number(event.target.value) || 0)))
-                  }
-                />
-              </label>
-              <label className="toggle" title="Show exact/neighbor matches first and hide one-draw-only noise">
-                <input
-                  type="checkbox"
-                  checked={actionableSignalsOnly}
-                  onChange={(event) => setActionableSignalsOnly(event.target.checked)}
-                />
-                Actionable only
-              </label>
-            </div>
-          </div>
-          <div className="signal-status">
-            <span>
-              Import root{" "}
-              <strong>
-                {historicalImportStatus?.root_exists ? "available" : "missing"}
-              </strong>
-            </span>
-            <span>
-              Warnings <strong>{historicalImportStatus?.warnings ?? 0}</strong>
-            </span>
-            <span>
-              Last import{" "}
-              <strong>{formatUtc(historicalImportStatus?.last_import)}</strong>
-            </span>
-          </div>
-          {groupedSignals.length > 0 ? (
-            <div className="signal-grid" aria-label="compact actionable feed">
-              {groupedSignals.slice(0, 24).map((group) => (
-                <article className="signal-card signal-feed-card" key={group.id}>
-                  <div className="signal-card-head">
-                    <div>
-                      <span className="signal-type">
-                        {group.signal_types.map(signalTypeLabel).join(" + ")}
-                      </span>
-                      <span
-                        className={similarityBadgeClass(group.bestSignal)}
-                        title={`${group.bestSignal.similarity_score} similarity score`}
-                      >
-                        {signalSimilarityBadge(group.bestSignal)}
-                      </span>
-                      <strong>
-                        {group.home_team} - {group.away_team}
-                      </strong>
-                      <small>
-                        {group.datasets.join(" + ")} ·{" "}
-                        {formatSchedule(group.kickoff_time)}
-                      </small>
-                      <small>{signalPrimaryReason(group.bestSignal)}</small>
-                      <small>Signal strength {signalStrengthLabel(group.bestSignal)}</small>
-                    </div>
-                    <span className="signal-sample">{group.bestSignal.sample_size}</span>
-                  </div>
-                  <div className="signal-odds signal-bookmakers">
-                    <span>
-                      Bwin <strong>{signalGroupBookmakerOdds(group, "bwin")}</strong>
-                    </span>
-                    <span>
-                      Unibet <strong>{signalGroupBookmakerOdds(group, "unibet")}</strong>
-                    </span>
-                  </div>
-                  <div className="signal-stats">
-                    <Info label="Home Win %" value={formatPct(group.bestSignal.home_win_pct)} />
-                    <Info label="Draw %" value={formatPct(group.bestSignal.draw_pct)} />
-                    <Info label="Away Win %" value={formatPct(group.bestSignal.away_win_pct)} />
-                    <Info label="Over 2.5" value={formatPct(group.bestSignal.over_2_5_pct)} />
-                    <Info label="BTTS" value={formatPct(group.bestSignal.btts_pct)} />
-                    <Info
-                      label="Double Chance"
-                      value={`1X ${formatPct(group.bestSignal.double_chance_1x_pct)} · X2 ${formatPct(group.bestSignal.double_chance_x2_pct)} · 12 ${formatPct(group.bestSignal.double_chance_12_pct)}`}
-                    />
-                  </div>
-                  <div className="score-strip">
-                    <small>Top historical outcomes</small>
-                    {group.historical_scores.slice(0, 8).map((score, index) => (
-                      <span key={`${group.id}-${score}-${index}`}>{score}</span>
-                    ))}
-                  </div>
-                  <a className="explain-link" href={`/match?id=${encodeURIComponent(group.match_id)}`}>
-                    Explain signal
-                  </a>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <p className="empty">
-              {historicalImportStatus?.records === 0
-                ? "Historical DOCX index is empty."
-                : "No historical match for current Bwin/Unibet odds."}
-            </p>
-          )}
         </section>
 
         <section className="panel" id="odds">
@@ -1814,6 +1780,18 @@ function Metric({
   );
 }
 
+function StatusChip({ label, value, detail, icon, tone }: TopbarStat) {
+  return (
+    <div className={`status-chip ${tone ?? ""}`} title={detail}>
+      <span className="status-chip-icon">{icon}</span>
+      <span>
+        <small>{label}</small>
+        <strong>{value}</strong>
+      </span>
+    </div>
+  );
+}
+
 function Info({ label, value }: { label: string; value: string }) {
   return (
     <div
@@ -1822,6 +1800,116 @@ function Info({ label, value }: { label: string; value: string }) {
     >
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function SelectedSignalPanel({
+  groups,
+  selectedMatch,
+}: {
+  groups: HistoricalSignalGroup[];
+  selectedMatch: MatchRow;
+}) {
+  const bestGroup = groups[0];
+  const bestSignal = bestGroup?.bestSignal;
+
+  return (
+    <section className="selected-signal-panel">
+      <div className="selected-signal-head">
+        <div>
+          <h4>Historical similarity</h4>
+          <p>
+            Current final pre-match odds compared with Odds and Gebruikbare odds.
+          </p>
+        </div>
+        {bestSignal ? (
+          <span className="signal-sample">n={bestSignal.sample_size}</span>
+        ) : null}
+      </div>
+
+      {!bestSignal ? (
+        <div className="selected-signal-empty">
+          <strong>
+            {selectedMatch.has_bwin || selectedMatch.has_unibet
+              ? "No historical signal for this match yet"
+              : "Waiting for Bwin / Unibet final 1X2 odds"}
+          </strong>
+          <span>
+            Signals appear here when the selected match has comparable final
+            pre-match odds in the historical database, including archived played
+            matches collected by this system.
+          </span>
+        </div>
+      ) : (
+        <div className="selected-signal-body">
+          <div className="selected-signal-main">
+            <div>
+              <span className="signal-type">
+                {signalTypeLabel(bestSignal.signal_type)}
+              </span>
+              <span className={similarityBadgeClass(bestSignal)}>
+                {signalSimilarityBadge(bestSignal)}
+              </span>
+            </div>
+            <strong>{signalPrimaryReason(bestSignal)}</strong>
+            <small>
+              {bestGroup.datasets.join(" + ")} · Signal strength{" "}
+              {signalStrengthLabel(bestSignal)} · {groups.length} matched
+              pattern{groups.length === 1 ? "" : "s"}
+            </small>
+            <div className="signal-bookmakers compact">
+              <span>
+                Bwin <strong>{signalGroupBookmakerOdds(bestGroup, "bwin")}</strong>
+              </span>
+              <span>
+                Unibet{" "}
+                <strong>{signalGroupBookmakerOdds(bestGroup, "unibet")}</strong>
+              </span>
+            </div>
+          </div>
+
+          <div className="selected-outcomes">
+            <OutcomeBar label="Home" value={bestSignal.home_win_pct} />
+            <OutcomeBar label="Draw" value={bestSignal.draw_pct} />
+            <OutcomeBar label="Away" value={bestSignal.away_win_pct} />
+          </div>
+
+          <div className="selected-signal-stats">
+            <Info label="Over 0.5" value={formatPct(bestSignal.over_0_5_pct)} />
+            <Info label="Over 1.5" value={formatPct(bestSignal.over_1_5_pct)} />
+            <Info label="Over 2.5" value={formatPct(bestSignal.over_2_5_pct)} />
+            <Info label="BTTS" value={formatPct(bestSignal.btts_pct)} />
+            <Info
+              label="Double chance"
+              value={`1X ${formatPct(bestSignal.double_chance_1x_pct)} · X2 ${formatPct(bestSignal.double_chance_x2_pct)} · 12 ${formatPct(bestSignal.double_chance_12_pct)}`}
+            />
+            <Info label="Sample size" value={String(bestSignal.sample_size)} />
+          </div>
+
+          {bestSignal.historical_scores.length > 0 ? (
+            <div className="score-strip compact">
+              <small>Top scores from selected signal</small>
+              {bestSignal.historical_scores.slice(0, 10).map((score, index) => (
+                <span key={`${bestSignal.id}-${score}-${index}`}>{score}</span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OutcomeBar({ label, value }: { label: string; value: number | null }) {
+  const width = Math.max(0, Math.min(100, value ?? 0));
+  return (
+    <div className="outcome-bar">
+      <span>{label}</span>
+      <strong>{formatPct(value)}</strong>
+      <div>
+        <i style={{ width: `${width}%` }} />
+      </div>
     </div>
   );
 }
@@ -2390,6 +2478,62 @@ function schedulerState(status: Status | null, nowMs: number): SchedulerState {
   };
 }
 
+function buildTopbarStats(
+  status: Status | null,
+  historicalImportStatus: HistoricalImportStatus | null,
+  nowMs: number,
+  timezoneOffset: string,
+): TopbarStat[] {
+  const apiRunning = Boolean(status);
+  const captureRunning = Boolean(status?.capture_progress?.running);
+  const nextCaptureMs = status?.next_capture
+    ? parseLocalApiDate(status.next_capture, timezoneOffset).getTime()
+    : null;
+  const lastCaptureMs = status?.last_capture
+    ? parseUtcApiDate(status.last_capture).getTime()
+    : null;
+  const monitored = status?.due_matches ?? status?.capture_progress?.due ?? 0;
+  return [
+    {
+      label: "API",
+      value: apiRunning ? "Running" : "Offline",
+      detail: `Local API: ${API_BASE}`,
+      icon: <Server size={15} />,
+      tone: apiRunning ? "good" : "bad",
+    },
+    {
+      label: "Historical DB",
+      value: `${historicalImportStatus?.records ?? 0} records`,
+      detail: historicalImportStatus?.root_exists
+        ? `${historicalImportStatus.files} DOCX files indexed`
+        : "Configured historical database root is missing",
+      icon: <Database size={15} />,
+      tone: historicalImportStatus?.root_exists ? "good" : "warn",
+    },
+    {
+      label: "Last capture",
+      value: lastCaptureMs ? agoLabel(nowMs - lastCaptureMs) : "-",
+      detail: `Last odds snapshot: ${status?.last_capture ?? "none"}`,
+      icon: <Clock3 size={15} />,
+      tone: captureRunning ? "good" : "idle",
+    },
+    {
+      label: "Next capture",
+      value: nextCaptureMs ? dueLabel(nextCaptureMs - nowMs) : "-",
+      detail: `Next scheduled capture: ${status?.next_capture ?? "none"}`,
+      icon: <Activity size={15} />,
+      tone: nextCaptureMs && nextCaptureMs <= nowMs ? "warn" : "idle",
+    },
+    {
+      label: "Due capture",
+      value: `${monitored} matches`,
+      detail: `${status?.matches ?? 0} total matches, ${status?.due_matches ?? 0} due captures`,
+      icon: <Table2 size={15} />,
+      tone: monitored > 0 ? "warn" : "good",
+    },
+  ];
+}
+
 function buildProgress(
   status: Status | null,
   match: MatchRow | null,
@@ -2509,6 +2653,71 @@ function relativeTime(ms: number) {
   return value;
 }
 
+function agoLabel(ms: number) {
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  if (ms < 60_000) return "just now";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function dueLabel(ms: number) {
+  if (!Number.isFinite(ms)) return "-";
+  if (ms <= 0) return "due now";
+  if (ms < 60_000) return "<1 min";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+function todayDateSlug() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function preferredMatchDate(days: MatchDay[], targetDate: string) {
+  if (days.length === 0) return targetDate;
+  if (days.some((day) => day.date === targetDate)) return targetDate;
+  const target = new Date(`${targetDate}T00:00:00`).getTime();
+  return [...days]
+    .sort((left, right) => {
+      const leftTime = new Date(`${left.date}T00:00:00`).getTime();
+      const rightTime = new Date(`${right.date}T00:00:00`).getTime();
+      const leftFuture = leftTime >= target ? 0 : 1;
+      const rightFuture = rightTime >= target ? 0 : 1;
+      if (leftFuture !== rightFuture) return leftFuture - rightFuture;
+      return Math.abs(leftTime - target) - Math.abs(rightTime - target);
+    })[0]?.date;
+}
+
+function selectedMatchDay(days: MatchDay[], selectedDate: string) {
+  return days.find((day) => day.date === selectedDate);
+}
+
+function adjacentMatchDate(days: MatchDay[], selectedDate: string, direction: -1 | 1) {
+  const sorted = [...days].sort((left, right) => left.date.localeCompare(right.date));
+  const index = sorted.findIndex((day) => day.date === selectedDate);
+  if (index === -1) return null;
+  return sorted[index + direction]?.date ?? null;
+}
+
+function formatSelectedDay(value: string) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en", {
+    day: "2-digit",
+    month: "long",
+    year: "numeric",
+  }).format(date);
+}
+
 function signalTypeLabel(value: string) {
   const labels: Record<string, string> = {
     exact_odds: "Exact odds",
@@ -2578,7 +2787,9 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "one_draw") return `Draw-only ${formatPct(signal.similarity_score)}`;
+  if (signal.signal_type === "exact_odds") return "Exact odds";
+  if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
+  if (signal.signal_type === "one_draw") return "Draw-only";
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 

@@ -85,74 +85,82 @@ def test_dashboard_tooltips_explain_metrics_with_operational_context() -> None:
         "This is separate from odds capture",
         'title={tooltipFor("Overview nav")}',
         'title={tooltipFor("Refresh data")}',
-        'title={tooltipFor("Export long CSV")}',
+        'data-testid="download-menu-trigger"',
+        'data-testid="import-docx-trigger"',
+        "Import DOCX",
+        "importHistoricalDatabase",
     ]
 
     for phrase in expected_phrases:
         assert phrase in page
 
 
-def test_dashboard_renders_historical_signal_controls() -> None:
+def test_dashboard_moves_historical_signals_to_separate_page() -> None:
     page = read_repo_file("apps/desktop/web/app/page.tsx")
+    signals_page = read_repo_file("apps/desktop/web/app/signals/page.tsx")
+
+    assert '<section className="panel signals-panel" id="signals">' not in page
+    assert 'href="/signals"' in page
 
     expected_phrases = [
-        "Historical signals",
-        "api<HistoricalSignal[]>(\"/api/signals\")",
+        "Signal monitor",
+        "\"/api/signals?actionable_only=true\"",
         "api<HistoricalImportStatus>(\"/api/historical/import-status\")",
-        "api<HistoricalImportResult>(\"/api/historical/import\"",
-        "api<SignalRecomputeResult>(\"/api/signals/recompute\"",
-        "api<ExportResult>(\"/api/exports/played-archive\"",
-        "exportPlayedArchive",
-        "Export archive CSV",
-        "signalDatasetFilter",
-        "signalBookmakerFilter",
-        "signalTypeFilter",
-        "minSignalSample",
-        "minSignalSimilarity",
-        "actionableSignalsOnly",
-        "Min similarity",
-        "Actionable only",
+        "api(\"/api/signals/recompute\"",
         "similarityBadgeClass",
-        "Home Win %",
+        "Actionable",
         "BTTS",
-        "Double Chance",
-        "groupedSignals",
-        "signalGroupBookmakerOdds(group, \"bwin\")",
-        "signalGroupBookmakerOdds(group, \"unibet\")",
+        "Sorted by match quality",
+        "Match type / Historical sample",
+        "Historical archive",
+        "Backfill historical date",
+        "Current monitored matches are archived automatically",
+        "archiveSignalsPath",
+        "api<SignalDay[]>(\"/api/signal-days\")",
+        "Previous day with signals",
+        "Best match first",
+        "The API is busy with this job, not offline.",
+        "bookmakerSourceLabel",
+        "samples",
+        "ArchiveProgressBar",
+        "api<ApiStatus>(\"/api/status\")",
+        "Capturing final odds and scores",
+        "completed / total",
+        "date <strong>{archiveResult.date}</strong>",
+        "no archive signals were created",
+        "setArchiveResult(null)",
+        "setArchiveProgress(null)",
     ]
 
     for phrase in expected_phrases:
-        assert phrase in page
+        assert phrase in signals_page
 
 
 def test_dashboard_renders_actionable_signal_feed() -> None:
-    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    signals_page = read_repo_file("apps/desktop/web/app/signals/page.tsx")
     styles = read_repo_file("apps/desktop/web/app/globals.css")
 
     expected_phrases = [
-        "compact actionable feed",
-        "signalSimilarityBadge",
-        "signalPrimaryReason",
-        "group.bestSignal.similarity_score",
-        "Explain signal",
-        "signalStrengthLabel",
-        "Top historical outcomes",
-        "No historical match for current Bwin/Unibet odds",
+        "visibleGroups.slice(0, 160).map",
+        "groupSignals(signals)",
+        "bookmakerOdds(group, \"bwin\")",
+        "bookmakerOdds(group, \"unibet\")",
+        "current_home_odds",
     ]
 
     for phrase in expected_phrases:
-        assert phrase in page
+        assert phrase in signals_page
     assert ".similarity-badge" in styles
-    assert ".signal-feed-card" in styles
-    assert ".outcome-bars" in styles
+    assert ".signal-row" in styles
+    assert ".signal-table-head" in styles
 
 
 def test_dashboard_labels_one_draw_similarity_as_draw_only_not_full_confidence() -> None:
-    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    page = read_repo_file("apps/desktop/web/app/match/page.tsx")
     styles = read_repo_file("apps/desktop/web/app/globals.css")
 
     assert 'signal.signal_type === "one_draw"' in page
-    assert "Draw-only ${formatPct(signal.similarity_score)}" in page
+    assert 'return "Draw-only";' in page
     assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
     assert ".similarity-badge.draw-only" in styles
 
@@ -177,6 +185,34 @@ def test_dashboard_uses_chunked_match_acquisition_and_render_derender_hints() ->
     assert "contain-intrinsic-size" in css
 
 
+def test_dashboard_defaults_match_list_to_kickoff_time_and_selected_signals() -> None:
+    page = read_repo_file("apps/desktop/web/app/page.tsx")
+    api = read_repo_file("apps/api/src/betexplorer_scraper/api.py")
+    database = read_repo_file("apps/api/src/betexplorer_scraper/database.py")
+
+    assert 'useState<SortMode>("kickoff_asc")' in page
+    assert "SelectedSignalPanel" in page
+    assert "Historical similarity" in page
+    assert "Current final pre-match odds compared with Odds and Gebruikbare odds" in page
+    assert 'from_date: str = ""' in api
+    assert "CAST(kickoff_time AS DATE) >= ?" in database
+
+
+def test_match_page_preserves_deep_link_selection_before_loading_day_list() -> None:
+    match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+
+    expected_phrases = [
+        "didInitialLoadRef",
+        "requestedDetail?.match ?? null",
+        "requestedMatch &&",
+        "setDetail(requestedDetail)",
+        "if (!didInitialLoadRef.current) return;",
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in match_page
+
+
 def test_dashboard_polling_splits_fast_status_from_heavy_full_refresh() -> None:
     page = read_repo_file("apps/desktop/web/app/page.tsx")
 
@@ -197,7 +233,11 @@ def test_selected_match_odds_rows_render_incrementally() -> None:
     assert "filteredBookmakers.map((row)" not in page
     assert "oddsListMoreRef" in page
     assert "Load more odds rows" in page
-    assert "startTransition(() => setDetail(nextDetail))" in page
+    assert "detailCacheRef" in page
+    assert "signalCacheRef" in page
+    assert 'api<HistoricalSignal[]>(`/api/signals/${selectedId}`)' in page
+    assert "Top scores from selected signal" in page
+    assert "bestGroup.historical_scores.slice" not in page
 
     assert "ODDS_RENDER_BATCH" in match_page
     assert "renderedGroupedOddsRows" in match_page

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +95,85 @@ class CaptureService:
                     last_error=str(exc),
                 )
                 raise
+
+    async def archive_football_date(self, target_date: date) -> dict[str, int]:
+        async with self._run_lock:
+            return await self._archive_football_date_locked(target_date)
+
+    async def _archive_football_date_locked(self, target_date: date) -> dict[str, int]:
+        archive_now = datetime.combine(target_date, time(23, 59))
+        self._progress = {
+            **self._idle_progress(),
+            "running": True,
+            "trigger": "archive_date",
+            "phase": "archive_discovery",
+            "started_at": utc_now().isoformat(),
+        }
+        page = await self.transport.fetch_football_date(target_date)
+        parsed_matches = self.discovery_parser.parse_homepage(page.text, archive_now)
+        matches = [
+            match
+            for match in parsed_matches
+            if match.kickoff_time is not None and match.kickoff_time.date() == target_date
+        ]
+        discovered = len(matches)
+        captured = 0
+        complete = 0
+        failed = 0
+        results_captured = 0
+        results_checked = 0
+        self._set_progress(discovered=discovered, due=discovered, queued=discovered, phase="archive_capturing")
+
+        for index, match in enumerate(matches, start=1):
+            self._set_progress(active=1, completed=index - 1, current_event_id=match.event_id)
+            await self._enrich_kickoff_from_match_page_if_needed(match, archive_now)
+            match.timing_status = TimingStatus.FINISHED
+            match.status = "finished"
+            match_id = self.database.upsert_match(match)
+            self.database.update_match_schedule(match_id, "FINALIZED", None, utc_now())
+            saved, market_complete = await self.capture_match_market(match_id, match.event_id, match.source_url, "1x2")
+            captured += 1 if saved else 0
+            complete += 1 if market_complete else 0
+            failed += 0 if saved else 1
+
+            score = match.live_score
+            if not score:
+                results_checked += 1
+                try:
+                    match_page = await self._fetch_match_page_cached(match.source_url)
+                    finished, parsed_score = self.discovery_parser.parse_match_page_result(match_page)
+                    # Historical date pages are already past dates. Some archived match
+                    # pages expose the full-time score without the structured Finished
+                    # marker, so keeping the parsed score is safer than dropping it.
+                    score = parsed_score if finished or parsed_score else None
+                except Exception as exc:
+                    self.database.log("warning", "archive", "archive_result_lookup_failed", match.event_id, {"error": str(exc)})
+            if score and self.database.mark_result_captured(match_id, score, utc_now()):
+                results_captured += 1
+            self._set_progress(
+                captured=captured,
+                failed=failed,
+                completed=index,
+                results_captured=results_captured,
+                results_checked=results_checked,
+            )
+
+        archive = self.database.archive_played_matches()
+        recompute = self.database.recompute_historical_signals()
+        result = {
+            "date": target_date.isoformat(),
+            "discovered": discovered,
+            "captured": captured,
+            "complete": complete,
+            "failed": failed,
+            "results_captured": results_captured,
+            "results_checked": results_checked,
+            "archived": archive["archived"],
+            "signals": recompute["signals"],
+            "matches_evaluated": recompute["matches_evaluated"],
+        }
+        self._set_progress(running=False, active=0, phase="archive_complete", finished_at=utc_now().isoformat())
+        return result
 
     async def _run_once_locked(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
         now = now or datetime.now()
@@ -427,8 +506,8 @@ class CaptureService:
                     event_id,
                     {"market": market, "quality": quality.value, "bookmakers": len(odds)},
                 )
-                if odds:
-                    return True, quality.value == "COMPLETE"
+                if quality.value == "COMPLETE":
+                    return True, True
             except Exception as exc:
                 self.database.save_attempt(match_id, event_id, source_url, attempt, "ERROR", str(exc), {}, started, utc_now())
                 self.database.log("error", "capture", "capture_failed", event_id, {"market": market, "attempt": attempt, "error": str(exc)})

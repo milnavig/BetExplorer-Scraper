@@ -3,6 +3,9 @@
 import {
   Activity,
   ArrowLeft,
+  CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   ExternalLink,
   Filter,
@@ -16,7 +19,9 @@ import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const REQUIRED_BOOKMAKERS = new Set(["bwin", "unibet"]);
 const MATCH_RENDER_BATCH = 80;
+const MATCH_PAGE_SIZE = 120;
 const ODDS_RENDER_BATCH = 160;
+const DETAIL_TABLE_PREVIEW_ROWS = 80;
 
 type MatchRow = {
   id: string;
@@ -102,6 +107,20 @@ type MatchDetail = {
   attempts: AttemptRow[];
 };
 
+type MatchPageResult = {
+  items: MatchRow[];
+  total: number;
+  offset: number;
+  limit: number;
+};
+
+type MatchDay = {
+  date: string;
+  matches: number;
+  due_or_scheduled: number;
+  active: number;
+};
+
 type HistoricalSignal = {
   id: string;
   match_id: string;
@@ -168,6 +187,9 @@ async function api<T>(path: string): Promise<T> {
 
 export default function MatchPage() {
   const [matches, setMatches] = useState<MatchRow[]>([]);
+  const [matchesTotal, setMatchesTotal] = useState(0);
+  const [matchDays, setMatchDays] = useState<MatchDay[]>([]);
+  const [selectedMatchDate, setSelectedMatchDate] = useState(() => todayDateSlug());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<MatchDetail | null>(null);
   const [signals, setSignals] = useState<HistoricalSignal[]>([]);
@@ -178,8 +200,10 @@ export default function MatchPage() {
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isPending, startTransition] = useTransition();
+  const [isLoadingMatches, setIsLoadingMatches] = useState(false);
   const [clientTimezone, setClientTimezone] = useState("-");
   const selectedIdRef = useRef<string | null>(null);
+  const didInitialLoadRef = useRef(false);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
   const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
   const [matchRenderLimit, setMatchRenderLimit] = useState(MATCH_RENDER_BATCH);
@@ -189,22 +213,89 @@ export default function MatchPage() {
     selectedIdRef.current = selectedId;
   }, [selectedId]);
 
-  const loadMatches = async () => {
-    setError(null);
-    const [nextMatches, nextStatus] = await Promise.all([api<MatchRow[]>("/api/matches"), api<Status>("/api/status")]);
-    setMatches(nextMatches);
-    setStatus(nextStatus);
-    const params = new URLSearchParams(window.location.search);
-    const requestedId = params.get("id");
+  const matchesPagePath = (date: string, offset: number) => {
+    const params = new URLSearchParams({
+      q: matchQuery,
+      filter: "all",
+      sort: "kickoff_asc",
+      date,
+      offset: String(offset),
+      limit: String(MATCH_PAGE_SIZE),
+    });
+    return `/api/matches-page?${params.toString()}`;
+  };
+
+  const applyMatchesPage = (
+    nextPage: MatchPageResult,
+    mode: "replace" | "append",
+    requestedId?: string | null,
+    requestedMatch?: MatchRow | null,
+  ) => {
+    const pageItems =
+      mode === "replace" &&
+      requestedMatch &&
+      !nextPage.items.some((match) => match.id === requestedMatch.id)
+        ? [requestedMatch, ...nextPage.items]
+        : nextPage.items;
+    setMatches((current) =>
+      mode === "append" ? [...current, ...pageItems] : pageItems,
+    );
+    setMatchesTotal(nextPage.total);
+    if (mode !== "replace") return;
+    setMatchRenderLimit(MATCH_RENDER_BATCH);
     const currentSelectedId = selectedIdRef.current;
     const nextId =
-      requestedId && nextMatches.some((match) => match.id === requestedId)
+      requestedId && pageItems.some((match) => match.id === requestedId)
         ? requestedId
-        : currentSelectedId && nextMatches.some((match) => match.id === currentSelectedId)
+        : currentSelectedId && pageItems.some((match) => match.id === currentSelectedId)
           ? currentSelectedId
-          : nextMatches[0]?.id ?? null;
+          : pageItems[0]?.id ?? null;
     selectedIdRef.current = nextId;
     setSelectedId(nextId);
+  };
+
+  const loadMatchesPage = async (
+    date = selectedMatchDate,
+    offset = 0,
+    mode: "replace" | "append" = "replace",
+    requestedId?: string | null,
+    requestedMatch?: MatchRow | null,
+  ) => {
+    setIsLoadingMatches(true);
+    try {
+      const nextPage = await api<MatchPageResult>(matchesPagePath(date, offset));
+      applyMatchesPage(nextPage, mode, requestedId, requestedMatch);
+    } finally {
+      setIsLoadingMatches(false);
+    }
+  };
+
+  const loadMatches = async () => {
+    setError(null);
+    const params = new URLSearchParams(window.location.search);
+    const requestedId = params.get("id");
+    const [nextStatus, nextMatchDays, requestedDetail] = await Promise.all([
+      api<Status>("/api/status"),
+      api<MatchDay[]>("/api/match-days"),
+      requestedId
+        ? api<MatchDetail>(`/api/matches/${requestedId}`).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+    setStatus(nextStatus);
+    setMatchDays(nextMatchDays);
+    const requestedDate = requestedDetail?.match.kickoff_time?.slice(0, 10);
+    const nextDate =
+      requestedDate
+        ? requestedDate
+        : preferredMatchDate(nextMatchDays, todayDateSlug()) ?? todayDateSlug();
+    if (requestedDetail) {
+      selectedIdRef.current = requestedDetail.match.id;
+      setSelectedId(requestedDetail.match.id);
+      setDetail(requestedDetail);
+    }
+    setSelectedMatchDate(nextDate);
+    await loadMatchesPage(nextDate, 0, "replace", requestedId, requestedDetail?.match ?? null);
+    didInitialLoadRef.current = true;
   };
 
   useEffect(() => {
@@ -237,31 +328,36 @@ export default function MatchPage() {
     };
   }, [selectedId]);
 
-  const visibleMatches = useMemo(() => {
-    const query = matchQuery.trim().toLowerCase();
-    return matches.filter((match) => {
-      if (!query) return true;
-      return [match.event_id, match.league, match.home_team, match.away_team, match.capture_phase, match.quality_status]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(query);
-    });
-  }, [matchQuery, matches]);
+  const visibleMatches = useMemo(() => matches, [matches]);
 
   useEffect(() => {
     setMatchRenderLimit(MATCH_RENDER_BATCH);
-  }, [matchQuery]);
+  }, [matchQuery, selectedMatchDate]);
+
+  useEffect(() => {
+    if (!didInitialLoadRef.current) return;
+    if (matchDays.length === 0) return;
+    void loadMatchesPage(selectedMatchDate, 0, "replace");
+  }, [matchQuery, selectedMatchDate]);
 
   const renderedMatches = useMemo(
     () => visibleMatches.slice(0, matchRenderLimit),
     [matchRenderLimit, visibleMatches],
   );
-  const hasMoreMatches = renderedMatches.length < visibleMatches.length;
-  const loadMoreMatches = () =>
-    setMatchRenderLimit((value) =>
-      Math.min(value + MATCH_RENDER_BATCH, visibleMatches.length),
-    );
+  const hasMoreLoadedMatches = renderedMatches.length < visibleMatches.length;
+  const hasMoreServerMatches = matches.length < matchesTotal;
+  const hasMoreMatches = hasMoreLoadedMatches || hasMoreServerMatches;
+  const loadMoreMatches = () => {
+    if (hasMoreLoadedMatches) {
+      setMatchRenderLimit((value) =>
+        Math.min(value + MATCH_RENDER_BATCH, visibleMatches.length),
+      );
+      return;
+    }
+    if (hasMoreServerMatches && !isLoadingMatches) {
+      void loadMatchesPage(selectedMatchDate, matches.length, "append");
+    }
+  };
 
   useEffect(() => {
     const node = matchListMoreRef.current;
@@ -274,7 +370,7 @@ export default function MatchPage() {
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [hasMoreMatches, visibleMatches.length]);
+  }, [hasMoreMatches, isLoadingMatches, matches.length, selectedMatchDate, visibleMatches.length]);
 
   const filteredOdds = useMemo(() => {
     const query = oddsQuery.trim().toLowerCase();
@@ -358,6 +454,8 @@ export default function MatchPage() {
 
   const selectMatch = (id: string) => {
     selectedIdRef.current = id;
+    setDetail(null);
+    setSignals([]);
     setSelectedId(id);
     window.history.replaceState(null, "", `/match?id=${encodeURIComponent(id)}`);
   };
@@ -371,8 +469,31 @@ export default function MatchPage() {
         </a>
         <div className="match-side-head">
           <h1>Match detail</h1>
-          <p>{visibleMatches.length} visible of {matches.length}</p>
+          <p>{renderedMatches.length} rendered · {matches.length} loaded of {matchesTotal}</p>
         </div>
+        <section className="side-day-selector" aria-label="match day selector">
+          <button
+            type="button"
+            onClick={() => setSelectedMatchDate((value) => adjacentMatchDate(matchDays, value, -1) ?? value)}
+            disabled={!adjacentMatchDate(matchDays, selectedMatchDate, -1)}
+            title="Previous day with matches"
+          >
+            <ChevronLeft size={15} />
+          </button>
+          <div>
+            <CalendarDays size={14} />
+            <strong>{formatSelectedDay(selectedMatchDate)}</strong>
+            <small>{selectedMatchDay(matchDays, selectedMatchDate)?.matches ?? 0}</small>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSelectedMatchDate((value) => adjacentMatchDate(matchDays, value, 1) ?? value)}
+            disabled={!adjacentMatchDate(matchDays, selectedMatchDate, 1)}
+            title="Next day with matches"
+          >
+            <ChevronRight size={15} />
+          </button>
+        </section>
         <label className="search match-search">
           <Search size={15} />
           <input value={matchQuery} onChange={(event) => setMatchQuery(event.target.value)} placeholder="Search matches" />
@@ -385,10 +506,11 @@ export default function MatchPage() {
               <small>{formatSchedule(item.kickoff_time)} · {item.bookmaker_count} bookmakers · {item.attempt_count} tries</small>
             </button>
           ))}
+          {isLoadingMatches && renderedMatches.length === 0 ? <MatchListSkeleton /> : null}
           {visibleMatches.length > 0 ? (
             <div className="list-footer" ref={matchListMoreRef}>
               <span>
-                Showing {renderedMatches.length} of {visibleMatches.length}
+                  Showing {renderedMatches.length} rendered, {matches.length} loaded of {matchesTotal}
               </span>
               {hasMoreMatches ? (
                 <button type="button" onClick={loadMoreMatches}>
@@ -512,7 +634,7 @@ export default function MatchPage() {
                     />
                   </div>
                   <WhyMatched signal={bestSignal(signals)} />
-                  <ScoreExamples scores={uniqueSorted(signals.flatMap((signal) => signal.historical_scores))} />
+                  <ScoreExamples signal={bestSignal(signals)} />
                 </div>
               ) : (
                 <p className="empty">{historicalEmptyMessage(match)}</p>
@@ -625,7 +747,7 @@ export default function MatchPage() {
 
             <section className="dual-grid match-dual">
               <div className="panel">
-                <PanelHeader title="Snapshots" subtitle={`${detail?.snapshots.length ?? 0} saved attempts`} />
+                <PanelHeader title="Snapshots" subtitle={`${Math.min(detail?.snapshots.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.snapshots.length ?? 0} saved attempts`} />
                 <div className="table-wrap medium">
                   <table>
                     <thead>
@@ -645,7 +767,7 @@ export default function MatchPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(detail?.snapshots ?? []).map((snapshot) => (
+                      {(detail?.snapshots ?? []).slice(0, DETAIL_TABLE_PREVIEW_ROWS).map((snapshot) => (
                         <tr key={snapshot.id}>
                           <td><code>{snapshot.id}</code></td>
                           <td>{formatUtc(snapshot.captured_at)}</td>
@@ -663,11 +785,16 @@ export default function MatchPage() {
                       ))}
                     </tbody>
                   </table>
+                  {(detail?.snapshots.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
+                    <div className="list-footer">
+                      <span>Showing latest {DETAIL_TABLE_PREVIEW_ROWS} snapshots to keep the page responsive.</span>
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
               <div className="panel">
-                <PanelHeader title="Attempts" subtitle={`${detail?.attempts.length ?? 0} HTTP/parser attempts`} />
+                <PanelHeader title="Attempts" subtitle={`${Math.min(detail?.attempts.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.attempts.length ?? 0} HTTP/parser attempts`} />
                 <div className="table-wrap medium">
                   <table>
                     <thead>
@@ -683,7 +810,7 @@ export default function MatchPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {(detail?.attempts ?? []).map((attempt) => (
+                      {(detail?.attempts ?? []).slice(0, DETAIL_TABLE_PREVIEW_ROWS).map((attempt) => (
                         <tr key={attempt.id}>
                           <td><code>{attempt.id}</code></td>
                           <td>{attempt.attempt_number}</td>
@@ -697,13 +824,18 @@ export default function MatchPage() {
                       ))}
                     </tbody>
                   </table>
+                  {(detail?.attempts.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
+                    <div className="list-footer">
+                      <span>Showing latest {DETAIL_TABLE_PREVIEW_ROWS} attempts to keep the page responsive.</span>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </section>
           </>
         ) : (
           <div className="panel">
-            <p className="empty">No match selected.</p>
+            <DetailSkeleton />
           </div>
         )}
       </section>
@@ -739,6 +871,34 @@ function Info({ label, value }: { label: string; value: string }) {
     <div className="info-cell" title={`${tooltipFor(label)} Current value: ${value}`}>
       <span>{label}</span>
       <strong title={value}>{value}</strong>
+    </div>
+  );
+}
+
+function MatchListSkeleton() {
+  return (
+    <div className="skeleton-stack" aria-label="Loading matches">
+      {Array.from({ length: 6 }).map((_, index) => (
+        <div className="skeleton-row dark" key={index}>
+          <span />
+          <strong />
+          <small />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DetailSkeleton() {
+  return (
+    <div className="detail-skeleton" aria-label="Loading match detail">
+      <div className="skeleton-title" />
+      <div className="skeleton-grid">
+        {Array.from({ length: 8 }).map((_, index) => (
+          <span key={index} />
+        ))}
+      </div>
+      <div className="skeleton-block" />
     </div>
   );
 }
@@ -858,12 +1018,16 @@ function WhyMatched({ signal }: { signal: HistoricalSignal }) {
   );
 }
 
-function ScoreExamples({ scores }: { scores: string[] }) {
+function ScoreExamples({ signal }: { signal: HistoricalSignal }) {
+  const scores = signal.historical_scores;
   return (
     <div className="score-examples">
       <div className="section-explainer">
         <h4>Example historical full-time scores</h4>
-        <p>These are previous final scores from the matched historical sample.</p>
+        <p>
+          Scores shown here come from this selected signal only: {signal.dataset},{" "}
+          {signal.sample_size} matched matches.
+        </p>
       </div>
       <div className="score-strip">
         {scores.slice(0, 12).map((score, index) => (
@@ -995,8 +1159,54 @@ function similarityBadgeClass(signal: HistoricalSignal) {
   return "similarity-badge weak";
 }
 
+function todayDateSlug() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function preferredMatchDate(days: MatchDay[], targetDate: string) {
+  if (days.length === 0) return targetDate;
+  if (days.some((day) => day.date === targetDate)) return targetDate;
+  const target = new Date(`${targetDate}T00:00:00`).getTime();
+  return [...days]
+    .sort((left, right) => {
+      const leftTime = new Date(`${left.date}T00:00:00`).getTime();
+      const rightTime = new Date(`${right.date}T00:00:00`).getTime();
+      const leftFuture = leftTime >= target ? 0 : 1;
+      const rightFuture = rightTime >= target ? 0 : 1;
+      if (leftFuture !== rightFuture) return leftFuture - rightFuture;
+      return Math.abs(leftTime - target) - Math.abs(rightTime - target);
+    })[0]?.date;
+}
+
+function selectedMatchDay(days: MatchDay[], selectedDate: string) {
+  return days.find((day) => day.date === selectedDate);
+}
+
+function adjacentMatchDate(days: MatchDay[], selectedDate: string, direction: -1 | 1) {
+  const sorted = [...days].sort((left, right) => left.date.localeCompare(right.date));
+  const index = sorted.findIndex((day) => day.date === selectedDate);
+  if (index === -1) return null;
+  return sorted[index + direction]?.date ?? null;
+}
+
+function formatSelectedDay(value: string) {
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(date);
+}
+
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "one_draw") return `Draw-only ${formatPct(signal.similarity_score)}`;
+  if (signal.signal_type === "exact_odds") return "Exact odds";
+  if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
+  if (signal.signal_type === "one_draw") return "Draw-only";
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -92,6 +92,10 @@ class SignalRecomputeRequest(BaseModel):
     archive_played: bool = True
 
 
+class ArchiveDateRequest(BaseModel):
+    date: date
+
+
 def _refresh_historical_signals(reason: str) -> dict[str, int]:
     try:
         return historical_auto_refresh.refresh(reason)
@@ -179,10 +183,16 @@ def matches_page(
     q: str = "",
     filter: str = "all",
     sort: str = "capture_desc",
+    date: str = "",
     offset: int = 0,
     limit: int = 120,
 ) -> dict[str, object]:
-    return database.list_matches_page(query=q, match_filter=filter, sort_mode=sort, offset=offset, limit=limit)
+    return database.list_matches_page(query=q, match_filter=filter, sort_mode=sort, match_date=date, offset=offset, limit=limit)
+
+
+@app.get("/api/match-days")
+def match_days() -> list[dict[str, object]]:
+    return database.list_match_days()
 
 
 @app.get("/api/matches/{match_id}")
@@ -226,8 +236,8 @@ def historical_import_status() -> dict[str, object]:
 @app.post("/api/historical/import")
 def historical_import() -> dict[str, int]:
     result = historical_importer.import_roots([settings.historical_database_root])
-    recompute = database.recompute_historical_signals()
     archive = database.archive_played_matches()
+    recompute = database.recompute_historical_signals()
     return {**result, **{f"recompute_{key}": value for key, value in recompute.items()}, **archive}
 
 
@@ -237,15 +247,41 @@ def signals(
     bookmaker: str = "all",
     signal_type: str = "all",
     min_sample: int = 1,
+    from_date: str = "",
+    date: str = "",
+    actionable_only: bool = False,
+    sort: str = "quality",
 ) -> list[dict[str, object]]:
-    return database.list_signals(dataset=dataset, bookmaker=bookmaker, signal_type=signal_type, min_sample=min_sample)
+    actionable_after = None
+    if actionable_only:
+        actionable_after = datetime.now() - timedelta(minutes=settings.recently_started_window_minutes)
+    return database.list_signals(
+        dataset=dataset,
+        bookmaker=bookmaker,
+        signal_type=signal_type,
+        min_sample=min_sample,
+        from_date=from_date,
+        match_date=date,
+        actionable_after=actionable_after,
+        sort_mode=sort,
+    )
+
+
+@app.get("/api/signal-days")
+def signal_days() -> list[dict[str, object]]:
+    return database.list_signal_days()
 
 
 @app.post("/api/signals/recompute")
 def recompute_signals(request: SignalRecomputeRequest) -> dict[str, int]:
-    result = database.recompute_historical_signals()
     archive = database.archive_played_matches() if request.archive_played else {"archived": 0}
+    result = database.recompute_historical_signals()
     return {**result, **archive}
+
+
+@app.post("/api/archive/date")
+async def archive_date(request: ArchiveDateRequest) -> dict[str, object]:
+    return await service.archive_football_date(request.date)
 
 
 @app.get("/api/signals/{match_id}")

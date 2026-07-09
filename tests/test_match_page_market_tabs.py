@@ -45,6 +45,7 @@ def test_match_page_renders_historical_signals_for_selected_match() -> None:
         "Historical outcome stats from",
         "Percentages are calculated from historical matches",
         "Example historical full-time scores",
+        "Scores shown here come from this selected signal only",
         "View all matched scores",
         "Signal strength",
         "SignalSummaryCard",
@@ -64,6 +65,7 @@ def test_match_page_renders_historical_signals_for_selected_match() -> None:
 
     for phrase in expected_phrases:
         assert phrase in page
+    assert "ScoreExamples scores={uniqueSorted(signals.flatMap" not in page
 
 
 def test_match_page_labels_one_draw_similarity_as_draw_only_not_full_confidence() -> None:
@@ -71,7 +73,7 @@ def test_match_page_labels_one_draw_similarity_as_draw_only_not_full_confidence(
     styles = (ROOT / "apps/desktop/web/app/globals.css").read_text(encoding="utf-8")
 
     assert 'signal.signal_type === "one_draw"' in page
-    assert "Draw-only ${formatPct(signal.similarity_score)}" in page
+    assert 'return "Draw-only";' in page
     assert "<span className={similarityBadgeClass(signal)}>{signalSimilarityBadge(signal)}</span>" in page
     assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
     assert ".similarity-badge.draw-only" in styles

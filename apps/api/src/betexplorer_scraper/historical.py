@@ -179,12 +179,12 @@ class HistoricalSignalAutoRefresh:
     def refresh(self, reason: str) -> dict[str, int]:
         with self._lock:
             import_result = self.importer.import_roots(self.roots)
-            recompute_result = self.database.recompute_historical_signals()
             archive_result = self.database.archive_played_matches()
+            recompute_result = self.database.recompute_historical_signals()
             result = {
                 **import_result,
-                **{f"recompute_{key}": value for key, value in recompute_result.items()},
                 **archive_result,
+                **{f"recompute_{key}": value for key, value in recompute_result.items()},
             }
             self.database.log("info", "historical", "auto_refresh_completed", details={"reason": reason, **result})
             return result

@@ -814,6 +814,8 @@ class Database:
             [draw, NEIGHBOR_TOLERANCE],
         )
         groups = [("exact_odds", exact), ("neighbor_odds", neighbor)]
+        primary_datasets = {str(record["dataset"]) for record in [*exact, *neighbor]}
+        draw_records = [record for record in draw_records if str(record["dataset"]) in primary_datasets]
         if len(draw_records) >= ONE_DRAW_MIN_SAMPLE:
             groups.append(("one_draw", draw_records))
         return groups
@@ -821,10 +823,37 @@ class Database:
     def _fetch_historical_records(self, where_sql: str, params: list[object]) -> list[dict[str, object]]:
         rows = self.connection.execute(
             f"""
+            WITH historical_pool AS (
+                SELECT dataset, source_file, query_home_odds, query_draw_odds, query_away_odds, full_time_score
+                FROM historical_records
+                WHERE full_time_score IS NOT NULL
+                UNION ALL
+                SELECT 'Played archive Bwin' AS dataset, event_id AS source_file,
+                       bwin_home_odds AS query_home_odds,
+                       bwin_draw_odds AS query_draw_odds,
+                       bwin_away_odds AS query_away_odds,
+                       full_time_score
+                FROM played_match_archive
+                WHERE full_time_score IS NOT NULL
+                  AND bwin_home_odds IS NOT NULL
+                  AND bwin_draw_odds IS NOT NULL
+                  AND bwin_away_odds IS NOT NULL
+                UNION ALL
+                SELECT 'Played archive Unibet' AS dataset, event_id AS source_file,
+                       unibet_home_odds AS query_home_odds,
+                       unibet_draw_odds AS query_draw_odds,
+                       unibet_away_odds AS query_away_odds,
+                       full_time_score
+                FROM played_match_archive
+                WHERE full_time_score IS NOT NULL
+                  AND unibet_home_odds IS NOT NULL
+                  AND unibet_draw_odds IS NOT NULL
+                  AND unibet_away_odds IS NOT NULL
+            )
             SELECT dataset, source_file, query_home_odds, query_draw_odds, query_away_odds, full_time_score
-            FROM historical_records
-            WHERE full_time_score IS NOT NULL AND {where_sql}
-            ORDER BY dataset, source_file, id
+            FROM historical_pool
+            WHERE {where_sql}
+            ORDER BY dataset, source_file, query_home_odds, query_draw_odds, query_away_odds
             """,
             params,
         ).fetchall()
@@ -929,6 +958,10 @@ class Database:
         bookmaker: str | None = None,
         signal_type: str | None = None,
         min_sample: int = 1,
+        from_date: str | None = None,
+        match_date: str | None = None,
+        actionable_after: datetime | None = None,
+        sort_mode: str = "quality",
     ) -> list[dict[str, object]]:
         clauses = ["sample_size >= ?"]
         params: list[object] = [min_sample]
@@ -944,13 +977,33 @@ class Database:
         if signal_type and signal_type != "all":
             clauses.append("signal_type = ?")
             params.append(signal_type)
+        if from_date:
+            clauses.append("CAST(kickoff_time AS DATE) >= ?")
+            params.append(from_date)
+        if match_date:
+            clauses.append("CAST(kickoff_time AS DATE) = ?")
+            params.append(match_date)
+        if actionable_after:
+            clauses.append(
+                """
+                EXISTS (
+                    SELECT 1
+                    FROM matches m
+                    WHERE m.id = historical_signals.match_id
+                      AND m.finalized_at IS NULL
+                      AND m.result_captured_at IS NULL
+                      AND (m.kickoff_time IS NULL OR m.kickoff_time >= ?)
+                )
+                """
+            )
+            params.append(actionable_after)
+        order_sql = _signal_order_sql(sort_mode)
         rows = self.connection.execute(
             f"""
             SELECT *
             FROM historical_signals
             WHERE {' AND '.join(clauses)}
-            ORDER BY COALESCE(signal_rank, 99), COALESCE(similarity_score, 0) DESC, sample_size DESC,
-                     kickoff_time NULLS LAST, normalized_bookmaker
+            ORDER BY {order_sql}
             LIMIT 500
             """,
             params,
@@ -961,6 +1014,28 @@ class Database:
             signal["historical_scores"] = json.loads(str(signal.pop("historical_scores_json") or "[]"))
             signal["source_files"] = json.loads(str(signal.pop("source_files_json") or "[]"))
         return signals
+
+    @_locked
+    def list_signal_days(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT CAST(kickoff_time AS DATE) AS signal_date,
+                   COUNT(DISTINCT match_id) AS matches,
+                   COUNT(*) AS signals
+            FROM historical_signals
+            WHERE kickoff_time IS NOT NULL
+            GROUP BY signal_date
+            ORDER BY signal_date
+            """
+        ).fetchall()
+        return [
+            {
+                "date": row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0]),
+                "matches": row[1],
+                "signals": row[2],
+            }
+            for row in rows
+        ]
 
     @_locked
     def archive_played_matches(self) -> dict[str, int]:
@@ -1210,11 +1285,12 @@ class Database:
         query: str = "",
         match_filter: str = "all",
         sort_mode: str = "capture_desc",
+        match_date: str = "",
         offset: int = 0,
         limit: int = 120,
     ) -> dict[str, object]:
         rows = self.list_matches()
-        visible = [row for row in rows if self._match_row_visible(row, query, match_filter)]
+        visible = [row for row in rows if self._match_row_visible(row, query, match_filter, match_date)]
         visible.sort(key=lambda row: self._match_sort_key(row, sort_mode), reverse=sort_mode in {"capture_desc", "bookmakers_desc", "attempts_desc"})
         safe_offset = max(0, offset)
         safe_limit = min(max(1, limit), 500)
@@ -1225,7 +1301,9 @@ class Database:
             "limit": safe_limit,
         }
 
-    def _match_row_visible(self, row: dict[str, object], query: str, match_filter: str) -> bool:
+    def _match_row_visible(self, row: dict[str, object], query: str, match_filter: str, match_date: str = "") -> bool:
+        if match_date and not str(row.get("kickoff_time") or "").startswith(match_date):
+            return False
         bookmaker_count = int(row.get("bookmaker_count") or 0)
         attempt_count = int(row.get("attempt_count") or 0)
         quality_status = row.get("quality_status")
@@ -1272,6 +1350,30 @@ class Database:
         if sort_mode == "attempts_desc":
             return int(row.get("attempt_count") or 0)
         return row.get("captured_at") or ""
+
+    @_locked
+    def list_match_days(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT CAST(kickoff_time AS DATE) AS match_date,
+                   COUNT(*) AS matches,
+                   SUM(CASE WHEN next_capture_at IS NOT NULL AND finalized_at IS NULL THEN 1 ELSE 0 END) AS due_or_scheduled,
+                   SUM(CASE WHEN finalized_at IS NULL THEN 1 ELSE 0 END) AS active
+            FROM matches
+            WHERE kickoff_time IS NOT NULL
+            GROUP BY match_date
+            ORDER BY match_date
+            """
+        ).fetchall()
+        return [
+            {
+                "date": row[0].isoformat() if hasattr(row[0], "isoformat") else str(row[0]),
+                "matches": row[1],
+                "due_or_scheduled": row[2] or 0,
+                "active": row[3] or 0,
+            }
+            for row in rows
+        ]
 
     @_locked
     def match_detail(self, match_id: str) -> dict[str, object] | None:
@@ -1510,6 +1612,28 @@ def _signal_rank(signal_type: str) -> int:
     if signal_type == "one_draw":
         return 3
     return 99
+
+
+def _signal_order_sql(sort_mode: str) -> str:
+    if sort_mode == "kickoff_asc":
+        return (
+            "kickoff_time NULLS LAST, COALESCE(signal_rank, 99), "
+            "COALESCE(similarity_score, 0) DESC, sample_size DESC, normalized_bookmaker"
+        )
+    if sort_mode == "kickoff_desc":
+        return (
+            "kickoff_time DESC NULLS LAST, COALESCE(signal_rank, 99), "
+            "COALESCE(similarity_score, 0) DESC, sample_size DESC, normalized_bookmaker"
+        )
+    if sort_mode == "sample_desc":
+        return (
+            "sample_size DESC, COALESCE(signal_rank, 99), "
+            "COALESCE(similarity_score, 0) DESC, kickoff_time NULLS LAST, normalized_bookmaker"
+        )
+    return (
+        "COALESCE(signal_rank, 99), COALESCE(similarity_score, 0) DESC, "
+        "sample_size DESC, kickoff_time NULLS LAST, normalized_bookmaker"
+    )
 
 
 def _signal_similarity(candidate: dict[str, object], signal_type: str, records: list[dict[str, object]]) -> float:

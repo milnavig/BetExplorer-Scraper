@@ -20,3 +20,4 @@ out/
 har/
 
 .venv/
+/apps/api/data/test_tmp

@@ -10,7 +10,7 @@ from betexplorer_scraper.capture import CaptureService
 from betexplorer_scraper.config import Settings
 from betexplorer_scraper.database import Database
 from betexplorer_scraper.models import DiscoveredMatch, TimingStatus
-from betexplorer_scraper.transport import BetExplorerTransport, RawResponse
+from betexplorer_scraper.transport import BetExplorerTransport, HttpBetExplorerTransport, RawResponse
 
 
 class FakeTransport(BetExplorerTransport):
@@ -96,6 +96,40 @@ class PartialOddsTransport(FakeTransport):
         return RawResponse("https://www.betexplorer.com/match-odds/abc12345/0/1x2/bestOdds/?lang=en", json.dumps({"odds": html}), 200)
 
 
+class PartialThenCompleteOddsTransport(FakeTransport):
+    async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:
+        self.match_odds_calls += 1
+        if self.match_odds_calls == 1:
+            html = """
+            <table><tbody>
+              <tr data-bid="2" data-bookie-id="261">
+                <td><a class="in-bookmaker-logo-link">bwin</a></td>
+                <td data-odd="2.20" data-bookie="bwin"></td>
+                <td data-odd="3.10" data-bookie="bwin"></td>
+                <td data-odd="2.87" data-bookie="bwin"></td>
+              </tr>
+            </tbody></table>
+            """
+        else:
+            html = """
+            <table><tbody>
+              <tr data-bid="2" data-bookie-id="261">
+                <td><a class="in-bookmaker-logo-link">bwin</a></td>
+                <td data-odd="2.20" data-bookie="bwin"></td>
+                <td data-odd="3.10" data-bookie="bwin"></td>
+                <td data-odd="2.87" data-bookie="bwin"></td>
+              </tr>
+              <tr data-bid="5" data-bookie-id="43">
+                <td><a class="in-bookmaker-logo-link">Unibet</a></td>
+                <td data-odd="2.55" data-bookie="Unibet"></td>
+                <td data-odd="3.10" data-bookie="Unibet"></td>
+                <td data-odd="2.38" data-bookie="Unibet"></td>
+              </tr>
+            </tbody></table>
+            """
+        return RawResponse("https://www.betexplorer.com/match-odds/abc12345/0/1x2/bestOdds/?lang=en", json.dumps({"odds": html}), 200)
+
+
 class FinishedResultTransport(FakeTransport):
     async def fetch_homepage(self) -> RawResponse:
         return RawResponse("https://www.betexplorer.com/", "<html></html>", 200)
@@ -132,6 +166,60 @@ class MatchPageResultTransport(NoDiscoveryTransport):
         return RawResponse(match_url, html, 200)
 
 
+class ArchivedScoreWithoutFinishedMarkerTransport(FinishedResultTransport):
+    async def fetch_football_date(self, target_date: date) -> RawResponse:
+        dt = f"{self.kickoff.day},{self.kickoff.month},{self.kickoff.year},{self.kickoff.hour},{self.kickoff.minute:02d}"
+        html = f"""
+        <table>
+          <tr class="js-tournament">
+            <th colspan="2"><a class="table-main__tournament" href="/football/test/">Test Country: Test League</a></th>
+          </tr>
+          <tr data-dt="{dt}">
+            <td>
+              <span class="table-main__time">{self.kickoff.hour:02d}:{self.kickoff.minute:02d}</span>
+              <a href="/football/test-league/home-away/abc12345/">Home - Away</a>
+            </td>
+          </tr>
+        </table>
+        """
+        return RawResponse("https://www.betexplorer.com/football/", html, 200)
+
+    async def fetch_match_page(self, match_url: str) -> RawResponse:
+        html = """
+        <div class="list-details">
+          <p class="list-details__item__score">2:1</p>
+        </div>
+        """
+        return RawResponse(match_url, html, 200)
+
+
+class MixedDateArchiveTransport(FinishedResultTransport):
+    async def fetch_football_date(self, target_date: date) -> RawResponse:
+        def row(event_id: str, day: int, home: str, score: str) -> str:
+            dt = f"{day},5,2026,20,00"
+            return f"""
+            <tr data-dt="{dt}">
+              <td>
+                <span class="table-main__time">20:00</span>
+                <a href="/football/test-league/{home.lower()}-away/{event_id}/">{home} - Away</a>
+                <span class="table-main__result">{score}</span>
+              </td>
+            </tr>
+            """
+
+        html = f"""
+        <table>
+          <tr class="js-tournament">
+            <th colspan="2"><a class="table-main__tournament" href="/football/test/">Test Country: Test League</a></th>
+          </tr>
+          {row("prev1234", 13, "Previous", "1:0")}
+          {row("abc12345", 14, "Home", "2:1")}
+          {row("next1234", 15, "Next", "3:0")}
+        </table>
+        """
+        return RawResponse("https://www.betexplorer.com/football/results/", html, 200)
+
+
 def _settings(db_path: Path) -> Settings:
     return Settings(
         database_path=db_path,
@@ -147,6 +235,7 @@ def _settings(db_path: Path) -> Settings:
         discovery_poll_interval_seconds=60,
         max_retries_per_match=1,
         capture_market="1x2",
+        result_capture_lookback_hours=120,
         result_backfill_batch_size=50,
     )
 
@@ -318,9 +407,28 @@ async def test_run_once_captures_all_available_markets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_successful_partial_market_payload_is_not_retried() -> None:
+async def test_partial_required_bookmaker_payload_is_retried_until_complete() -> None:
     now = datetime(2026, 4, 28, 16, 0)
-    db_path = Path("data/test_tmp/capture_partial_no_retry.duckdb")
+    db_path = Path("data/test_tmp/capture_partial_retries_until_complete.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    settings = _settings(db_path).model_copy(update={"max_retries_per_match": 3, "retry_delay_seconds": 0})
+    transport = PartialThenCompleteOddsTransport(now + timedelta(minutes=5))
+    service = CaptureService(settings, Database(db_path), transport)
+
+    result = await service.run_once(now=now)
+
+    assert result["captured"] == 1
+    assert transport.match_odds_calls == 2
+    snapshots = service.database.list_snapshots()
+    assert [snapshot["quality_status"] for snapshot in snapshots] == ["COMPLETE", "PARTIAL"]
+    assert service.database.list_matches()[0]["quality_status"] == "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_partial_required_bookmaker_payload_retries_until_exhausted() -> None:
+    now = datetime(2026, 4, 28, 16, 0)
+    db_path = Path("data/test_tmp/capture_partial_retries_exhausted.duckdb")
     if db_path.exists():
         db_path.unlink()
     settings = _settings(db_path).model_copy(update={"max_retries_per_match": 3, "retry_delay_seconds": 0})
@@ -330,8 +438,78 @@ async def test_successful_partial_market_payload_is_not_retried() -> None:
     result = await service.run_once(now=now)
 
     assert result["captured"] == 1
-    assert transport.match_odds_calls == 1
-    assert service.database.list_snapshots()[0]["quality_status"] == "FAILED"
+    assert transport.match_odds_calls == 3
+    assert {snapshot["quality_status"] for snapshot in service.database.list_snapshots()} == {"FAILED"}
+
+
+@pytest.mark.asyncio
+async def test_archive_football_date_captures_played_matches_and_updates_archive(tmp_path: Path) -> None:
+    target_day = date(2026, 5, 14)
+    kickoff = datetime(2026, 5, 14, 20, 0)
+    db_path = tmp_path / "archive_football_date.duckdb"
+    db = Database(db_path)
+    service = CaptureService(_settings(db_path), db, FinishedResultTransport(kickoff))
+
+    result = await service.archive_football_date(target_day)
+    archive_rows = db.list_played_match_archive()
+
+    assert result["date"] == "2026-05-14"
+    assert result["discovered"] == 1
+    assert result["captured"] == 1
+    assert result["complete"] == 1
+    assert result["archived"] == 1
+    assert archive_rows[0]["event_id"] == "abc12345"
+    assert archive_rows[0]["full_time_score"] == "2-1"
+    assert archive_rows[0]["bwin_home_odds"] == 2.2
+    assert archive_rows[0]["unibet_away_odds"] == 2.38
+
+
+@pytest.mark.asyncio
+async def test_archive_football_date_accepts_archived_score_without_finished_marker(tmp_path: Path) -> None:
+    target_day = date(2026, 5, 14)
+    kickoff = datetime(2026, 5, 14, 20, 0)
+    db_path = tmp_path / "archive_football_date_score_without_finished.duckdb"
+    db = Database(db_path)
+    service = CaptureService(_settings(db_path), db, ArchivedScoreWithoutFinishedMarkerTransport(kickoff))
+
+    result = await service.archive_football_date(target_day)
+    archive_rows = db.list_played_match_archive()
+
+    assert result["results_captured"] == 1
+    assert result["archived"] == 1
+    assert archive_rows[0]["full_time_score"] == "2-1"
+
+
+@pytest.mark.asyncio
+async def test_archive_football_date_filters_matches_to_requested_day(tmp_path: Path) -> None:
+    target_day = date(2026, 5, 14)
+    kickoff = datetime(2026, 5, 14, 20, 0)
+    db_path = tmp_path / "archive_football_date_filters_day.duckdb"
+    db = Database(db_path)
+    service = CaptureService(_settings(db_path), db, MixedDateArchiveTransport(kickoff))
+
+    result = await service.archive_football_date(target_day)
+    rows = db.list_matches()
+
+    assert result["discovered"] == 1
+    assert result["results_captured"] == 1
+    assert [row["event_id"] for row in rows] == ["abc12345"]
+
+
+@pytest.mark.asyncio
+async def test_http_transport_uses_betexplorer_results_page_for_historical_date() -> None:
+    captured: dict[str, str] = {}
+    transport = HttpBetExplorerTransport("https://www.betexplorer.com")
+
+    async def fake_get(url: str, headers: dict[str, str]) -> RawResponse:
+        captured["url"] = url
+        return RawResponse(url, "<html></html>", 200)
+
+    transport._get = fake_get  # type: ignore[method-assign]
+
+    await transport.fetch_football_date(date(2026, 6, 20))
+
+    assert captured["url"] == "https://www.betexplorer.com/football/results/?year=2026&month=06&day=20"
 
 
 @pytest.mark.asyncio
