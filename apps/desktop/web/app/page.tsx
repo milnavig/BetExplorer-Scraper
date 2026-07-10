@@ -876,24 +876,6 @@ export default function Dashboard() {
     setHistoricalImportStatus(nextHistoricalImportStatus);
   };
 
-  const importHistoricalDatabase = () => {
-    startTransition(async () => {
-      setError(null);
-      try {
-        await api<HistoricalImportResult>("/api/historical/import", {
-          method: "POST",
-        });
-        await refreshHistoricalSignalState();
-      } catch (nextError) {
-        setError(
-          nextError instanceof Error
-            ? nextError.message
-            : "Historical import failed",
-        );
-      }
-    });
-  };
-
   const importHistoricalZip = (file: File) => {
     startTransition(async () => {
       setError(null);
@@ -1012,25 +994,14 @@ export default function Dashboard() {
             </button>
             <button
               type="button"
-              onClick={importHistoricalDatabase}
+              onClick={() => zipImportInputRef.current?.click()}
               disabled={isPending}
-              title="Import DOCX historical database from the configured sample database folder."
+              title="Import a ZIP archive that contains DOCX historical database folders."
               className="icon-action"
               data-testid="import-docx-trigger"
             >
               <Upload size={16} />
               Import DOCX
-            </button>
-            <button
-              type="button"
-              onClick={() => zipImportInputRef.current?.click()}
-              disabled={isPending}
-              title="Import a ZIP archive that contains DOCX historical database folders."
-              className="icon-action"
-              data-testid="import-zip-trigger"
-            >
-              <Upload size={16} />
-              Import ZIP
             </button>
             <div className="download-menu">
               <button
