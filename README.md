@@ -143,7 +143,7 @@ uv run python scripts/run_live_capture.py
 
 Use this external loop only when `ENABLE_API_SCHEDULER=false` or when the API is not running. Do not run both schedulers against the same DuckDB file unless you intentionally want duplicate capture pressure.
 
-The continuous loop checks due matches every `SCHEDULER_TICK_SECONDS`, but full BetExplorer discovery is throttled by `DISCOVERY_POLL_INTERVAL_SECONDS`. Odds polling is adaptive: matches enter monitoring up to `ODDS_CAPTURE_LOOKAHEAD_HOURS` before kickoff, normal polling uses `MONITORING_CAPTURE_POLL_INTERVAL_SECONDS`, then switches to `FINAL_CAPTURE_POLL_INTERVAL_SECONDS` during the last `FINAL_CAPTURE_FAST_WINDOW_MINUTES` before kickoff and shortly after kickoff. Current defaults are intentionally moderate for `CAPTURE_MARKET=all`: every 120 seconds in the early window, every 20 seconds in the last 3 minutes, and up to 5 minutes after kickoff. Results are captured separately once per finished match in the configured 24-hour lookback.
+The continuous loop checks due matches every `SCHEDULER_TICK_SECONDS`, but full BetExplorer discovery is throttled by `DISCOVERY_POLL_INTERVAL_SECONDS`. Odds polling is adaptive: matches enter monitoring up to `ODDS_CAPTURE_LOOKAHEAD_HOURS` before kickoff, normal polling uses `MONITORING_CAPTURE_POLL_INTERVAL_SECONDS`, then switches to `FINAL_CAPTURE_POLL_INTERVAL_SECONDS` during the last `FINAL_CAPTURE_FAST_WINDOW_MINUTES` before kickoff and shortly after kickoff. Current defaults capture all discovered BetExplorer markets every 120 seconds in the early window, every 20 seconds in the last 3 minutes, and up to 5 minutes after kickoff. Results are captured separately once per finished match in the configured 24-hour lookback.
 
 Performance notes:
 - `MAX_CONCURRENT_CAPTURES` controls how many due matches run in parallel.
@@ -275,6 +275,6 @@ npm --prefix apps/desktop audit
 ## Notes
 
 - The scraper is HTTP-first. Browser automation is intentionally left as a fallback interface, not the default.
-- `CAPTURE_MARKET=all` discovers BetExplorer market tabs from the match page, for example `1x2`, `ou`, `ah`, `dc`, and `bts`. Set it to a single market id like `1x2` to restrict capture.
+- `CAPTURE_MARKET=all` discovers BetExplorer market tabs from the match page, for example `1x2`, `ou`, `ah`, `dc`, and `bts`. Set it to a single market id like `1x2` to reduce request volume when only final 1X2 odds are needed.
 - Odds rows use generic `Odd 1`, `Odd 2`, `Odd 3` columns because markets can be two-outcome or three-outcome.
 - Historical matching is file-based: configure `HISTORICAL_DATABASE_ROOT`, keep the original DOCX files read-only, and let DuckDB hold the local searchable index/signals.

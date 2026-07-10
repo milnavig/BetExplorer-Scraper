@@ -317,6 +317,116 @@ def test_late_incomplete_snapshot_does_not_replace_better_required_bookmaker_fin
     assert detail["snapshots"][1]["is_final"] is True
 
 
+def test_match_summary_quality_uses_primary_1x2_market_not_latest_auxiliary_market() -> None:
+    db_path = Path("data/test_tmp/test_match_summary_uses_1x2.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="markets123",
+            source_url="https://www.betexplorer.com/football/test/markets123/",
+            league="Market League",
+            home_team="Market Home",
+            away_team="Market Away",
+            kickoff_time=datetime(2026, 7, 10, 18, 0),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="markets123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 10, 16, 0),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 2.0, 3.2, 3.4),
+                BookmakerOdds("Unibet", "unibet", 2.1, 3.1, 3.2),
+            ],
+        ),
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="markets123",
+            market="bts",
+            captured_at=datetime(2026, 7, 10, 16, 5),
+            quality_status=SnapshotQuality.PARTIAL,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Bwin", "bwin", 1.9, 1.8, None)],
+        ),
+    )
+
+    row = db.list_matches()[0]
+    detail = db.match_detail(match_id)
+
+    assert row["quality_status"] == "COMPLETE"
+    assert row["bookmaker_count"] == 2
+    assert row["has_bwin"] is True
+    assert row["has_unibet"] is True
+    assert detail is not None
+    assert detail["match"]["quality_status"] == "COMPLETE"
+
+
+def test_repair_final_snapshots_restores_best_required_bookmaker_snapshot() -> None:
+    db_path = Path("data/test_tmp/test_repair_final_snapshots.duckdb")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if db_path.exists():
+        db_path.unlink()
+    db = Database(db_path)
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="repair123",
+            source_url="https://www.betexplorer.com/football/test/repair123/",
+            league="Repair League",
+            home_team="Repair Home",
+            away_team="Repair Away",
+            kickoff_time=datetime(2026, 7, 10, 18, 0),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    good_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="repair123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 10, 16, 0),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 2.0, 3.2, 3.4),
+                BookmakerOdds("Unibet", "unibet", 2.1, 3.1, 3.2),
+            ],
+        ),
+    )
+    bad_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="repair123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 10, 16, 5),
+            quality_status=SnapshotQuality.FAILED,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Bet365", "bet365", 2.2, 3.0, 3.1)],
+        ),
+    )
+    db.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE id = ?", [good_id])
+    db.connection.execute("UPDATE odds_snapshots SET is_final = TRUE WHERE id = ?", [bad_id])
+
+    result = db.repair_final_snapshots()
+    detail = db.match_detail(match_id)
+
+    assert result["groups_repaired"] == 1
+    assert detail is not None
+    assert detail["match"]["quality_status"] == "COMPLETE"
+    final_snapshots = [snapshot for snapshot in detail["snapshots"] if snapshot["is_final"]]
+    assert len(final_snapshots) == 1
+    assert final_snapshots[0]["quality_status"] == "COMPLETE"
+
+
 def test_database_status_reports_final_snapshots_separately_from_attempts() -> None:
     db_path = Path("data/test_tmp/test_status_final.duckdb")
     db_path.parent.mkdir(parents=True, exist_ok=True)

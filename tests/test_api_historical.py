@@ -192,6 +192,57 @@ def test_matches_page_api_returns_chunked_filtered_results(monkeypatch, tmp_path
     assert len(second_page.json()["items"]) == 2
 
 
+def test_repair_final_snapshots_endpoint_uses_open_api_database(monkeypatch, tmp_path: Path) -> None:
+    db = Database(tmp_path / "api_repair.duckdb")
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="apirepair",
+            source_url="https://www.betexplorer.com/football/test/apirepair/",
+            league="Repair League",
+            home_team="Repair Home",
+            away_team="Repair Away",
+            kickoff_time=datetime(2026, 5, 14, 20, 0),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    good_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="apirepair",
+            market="1x2",
+            captured_at=datetime(2026, 5, 14, 19, 55),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 2.0, 3.4, 3.0),
+                BookmakerOdds("Unibet", "unibet", 2.1, 3.3, 3.1),
+            ],
+        ),
+    )
+    bad_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="apirepair",
+            market="1x2",
+            captured_at=datetime(2026, 5, 14, 20, 1),
+            quality_status=SnapshotQuality.FAILED,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Bet365", "bet365", 2.2, 3.2, 3.0)],
+        ),
+    )
+    db.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE id = ?", [good_id])
+    db.connection.execute("UPDATE odds_snapshots SET is_final = TRUE WHERE id = ?", [bad_id])
+    monkeypatch.setattr(api, "database", db)
+    client = TestClient(api.app)
+
+    response = client.post("/api/maintenance/repair-final-snapshots")
+    detail = client.get(f"/api/matches/{match_id}")
+
+    assert response.status_code == 200
+    assert response.json()["groups_repaired"] == 1
+    assert detail.json()["match"]["quality_status"] == "COMPLETE"
+
+
 def test_capture_run_once_auto_refreshes_historical_signals_after_capture(monkeypatch) -> None:
     fake_refresh = _FakeHistoricalAutoRefresh()
     monkeypatch.setattr(api, "service", _FakeCaptureService())

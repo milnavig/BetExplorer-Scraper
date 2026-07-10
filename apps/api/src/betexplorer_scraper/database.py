@@ -620,6 +620,66 @@ class Database:
         return new_score >= int(current_score or 0)
 
     @_locked
+    def repair_final_snapshots(self, required_bookmakers: list[str] | None = None) -> dict[str, int]:
+        required = [normalize_bookmaker_name(item) for item in (required_bookmakers or ["Bwin", "Unibet"])]
+        required = [item for item in required if item]
+        if not required:
+            return {"groups_checked": 0, "groups_repaired": 0}
+        placeholders = ", ".join(["?"] * len(required))
+        best_rows = self.connection.execute(
+            f"""
+            WITH scored AS (
+                SELECT
+                    s.id,
+                    s.match_id,
+                    s.market,
+                    s.captured_at,
+                    COUNT(DISTINCT CASE
+                        WHEN o.is_available = TRUE AND o.normalized_bookmaker IN ({placeholders})
+                        THEN o.normalized_bookmaker
+                    END) AS required_score
+                FROM odds_snapshots s
+                LEFT JOIN bookmaker_odds o ON o.snapshot_id = s.id
+                GROUP BY s.id, s.match_id, s.market, s.captured_at
+            ),
+            ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY match_id, market
+                           ORDER BY required_score DESC, captured_at DESC, id DESC
+                       ) AS rank
+                FROM scored
+            )
+            SELECT id, match_id, market
+            FROM ranked
+            WHERE rank = 1
+            """,
+            required,
+        ).fetchall()
+        if not best_rows:
+            return {"groups_checked": 0, "groups_repaired": 0}
+        current_rows = self.connection.execute(
+            """
+            SELECT match_id, market, id
+            FROM odds_snapshots
+            WHERE is_final = TRUE
+            """
+        ).fetchall()
+        current_by_group = {(str(row[0]), str(row[1])): str(row[2]) for row in current_rows}
+        best_by_group = {(str(row[1]), str(row[2])): str(row[0]) for row in best_rows}
+        repaired = sum(1 for group, snapshot_id in best_by_group.items() if current_by_group.get(group) != snapshot_id)
+        self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE")
+        best_ids = [str(row[0]) for row in best_rows]
+        for chunk_start in range(0, len(best_ids), 500):
+            chunk = best_ids[chunk_start : chunk_start + 500]
+            chunk_placeholders = ", ".join(["?"] * len(chunk))
+            self.connection.execute(
+                f"UPDATE odds_snapshots SET is_final = TRUE WHERE id IN ({chunk_placeholders})",
+                chunk,
+            )
+        return {"groups_checked": len(best_rows), "groups_repaired": repaired}
+
+    @_locked
     def save_bookmaker_odds(self, snapshot_id: str, odds: BookmakerOdds, created_at: datetime) -> None:
         self.connection.execute(
             """
@@ -1258,7 +1318,7 @@ class Database:
                     arg_max(quality_status, captured_at) AS quality_status,
                     MAX(captured_at) AS captured_at
                 FROM odds_snapshots
-                WHERE is_final = TRUE
+                WHERE is_final = TRUE AND lower(market) = '1x2'
                 GROUP BY match_id
             )
             SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
@@ -1271,7 +1331,7 @@ class Database:
                    COALESCE(a.attempt_count, 0) AS attempt_count
             FROM matches m
             LEFT JOIN final_snapshot_summary s ON s.match_id = m.id
-            LEFT JOIN odds_snapshots fs ON fs.match_id = m.id AND fs.is_final = TRUE
+            LEFT JOIN odds_snapshots fs ON fs.match_id = m.id AND fs.is_final = TRUE AND lower(fs.market) = '1x2'
             LEFT JOIN bookmaker_odds o ON o.snapshot_id = fs.id
             LEFT JOIN (
                 SELECT match_id, COUNT(*) AS attempt_count

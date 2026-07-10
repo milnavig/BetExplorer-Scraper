@@ -354,6 +354,14 @@ def recompute_signals(request: SignalRecomputeRequest) -> dict[str, int]:
     return {**result, **archive}
 
 
+@app.post("/api/maintenance/repair-final-snapshots")
+def repair_final_snapshots() -> dict[str, int]:
+    repair = database.repair_final_snapshots(settings.required_bookmakers)
+    archive = database.archive_played_matches()
+    recompute = database.recompute_historical_signals()
+    return {**repair, **archive, **{f"recompute_{key}": value for key, value in recompute.items()}}
+
+
 @app.post("/api/archive/date")
 async def archive_date(request: ArchiveDateRequest) -> dict[str, object]:
     return await service.archive_football_date(request.date)
