@@ -85,6 +85,8 @@ HISTORICAL_AUTO_IMPORT=true
 HISTORICAL_AUTO_RECOMPUTE=true
 ```
 
+Relative paths such as `data/betexplorer.duckdb`, `data/raw_snapshots`, and `SAMPLE_DATABASE` are resolved from the repository root, so the API uses the same local database whether it is started from the project root or from `apps/api`.
+
 `BETEXPLORER_TIMEZONE_OFFSET` is important: BetExplorer changes the visible "today" schedule based on the `my_timezone` cookie. For Kyiv time keep `+3`, otherwise the scraper can see the previous UTC day and `Next capture` may look empty or stale.
 
 ## Run The API

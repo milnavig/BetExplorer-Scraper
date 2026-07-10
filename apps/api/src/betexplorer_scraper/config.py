@@ -6,8 +6,16 @@ from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True)
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
 
     betexplorer_base_url: str = "https://www.betexplorer.com"
     betexplorer_timezone_offset: str = "+3"
@@ -56,6 +64,15 @@ class Settings(BaseSettings):
 
 def get_settings() -> Settings:
     settings = Settings()
+    settings.database_path = _project_path(settings.database_path)
+    settings.export_dir = _project_path(settings.export_dir)
+    settings.raw_snapshot_dir = _project_path(settings.raw_snapshot_dir)
+    settings.log_dir = _project_path(settings.log_dir)
+    settings.historical_database_root = _project_path(settings.historical_database_root)
     for path in (settings.export_dir, settings.raw_snapshot_dir, settings.log_dir, settings.database_path.parent):
         path.mkdir(parents=True, exist_ok=True)
     return settings
+
+
+def _project_path(path: Path) -> Path:
+    return path if path.is_absolute() else PROJECT_ROOT / path
