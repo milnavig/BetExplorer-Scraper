@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from .clock import utc_now
+from .clock import now_for_timezone_offset, utc_now
 from .config import Settings
 from .database import Database
 from .models import DiscoveredMatch, OddsSnapshot, TimingStatus
@@ -176,7 +177,7 @@ class CaptureService:
         return result
 
     async def _run_once_locked(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
-        now = now or datetime.now()
+        now = now or now_for_timezone_offset(self.settings.betexplorer_timezone_offset)
         next_discovery = self._next_discovery_at()
         self._progress = {
             **self._idle_progress(),
@@ -504,7 +505,12 @@ class CaptureService:
                     "capture",
                     "snapshot_saved",
                     event_id,
-                    {"market": market, "quality": quality.value, "bookmakers": len(odds)},
+                    {
+                        "market": market,
+                        "quality": quality.value,
+                        "bookmakers": len(odds),
+                        **self._odds_payload_diagnostics(response.text, odds),
+                    },
                 )
                 if quality.value == "COMPLETE":
                     return True, True
@@ -541,3 +547,17 @@ class CaptureService:
         path = self.settings.raw_snapshot_dir / f"{event_id}_{safe_market}_{timestamp}_attempt{attempt}.json"
         path.write_text(payload, encoding="utf-8")
         return path
+
+    def _odds_payload_diagnostics(self, payload: str, odds: list[Any]) -> dict[str, Any]:
+        try:
+            data = json.loads(payload)
+            odds_html = str(data.get("odds", "")) if isinstance(data, dict) else ""
+        except json.JSONDecodeError:
+            odds_html = ""
+        bookmaker_names = sorted({str(row.normalized_bookmaker) for row in odds if row.normalized_bookmaker})
+        return {
+            "payload_bytes": len(payload.encode("utf-8")),
+            "odds_html_bytes": len(odds_html.encode("utf-8")),
+            "no_data_message": "isn't any bookmaker offering odds" in odds_html,
+            "parsed_bookmakers": bookmaker_names[:30],
+        }

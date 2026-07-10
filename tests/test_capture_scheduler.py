@@ -303,6 +303,28 @@ async def test_run_once_fetches_odds_when_match_is_due() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_once_uses_betexplorer_timezone_for_scheduler_now(monkeypatch) -> None:
+    betexplorer_now = datetime(2026, 4, 28, 16, 0)
+    db_path = Path("data/test_tmp/capture_betexplorer_timezone_now.duckdb")
+    if db_path.exists():
+        db_path.unlink()
+    settings = _settings(db_path).model_copy(update={"betexplorer_timezone_offset": "+3"})
+    transport = FakeTransport(betexplorer_now + timedelta(minutes=5))
+    service = CaptureService(settings, Database(db_path), transport)
+    monkeypatch.setattr(
+        "betexplorer_scraper.capture.now_for_timezone_offset",
+        lambda offset: betexplorer_now if offset == "+3" else datetime(2026, 4, 28, 13, 0),
+    )
+
+    result = await service.run_once()
+    row = service.database.list_matches()[0]
+
+    assert result["captured"] == 1
+    assert transport.match_odds_calls == 1
+    assert row["capture_phase"] == "MONITORING"
+
+
+@pytest.mark.asyncio
 async def test_run_once_discovers_future_date_table_rows() -> None:
     now = datetime(2026, 4, 29, 0, 48)
     kickoff = datetime(2026, 4, 29, 23, 0)

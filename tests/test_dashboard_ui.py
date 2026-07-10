@@ -87,8 +87,14 @@ def test_dashboard_tooltips_explain_metrics_with_operational_context() -> None:
         'title={tooltipFor("Refresh data")}',
         'data-testid="download-menu-trigger"',
         'data-testid="import-docx-trigger"',
+        'data-testid="import-zip-trigger"',
+        'data-testid="import-zip-input"',
         "Import DOCX",
+        "Import ZIP",
         "importHistoricalDatabase",
+        "importHistoricalZip",
+        'fetch(`${API_BASE}/api/historical/import-zip`',
+        'accept=".zip,application/zip"',
     ]
 
     for phrase in expected_phrases:

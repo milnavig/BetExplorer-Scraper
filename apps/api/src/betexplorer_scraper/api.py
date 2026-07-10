@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import re
+import zipfile
 from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -94,6 +98,9 @@ class SignalRecomputeRequest(BaseModel):
 
 class ArchiveDateRequest(BaseModel):
     date: date
+
+
+SAFE_IMPORT_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
 def _refresh_historical_signals(reason: str) -> dict[str, int]:
@@ -239,6 +246,74 @@ def historical_import() -> dict[str, int]:
     archive = database.archive_played_matches()
     recompute = database.recompute_historical_signals()
     return {**result, **{f"recompute_{key}": value for key, value in recompute.items()}, **archive}
+
+
+@app.post("/api/historical/import-zip")
+async def historical_import_zip(request: Request) -> dict[str, object]:
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(status_code=400, detail="ZIP payload is empty")
+    filename = unquote(request.headers.get("x-filename", "historical-docx.zip"))
+    import_root = _extract_docx_zip(payload, filename)
+    result = historical_importer.import_roots(_historical_import_roots(import_root))
+    archive = database.archive_played_matches()
+    recompute = database.recompute_historical_signals()
+    return {
+        **result,
+        **{f"recompute_{key}": value for key, value in recompute.items()},
+        **archive,
+        "import_root": str(import_root),
+    }
+
+
+def _extract_docx_zip(payload: bytes, filename: str) -> Path:
+    zip_buffer = io.BytesIO(payload)
+    if not zipfile.is_zipfile(zip_buffer):
+        raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP archive")
+    safe_name = SAFE_IMPORT_NAME_RE.sub("-", Path(filename).stem or "historical-docx").strip(".-") or "historical-docx"
+    import_root = settings.historical_database_root / "_zip_imports" / f"{safe_name}-{utc_now().strftime('%Y%m%d%H%M%S')}"
+    import_root.mkdir(parents=True, exist_ok=True)
+    root_resolved = import_root.resolve()
+    extracted = 0
+    with zipfile.ZipFile(zip_buffer) as archive:
+        for info in archive.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(".docx"):
+                continue
+            relative_path = Path(info.filename)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise HTTPException(status_code=400, detail="ZIP archive contains an unsafe path")
+            target = import_root / relative_path
+            if not target.resolve().is_relative_to(root_resolved):
+                raise HTTPException(status_code=400, detail="ZIP archive contains an unsafe path")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, target.open("wb") as destination:
+                destination.write(source.read())
+            extracted += 1
+    if extracted == 0:
+        raise HTTPException(status_code=400, detail="ZIP archive does not contain DOCX files")
+    return import_root
+
+
+def _historical_import_roots(import_root: Path) -> list[Path]:
+    candidates = [import_root, *[item for item in import_root.rglob("*") if item.is_dir()]]
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not _looks_like_historical_root(candidate):
+            continue
+        if any(candidate != root and root in candidate.parents for root in roots):
+            continue
+        roots.append(candidate)
+    return roots or [import_root]
+
+
+def _looks_like_historical_root(path: Path) -> bool:
+    name = path.name.lower()
+    if "odds" in name or "gebruikbare" in name or "usable" in name:
+        return True
+    return any(
+        child.is_dir() and ("odds" in child.name.lower() or "gebruikbare" in child.name.lower() or "usable" in child.name.lower())
+        for child in path.iterdir()
+    )
 
 
 @app.get("/api/signals")

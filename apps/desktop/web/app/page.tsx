@@ -19,7 +19,7 @@ import {
   CalendarDays,
   Upload,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 const API_BASE =
@@ -336,6 +336,7 @@ type HistoricalImportResult = {
   recompute_matches_evaluated: number;
   recompute_signals: number;
   archived: number;
+  import_root?: string;
 };
 
 type MatchFilter =
@@ -419,6 +420,7 @@ export default function Dashboard() {
   const selectedIdRef = useRef<string | null>(null);
   const detailCacheRef = useRef<Map<string, MatchDetail>>(new Map());
   const signalCacheRef = useRef<Map<string, HistoricalSignal[]>>(new Map());
+  const zipImportInputRef = useRef<HTMLInputElement | null>(null);
   const didLoadInitialMatchesRef = useRef(false);
   const matchListMoreRef = useRef<HTMLDivElement | null>(null);
   const oddsListMoreRef = useRef<HTMLDivElement | null>(null);
@@ -858,6 +860,22 @@ export default function Dashboard() {
     });
   };
 
+  const refreshHistoricalSignalState = async () => {
+    signalCacheRef.current.clear();
+    const currentSelectedId = selectedIdRef.current;
+    const [nextSelectedSignals, nextHistoricalImportStatus] = await Promise.all([
+      currentSelectedId
+        ? api<HistoricalSignal[]>(`/api/signals/${currentSelectedId}`)
+        : Promise.resolve([]),
+      api<HistoricalImportStatus>("/api/historical/import-status"),
+    ]);
+    if (currentSelectedId) {
+      signalCacheRef.current.set(currentSelectedId, nextSelectedSignals);
+    }
+    setSelectedSignals(nextSelectedSignals);
+    setHistoricalImportStatus(nextHistoricalImportStatus);
+  };
+
   const importHistoricalDatabase = () => {
     startTransition(async () => {
       setError(null);
@@ -865,19 +883,7 @@ export default function Dashboard() {
         await api<HistoricalImportResult>("/api/historical/import", {
           method: "POST",
         });
-        signalCacheRef.current.clear();
-        const currentSelectedId = selectedIdRef.current;
-        const [nextSelectedSignals, nextHistoricalImportStatus] = await Promise.all([
-          currentSelectedId
-            ? api<HistoricalSignal[]>(`/api/signals/${currentSelectedId}`)
-            : Promise.resolve([]),
-          api<HistoricalImportStatus>("/api/historical/import-status"),
-        ]);
-        if (currentSelectedId) {
-          signalCacheRef.current.set(currentSelectedId, nextSelectedSignals);
-        }
-        setSelectedSignals(nextSelectedSignals);
-        setHistoricalImportStatus(nextHistoricalImportStatus);
+        await refreshHistoricalSignalState();
       } catch (nextError) {
         setError(
           nextError instanceof Error
@@ -886,6 +892,40 @@ export default function Dashboard() {
         );
       }
     });
+  };
+
+  const importHistoricalZip = (file: File) => {
+    startTransition(async () => {
+      setError(null);
+      try {
+        const response = await fetch(`${API_BASE}/api/historical/import-zip`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/zip",
+            "X-Filename": encodeURIComponent(file.name),
+          },
+          body: file,
+        });
+        if (!response.ok) {
+          throw new Error(`${response.status} ${response.statusText}`);
+        }
+        await response.json() as HistoricalImportResult;
+        await refreshHistoricalSignalState();
+      } catch (nextError) {
+        setError(
+          nextError instanceof Error
+            ? nextError.message
+            : "Historical ZIP import failed",
+        );
+      }
+    });
+  };
+
+  const onHistoricalZipSelected = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    importHistoricalZip(file);
   };
 
   return (
@@ -936,6 +976,14 @@ export default function Dashboard() {
 
       <section className="workspace">
         <header className="client-topbar">
+          <input
+            ref={zipImportInputRef}
+            type="file"
+            accept=".zip,application/zip"
+            className="visually-hidden"
+            onChange={onHistoricalZipSelected}
+            data-testid="import-zip-input"
+          />
           <div className="client-status-strip" aria-label="client status summary">
             {topbarStats.map((item) => (
               <StatusChip key={item.label} {...item} />
@@ -972,6 +1020,17 @@ export default function Dashboard() {
             >
               <Upload size={16} />
               Import DOCX
+            </button>
+            <button
+              type="button"
+              onClick={() => zipImportInputRef.current?.click()}
+              disabled={isPending}
+              title="Import a ZIP archive that contains DOCX historical database folders."
+              className="icon-action"
+              data-testid="import-zip-trigger"
+            >
+              <Upload size={16} />
+              Import ZIP
             </button>
             <div className="download-menu">
               <button

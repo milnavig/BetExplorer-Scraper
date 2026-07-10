@@ -21,3 +21,4 @@ har/
 
 .venv/
 /apps/api/data/test_tmp
+/apps/api/data/

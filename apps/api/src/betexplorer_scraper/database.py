@@ -13,6 +13,7 @@ from .clock import utc_now
 from .historical import NEIGHBOR_TOLERANCE, ONE_DRAW_MIN_SAMPLE, compute_outcome_stats, normalize_odds, normalize_score
 from .models import BookmakerOdds, CaptureType, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
 from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
+from .utils import normalize_bookmaker_name
 
 
 def _locked(method):
@@ -561,7 +562,9 @@ class Database:
     def save_snapshot(self, match_id: str, snapshot: OddsSnapshot) -> str:
         snapshot_id = str(uuid.uuid4())
         now = utc_now()
-        self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ? AND market = ?", [match_id, snapshot.market])
+        should_be_final = self._should_promote_snapshot(match_id, snapshot)
+        if should_be_final:
+            self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ? AND market = ?", [match_id, snapshot.market])
         self.connection.execute(
             """
             INSERT INTO odds_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -575,7 +578,7 @@ class Database:
                 snapshot.capture_type.value,
                 snapshot.quality_status.value,
                 True,
-                True,
+                should_be_final,
                 snapshot.source_page_type,
                 snapshot.raw_payload_path,
                 json.dumps(snapshot.required_bookmakers),
@@ -585,6 +588,36 @@ class Database:
         for odds in snapshot.bookmaker_odds:
             self.save_bookmaker_odds(snapshot_id, odds, now)
         return snapshot_id
+
+    def _should_promote_snapshot(self, match_id: str, snapshot: OddsSnapshot) -> bool:
+        current = self.connection.execute(
+            """
+            SELECT id, quality_status, required_bookmakers_json
+            FROM odds_snapshots
+            WHERE match_id = ? AND market = ? AND is_final = TRUE
+            ORDER BY captured_at DESC
+            LIMIT 1
+            """,
+            [match_id, snapshot.market],
+        ).fetchone()
+        if not current:
+            return True
+        current_required = _required_bookmaker_names(current[2])
+        if not current_required:
+            return True
+        placeholders = ", ".join(["?"] * len(current_required))
+        current_score = self.connection.execute(
+            f"""
+            SELECT COUNT(DISTINCT normalized_bookmaker)
+            FROM bookmaker_odds
+            WHERE snapshot_id = ?
+              AND is_available = TRUE
+              AND normalized_bookmaker IN ({placeholders})
+            """,
+            [current[0], *current_required],
+        ).fetchone()[0]
+        new_score = _required_bookmaker_score(snapshot.bookmaker_odds, snapshot.required_bookmakers)
+        return new_score >= int(current_score or 0)
 
     @_locked
     def save_bookmaker_odds(self, snapshot_id: str, odds: BookmakerOdds, created_at: datetime) -> None:
@@ -1678,3 +1711,33 @@ def _draw_similarity(draw: float | None, records: list[dict[str, object]]) -> fl
     if not distances:
         return 0.0
     return round(max(0.0, 100.0 * (1.0 - (sum(distances) / len(distances)))), 1)
+
+
+def _required_bookmaker_names(value: object) -> list[str]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = []
+    elif isinstance(value, list):
+        parsed = value
+    else:
+        parsed = []
+    names = {
+        normalize_bookmaker_name(str(item))
+        for item in parsed
+        if item is not None and normalize_bookmaker_name(str(item))
+    }
+    return sorted(names)
+
+
+def _required_bookmaker_score(odds: list[BookmakerOdds], required_bookmakers: list[str]) -> int:
+    required = set(_required_bookmaker_names(required_bookmakers))
+    if not required:
+        return 0
+    present = {
+        normalize_bookmaker_name(row.normalized_bookmaker or row.bookmaker)
+        for row in odds
+        if row.is_available and normalize_bookmaker_name(row.normalized_bookmaker or row.bookmaker) in required
+    }
+    return len(present)
