@@ -10,7 +10,7 @@ from threading import RLock
 import duckdb
 
 from .clock import utc_now
-from .historical import NEIGHBOR_TOLERANCE, ONE_DRAW_MIN_SAMPLE, compute_outcome_stats, normalize_odds, normalize_score
+from .historical import ONE_DRAW_MIN_SAMPLE, compute_outcome_stats, normalize_odds, normalize_score
 from .models import BookmakerOdds, CaptureType, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
 from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
 from .utils import normalize_bookmaker_name
@@ -864,7 +864,14 @@ class Database:
             """
             SELECT m.id AS match_id, m.betexplorer_match_id AS event_id, m.league, m.home_team, m.away_team,
                    m.kickoff_time, m.capture_phase, m.finalized_at,
-                   o.bookmaker, o.normalized_bookmaker, o.home_odds, o.draw_odds, o.away_odds
+                   MAX(CASE WHEN o.normalized_bookmaker = 'bwin' THEN o.bookmaker END) AS bwin_bookmaker,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'bwin' THEN o.home_odds END) AS bwin_home_odds,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'bwin' THEN o.draw_odds END) AS bwin_draw_odds,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'bwin' THEN o.away_odds END) AS bwin_away_odds,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.bookmaker END) AS unibet_bookmaker,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.home_odds END) AS unibet_home_odds,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.draw_odds END) AS unibet_draw_odds,
+                   MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.away_odds END) AS unibet_away_odds
             FROM matches m
             JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE AND lower(s.market) = '1x2'
             JOIN bookmaker_odds o ON o.snapshot_id = s.id
@@ -872,7 +879,15 @@ class Database:
               AND o.home_odds IS NOT NULL
               AND o.draw_odds IS NOT NULL
               AND o.away_odds IS NOT NULL
-            ORDER BY m.kickoff_time NULLS LAST, m.home_team, o.normalized_bookmaker
+            GROUP BY m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team,
+                     m.kickoff_time, m.capture_phase, m.finalized_at
+            HAVING bwin_home_odds IS NOT NULL
+               AND bwin_draw_odds IS NOT NULL
+               AND bwin_away_odds IS NOT NULL
+               AND unibet_home_odds IS NOT NULL
+               AND unibet_draw_odds IS NOT NULL
+               AND unibet_away_odds IS NOT NULL
+            ORDER BY m.kickoff_time NULLS LAST, m.home_team
             """
         ).fetchall()
         columns = [col[0] for col in self.connection.description]
@@ -882,76 +897,88 @@ class Database:
         self,
         candidate: dict[str, object],
     ) -> list[tuple[str, list[dict[str, object]]]]:
-        home = normalize_odds(candidate["home_odds"])
-        draw = normalize_odds(candidate["draw_odds"])
-        away = normalize_odds(candidate["away_odds"])
-        if home is None or draw is None or away is None:
+        if not _candidate_has_complete_required_odds(candidate):
             return []
-        exact = self._fetch_historical_records(
-            """
-            query_home_odds = ? AND query_draw_odds = ? AND query_away_odds = ?
-            """,
-            [home, draw, away],
-        )
-        neighbor = self._fetch_historical_records(
-            """
-            ABS(query_home_odds - ?) <= ?
-            AND ABS(query_draw_odds - ?) <= ?
-            AND ABS(query_away_odds - ?) <= ?
-            AND NOT (query_home_odds = ? AND query_draw_odds = ? AND query_away_odds = ?)
-            """,
-            [home, NEIGHBOR_TOLERANCE, draw, NEIGHBOR_TOLERANCE, away, NEIGHBOR_TOLERANCE, home, draw, away],
-        )
-        draw_records = self._fetch_historical_records(
-            "ABS(query_draw_odds - ?) <= ?",
-            [draw, NEIGHBOR_TOLERANCE],
-        )
-        groups = [("exact_odds", exact), ("neighbor_odds", neighbor)]
-        primary_datasets = {str(record["dataset"]) for record in [*exact, *neighbor]}
-        draw_records = [record for record in draw_records if str(record["dataset"]) in primary_datasets]
-        if len(draw_records) >= ONE_DRAW_MIN_SAMPLE:
-            groups.append(("one_draw", draw_records))
-        return groups
+        complete_records = self._fetch_complete_historical_records(candidate)
+        dataset_order = ["Odds", "Usable Odds", "Played archive"]
 
-    def _fetch_historical_records(self, where_sql: str, params: list[object]) -> list[dict[str, object]]:
+        exact_records = _matching_complete_records(candidate, complete_records, "exact_odds")
+        for dataset in dataset_order:
+            dataset_records = [record for record in exact_records if record["dataset"] == dataset]
+            if dataset_records:
+                return [("exact_odds", dataset_records)]
+
+        one_draw_records = _matching_complete_records(candidate, complete_records, "one_draw")
+        for dataset in dataset_order:
+            dataset_records = [record for record in one_draw_records if record["dataset"] == dataset]
+            if len(dataset_records) >= ONE_DRAW_MIN_SAMPLE:
+                return [("one_draw", dataset_records)]
+        return []
+
+    def _fetch_complete_historical_records(self, candidate: dict[str, object]) -> list[dict[str, object]]:
         rows = self.connection.execute(
-            f"""
+            """
             WITH historical_pool AS (
-                SELECT dataset, source_file, query_home_odds, query_draw_odds, query_away_odds, full_time_score
+                SELECT dataset, source_file,
+                       query_home_odds AS bwin_home_odds,
+                       query_draw_odds AS bwin_draw_odds,
+                       query_away_odds AS bwin_away_odds,
+                       historical_home_odds AS unibet_home_odds,
+                       historical_draw_odds AS unibet_draw_odds,
+                       historical_away_odds AS unibet_away_odds,
+                       full_time_score,
+                       TRUE AS allow_reverse
                 FROM historical_records
                 WHERE full_time_score IS NOT NULL
+                  AND query_home_odds IS NOT NULL
+                  AND query_draw_odds IS NOT NULL
+                  AND query_away_odds IS NOT NULL
+                  AND historical_home_odds IS NOT NULL
+                  AND historical_draw_odds IS NOT NULL
+                  AND historical_away_odds IS NOT NULL
                 UNION ALL
-                SELECT 'Played archive Bwin' AS dataset, event_id AS source_file,
+                SELECT 'Played archive' AS dataset, event_id AS source_file,
                        bwin_home_odds AS query_home_odds,
                        bwin_draw_odds AS query_draw_odds,
                        bwin_away_odds AS query_away_odds,
-                       full_time_score
-                FROM played_match_archive
-                WHERE full_time_score IS NOT NULL
-                  AND bwin_home_odds IS NOT NULL
-                  AND bwin_draw_odds IS NOT NULL
-                  AND bwin_away_odds IS NOT NULL
-                UNION ALL
-                SELECT 'Played archive Unibet' AS dataset, event_id AS source_file,
                        unibet_home_odds AS query_home_odds,
                        unibet_draw_odds AS query_draw_odds,
                        unibet_away_odds AS query_away_odds,
-                       full_time_score
+                       full_time_score,
+                       FALSE AS allow_reverse
                 FROM played_match_archive
                 WHERE full_time_score IS NOT NULL
                   AND unibet_home_odds IS NOT NULL
                   AND unibet_draw_odds IS NOT NULL
                   AND unibet_away_odds IS NOT NULL
+                  AND bwin_home_odds IS NOT NULL
+                  AND bwin_draw_odds IS NOT NULL
+                  AND bwin_away_odds IS NOT NULL
+                  AND event_id <> ?
             )
-            SELECT dataset, source_file, query_home_odds, query_draw_odds, query_away_odds, full_time_score
+            SELECT dataset, source_file,
+                   bwin_home_odds, bwin_draw_odds, bwin_away_odds,
+                   unibet_home_odds, unibet_draw_odds, unibet_away_odds,
+                   full_time_score, allow_reverse
             FROM historical_pool
-            WHERE {where_sql}
-            ORDER BY dataset, source_file, query_home_odds, query_draw_odds, query_away_odds
+            ORDER BY dataset, source_file, bwin_home_odds, bwin_draw_odds, bwin_away_odds
             """,
-            params,
+            [candidate.get("event_id")],
         ).fetchall()
+        columns = [
+            "dataset",
+            "source_file",
+            "bwin_home_odds",
+            "bwin_draw_odds",
+            "bwin_away_odds",
+            "unibet_home_odds",
+            "unibet_draw_odds",
+            "unibet_away_odds",
+            "full_time_score",
+            "allow_reverse",
+        ]
         return [
-            dict(zip(["dataset", "source_file", "query_home_odds", "query_draw_odds", "query_away_odds", "full_time_score"], row))
+            dict(zip(columns, row))
             for row in rows
         ]
 
@@ -970,77 +997,78 @@ class Database:
             stats = compute_outcome_stats(scores)
             explanation = _signal_explanation(signal_type)
             signal_rank = _signal_rank(signal_type)
-            similarity = _signal_similarity(candidate, signal_type, dataset_records)
-            matched_home = _average_odds(dataset_records, "query_home_odds")
-            matched_draw = _average_odds(dataset_records, "query_draw_odds")
-            matched_away = _average_odds(dataset_records, "query_away_odds")
-            current_home = normalize_odds(candidate["home_odds"])
-            current_draw = normalize_odds(candidate["draw_odds"])
-            current_away = normalize_odds(candidate["away_odds"])
-            distance_home = _odds_distance(current_home, matched_home)
-            distance_draw = _odds_distance(current_draw, matched_draw)
-            distance_away = _odds_distance(current_away, matched_away)
             source_files = sorted({str(record["source_file"]) for record in dataset_records})[:20]
             historical_scores = scores[:10]
-            self.connection.execute(
-                """
-                INSERT INTO historical_signals (
-                    id, match_id, event_id, league, home_team, away_team, kickoff_time, capture_phase,
-                    bookmaker, normalized_bookmaker, dataset, signal_type,
-                    current_home_odds, current_draw_odds, current_away_odds,
-                    matched_odds_home, matched_odds_draw, matched_odds_away,
-                    odds_distance_home, odds_distance_draw, odds_distance_away,
-                    similarity_score, match_explanation, signal_rank,
-                    sample_size, home_win_pct, draw_pct, away_win_pct,
-                    over_0_5_pct, over_1_5_pct, over_2_5_pct, btts_pct,
-                    double_chance_1x_pct, double_chance_x2_pct, double_chance_12_pct,
-                    historical_scores_json, source_files_json, created_at
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            for normalized_bookmaker, bookmaker in [("bwin", "Bwin"), ("unibet", "Unibet")]:
+                similarity = _signal_similarity(signal_type)
+                matched_home = _average_odds(dataset_records, f"{normalized_bookmaker}_home_odds")
+                matched_draw = _average_odds(dataset_records, f"{normalized_bookmaker}_draw_odds")
+                matched_away = _average_odds(dataset_records, f"{normalized_bookmaker}_away_odds")
+                current_home = normalize_odds(candidate[f"{normalized_bookmaker}_home_odds"])
+                current_draw = normalize_odds(candidate[f"{normalized_bookmaker}_draw_odds"])
+                current_away = normalize_odds(candidate[f"{normalized_bookmaker}_away_odds"])
+                distance_home = _odds_distance(current_home, matched_home)
+                distance_draw = _odds_distance(current_draw, matched_draw)
+                distance_away = _odds_distance(current_away, matched_away)
+                self.connection.execute(
+                    """
+                    INSERT INTO historical_signals (
+                        id, match_id, event_id, league, home_team, away_team, kickoff_time, capture_phase,
+                        bookmaker, normalized_bookmaker, dataset, signal_type,
+                        current_home_odds, current_draw_odds, current_away_odds,
+                        matched_odds_home, matched_odds_draw, matched_odds_away,
+                        odds_distance_home, odds_distance_draw, odds_distance_away,
+                        similarity_score, match_explanation, signal_rank,
+                        sample_size, home_win_pct, draw_pct, away_win_pct,
+                        over_0_5_pct, over_1_5_pct, over_2_5_pct, btts_pct,
+                        double_chance_1x_pct, double_chance_x2_pct, double_chance_12_pct,
+                        historical_scores_json, source_files_json, created_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    [
+                        str(uuid.uuid4()),
+                        candidate["match_id"],
+                        candidate["event_id"],
+                        candidate["league"],
+                        candidate["home_team"],
+                        candidate["away_team"],
+                        candidate["kickoff_time"],
+                        self._effective_capture_phase(candidate.get("capture_phase"), candidate.get("finalized_at")),
+                        bookmaker,
+                        normalized_bookmaker,
+                        dataset,
+                        signal_type,
+                        current_home,
+                        current_draw,
+                        current_away,
+                        matched_home,
+                        matched_draw,
+                        matched_away,
+                        distance_home,
+                        distance_draw,
+                        distance_away,
+                        similarity,
+                        explanation,
+                        signal_rank,
+                        stats["sample_size"],
+                        stats["home_win_pct"],
+                        stats["draw_pct"],
+                        stats["away_win_pct"],
+                        stats["over_0_5_pct"],
+                        stats["over_1_5_pct"],
+                        stats["over_2_5_pct"],
+                        stats["btts_pct"],
+                        stats["double_chance_1x_pct"],
+                        stats["double_chance_x2_pct"],
+                        stats["double_chance_12_pct"],
+                        json.dumps(historical_scores),
+                        json.dumps(source_files),
+                        utc_now(),
+                    ],
                 )
-                """,
-                [
-                    str(uuid.uuid4()),
-                    candidate["match_id"],
-                    candidate["event_id"],
-                    candidate["league"],
-                    candidate["home_team"],
-                    candidate["away_team"],
-                    candidate["kickoff_time"],
-                    self._effective_capture_phase(candidate.get("capture_phase"), candidate.get("finalized_at")),
-                    candidate["bookmaker"],
-                    candidate["normalized_bookmaker"],
-                    dataset,
-                    signal_type,
-                    current_home,
-                    current_draw,
-                    current_away,
-                    matched_home,
-                    matched_draw,
-                    matched_away,
-                    distance_home,
-                    distance_draw,
-                    distance_away,
-                    similarity,
-                    explanation,
-                    signal_rank,
-                    stats["sample_size"],
-                    stats["home_win_pct"],
-                    stats["draw_pct"],
-                    stats["away_win_pct"],
-                    stats["over_0_5_pct"],
-                    stats["over_1_5_pct"],
-                    stats["over_2_5_pct"],
-                    stats["btts_pct"],
-                    stats["double_chance_1x_pct"],
-                    stats["double_chance_x2_pct"],
-                    stats["double_chance_12_pct"],
-                    json.dumps(historical_scores),
-                    json.dumps(source_files),
-                    utc_now(),
-                ],
-            )
-            inserted += 1
+                inserted += 1
         return inserted
 
     @_locked
@@ -1689,11 +1717,11 @@ def _odds_distance(current: float | None, matched: float | None) -> float | None
 
 def _signal_explanation(signal_type: str) -> str:
     if signal_type == "exact_odds":
-        return "Exact 1X2 odds"
+        return "Exact 6-odds Bwin + Unibet match"
     if signal_type == "neighbor_odds":
         return "Nearby odds within 0.05"
     if signal_type == "one_draw":
-        return "Draw-only historical pattern"
+        return "One draw odd differs; other five odds match"
     return "Historical odds pattern"
 
 
@@ -1729,48 +1757,106 @@ def _signal_order_sql(sort_mode: str) -> str:
     )
 
 
-def _signal_similarity(candidate: dict[str, object], signal_type: str, records: list[dict[str, object]]) -> float:
-    home = normalize_odds(candidate.get("home_odds"))
-    draw = normalize_odds(candidate.get("draw_odds"))
-    away = normalize_odds(candidate.get("away_odds"))
+def _candidate_has_complete_required_odds(candidate: dict[str, object]) -> bool:
+    keys = [
+        "bwin_home_odds",
+        "bwin_draw_odds",
+        "bwin_away_odds",
+        "unibet_home_odds",
+        "unibet_draw_odds",
+        "unibet_away_odds",
+    ]
+    return all(normalize_odds(candidate.get(key)) is not None for key in keys)
+
+
+def _matching_complete_records(
+    candidate: dict[str, object],
+    records: list[dict[str, object]],
+    signal_type: str,
+) -> list[dict[str, object]]:
+    matched: list[dict[str, object]] = []
+    for record in records:
+        oriented = _oriented_complete_record(candidate, record, signal_type)
+        if oriented:
+            matched.append(oriented)
+    return matched
+
+
+def _oriented_complete_record(
+    candidate: dict[str, object],
+    record: dict[str, object],
+    signal_type: str,
+) -> dict[str, object] | None:
+    orientations = [_record_with_orientation(record, reverse=False)]
+    if record.get("allow_reverse"):
+        orientations.append(_record_with_orientation(record, reverse=True))
+    for oriented in orientations:
+        if signal_type == "exact_odds" and _is_exact_six_odds(candidate, oriented):
+            return oriented
+        if signal_type == "one_draw" and _is_one_draw_match(candidate, oriented):
+            return oriented
+    return None
+
+
+def _record_with_orientation(record: dict[str, object], reverse: bool) -> dict[str, object]:
+    if not reverse:
+        return record
+    oriented = dict(record)
+    for side in ["home", "draw", "away"]:
+        bwin_key = f"bwin_{side}_odds"
+        unibet_key = f"unibet_{side}_odds"
+        oriented[bwin_key], oriented[unibet_key] = oriented[unibet_key], oriented[bwin_key]
+    return oriented
+
+
+def _is_exact_six_odds(candidate: dict[str, object], record: dict[str, object]) -> bool:
+    return all(
+        normalize_odds(candidate.get(f"{bookmaker}_{side}_odds"))
+        == normalize_odds(record.get(f"{bookmaker}_{side}_odds"))
+        for bookmaker in ["bwin", "unibet"]
+        for side in ["home", "draw", "away"]
+    )
+
+
+def _is_one_draw_match(candidate: dict[str, object], record: dict[str, object]) -> bool:
+    bwin_draw_differs = _bookmaker_has_one_draw_difference(candidate, record, "bwin")
+    unibet_draw_differs = _bookmaker_has_one_draw_difference(candidate, record, "unibet")
+    bwin_exact = _bookmaker_is_exact(candidate, record, "bwin")
+    unibet_exact = _bookmaker_is_exact(candidate, record, "unibet")
+    return (bwin_draw_differs and unibet_exact) or (unibet_draw_differs and bwin_exact)
+
+
+def _bookmaker_is_exact(candidate: dict[str, object], record: dict[str, object], bookmaker: str) -> bool:
+    return all(
+        normalize_odds(candidate.get(f"{bookmaker}_{side}_odds"))
+        == normalize_odds(record.get(f"{bookmaker}_{side}_odds"))
+        for side in ["home", "draw", "away"]
+    )
+
+
+def _bookmaker_has_one_draw_difference(
+    candidate: dict[str, object],
+    record: dict[str, object],
+    bookmaker: str,
+) -> bool:
+    home_exact = normalize_odds(candidate.get(f"{bookmaker}_home_odds")) == normalize_odds(
+        record.get(f"{bookmaker}_home_odds")
+    )
+    away_exact = normalize_odds(candidate.get(f"{bookmaker}_away_odds")) == normalize_odds(
+        record.get(f"{bookmaker}_away_odds")
+    )
+    draw_differs = normalize_odds(candidate.get(f"{bookmaker}_draw_odds")) != normalize_odds(
+        record.get(f"{bookmaker}_draw_odds")
+    )
+    return home_exact and away_exact and draw_differs
+
+
+def _signal_similarity(signal_type: str) -> float:
     if signal_type == "exact_odds":
         return 100.0
     if signal_type == "one_draw":
-        return _draw_similarity(draw, records)
-    if signal_type == "neighbor_odds":
-        if home is None or draw is None or away is None:
-            return 0.0
-        distances: list[float] = []
-        for record in records:
-            record_home = normalize_odds(record.get("query_home_odds"))
-            record_draw = normalize_odds(record.get("query_draw_odds"))
-            record_away = normalize_odds(record.get("query_away_odds"))
-            if record_home is None or record_draw is None or record_away is None:
-                continue
-            distances.extend(
-                [
-                    abs(home - record_home) / NEIGHBOR_TOLERANCE,
-                    abs(draw - record_draw) / NEIGHBOR_TOLERANCE,
-                    abs(away - record_away) / NEIGHBOR_TOLERANCE,
-                ]
-            )
-        if not distances:
-            return 0.0
-        return round(min(99.0, max(0.0, 100.0 * (1.0 - (sum(distances) / len(distances))))), 1)
+        return 83.3
     return 0.0
-
-
-def _draw_similarity(draw: float | None, records: list[dict[str, object]]) -> float:
-    if draw is None:
-        return 0.0
-    distances: list[float] = []
-    for record in records:
-        record_draw = normalize_odds(record.get("query_draw_odds"))
-        if record_draw is not None:
-            distances.append(abs(draw - record_draw) / NEIGHBOR_TOLERANCE)
-    if not distances:
-        return 0.0
-    return round(max(0.0, 100.0 * (1.0 - (sum(distances) / len(distances)))), 1)
 
 
 def _required_bookmaker_names(value: object) -> list[str]:

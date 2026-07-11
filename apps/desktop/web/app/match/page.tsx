@@ -1125,17 +1125,17 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 
 function signalTypeLabel(value: string) {
   const labels: Record<string, string> = {
-    exact_odds: "Exact odds",
-    neighbor_odds: "Neighbor odds",
+    exact_odds: "Exact 6 odds",
+    neighbor_odds: "Nearby odds",
     one_draw: "One draw",
   };
   return labels[value] ?? value;
 }
 
 function matchBasisLabel(signal: HistoricalSignal) {
-  if (signal.signal_type === "exact_odds") return "Full 1X2 exact odds";
+  if (signal.signal_type === "exact_odds") return "Bwin + Unibet exact 6 odds";
   if (signal.signal_type === "neighbor_odds") return "Full 1X2 nearby odds";
-  if (signal.signal_type === "one_draw") return "Draw odds only";
+  if (signal.signal_type === "one_draw") return "One draw odd differs; other five odds match";
   return signal.match_explanation;
 }
 
@@ -1147,7 +1147,6 @@ function signalStrengthLabel(signal: HistoricalSignal) {
 }
 
 function usedForMatch(signal: HistoricalSignal, side: "home" | "draw" | "away") {
-  if (signal.signal_type === "one_draw") return side === "draw" ? "Yes" : "No";
   return "Yes";
 }
 
@@ -1204,9 +1203,9 @@ function formatSelectedDay(value: string) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "exact_odds") return "Exact odds";
+  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "Draw-only";
+  if (signal.signal_type === "one_draw") return "5 of 6 odds";
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 

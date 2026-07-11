@@ -2750,8 +2750,8 @@ function formatSelectedDay(value: string) {
 
 function signalTypeLabel(value: string) {
   const labels: Record<string, string> = {
-    exact_odds: "Exact odds",
-    neighbor_odds: "Neighbor odds",
+    exact_odds: "Exact 6 odds",
+    neighbor_odds: "Nearby odds",
     one_draw: "One draw",
   };
   return labels[value] ?? value;
@@ -2817,9 +2817,9 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "exact_odds") return "Exact odds";
+  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "Draw-only";
+  if (signal.signal_type === "one_draw") return "5 of 6 odds";
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 

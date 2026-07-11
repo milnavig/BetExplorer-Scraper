@@ -21,7 +21,7 @@ import { useEffect, useMemo, useState } from "react";
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
-type SignalTab = "all" | "exact_odds" | "neighbor_odds" | "one_draw";
+type SignalTab = "all" | "exact_odds" | "one_draw";
 type SignalScope = "active" | "archive";
 type SignalSort = "quality" | "kickoff_asc" | "kickoff_desc" | "sample_desc";
 
@@ -485,19 +485,13 @@ export default function SignalsPage() {
               onClick={() => setActiveTab("all")}
             />
             <SignalTabButton
-              label="Exact"
+              label="Exact 6 odds"
               count={counts.exact_odds}
               active={activeTab === "exact_odds"}
               onClick={() => setActiveTab("exact_odds")}
             />
             <SignalTabButton
-              label="Nearby"
-              count={counts.neighbor_odds}
-              active={activeTab === "neighbor_odds"}
-              onClick={() => setActiveTab("neighbor_odds")}
-            />
-            <SignalTabButton
-              label="Draw-only"
+              label="One draw"
               count={counts.one_draw}
               active={activeTab === "one_draw"}
               onClick={() => setActiveTab("one_draw")}
@@ -670,7 +664,7 @@ function SignalRow({ group }: { group: SignalGroup }) {
   const signal = group.bestSignal;
   const bwin = bookmakerOdds(group, "bwin");
   const unibet = bookmakerOdds(group, "unibet");
-  const signalMeta = `${signalMatchLabel(group)} · ${group.datasets.join(" + ")}`;
+  const signalMeta = `${signalMatchLabel(group)} · ${group.datasets.map(datasetLabel).join(" + ")}`;
 
   return (
     <article className={`signal-row ${signal.signal_type}`}>
@@ -791,45 +785,27 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 
 function signalTypeLabel(group: SignalGroup) {
   const signal = group.bestSignal;
-  if (signal.signal_type === "exact_odds") return `${bookmakerSourceLabel(group, "exact_odds")} exact`;
-  if (signal.signal_type === "neighbor_odds") return `${bookmakerSourceLabel(group, "neighbor_odds")} nearby`;
-  if (signal.signal_type === "one_draw") return `${bookmakerSourceLabel(group, "one_draw")} draw-only`;
+  if (signal.signal_type === "exact_odds") return "6-odds exact";
+  if (signal.signal_type === "neighbor_odds") return "Nearby";
+  if (signal.signal_type === "one_draw") return "One draw";
   return signal.signal_type;
 }
 
 function signalMatchBadge(group: SignalGroup) {
   const signal = group.bestSignal;
-  if (signal.signal_type === "exact_odds") return "Exact odds";
+  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "Draw-only";
+  if (signal.signal_type === "one_draw") return "5 of 6 odds";
   return formatPct(signal.similarity_score);
 }
 
 function signalMatchLabel(group: SignalGroup) {
   const signal = group.bestSignal;
-  const source = bookmakerSourceLabel(group, signal.signal_type);
-  if (signal.signal_type === "exact_odds") return `${source} exact 1X2`;
+  const source = group.datasets.map(datasetLabel).join(" + ");
+  if (signal.signal_type === "exact_odds") return `${source} exact 6 odds`;
   if (signal.signal_type === "neighbor_odds") return `${source} nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return `${source} draw odds pattern`;
+  if (signal.signal_type === "one_draw") return `${source} one draw odd differs`;
   return `${source} ${signal.signal_type}`;
-}
-
-function bookmakerSourceLabel(group: SignalGroup, signalType: string) {
-  const bookmakers = uniqueSorted(
-    group.signals
-      .filter((signal) => signal.signal_type === signalType)
-      .map((signal) => signal.normalized_bookmaker),
-  );
-  const labels = bookmakers.map(bookmakerDisplayName);
-  if (labels.length === 0) return bookmakerDisplayName(group.bestSignal.normalized_bookmaker);
-  if (labels.length === 1) return labels[0];
-  return labels.join(" + ");
-}
-
-function bookmakerDisplayName(value: string) {
-  if (value === "bwin") return "Bwin";
-  if (value === "unibet") return "Unibet";
-  return value;
 }
 
 function similarityBadgeClass(signal: HistoricalSignal) {
@@ -838,6 +814,13 @@ function similarityBadgeClass(signal: HistoricalSignal) {
   if (score >= 95) return "similarity-badge strong";
   if (score >= 70) return "similarity-badge medium";
   return "similarity-badge weak";
+}
+
+function datasetLabel(value: string) {
+  if (value === "Odds") return "ODDS";
+  if (value === "Usable Odds") return "USABLE ODDS";
+  if (value === "Played archive") return "PLAYED ARCHIVE";
+  return value;
 }
 
 function archivePhaseLabel(phase: string | null | undefined) {

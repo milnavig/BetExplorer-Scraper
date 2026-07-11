@@ -99,11 +99,11 @@ def test_historical_auto_refresh_imports_docx_and_recomputes_signals(tmp_path: P
     root = tmp_path / "SAMPLE_DATABASE"
     _write_docx(
         root / "2.00 Sample_Database ODDS" / "3.00" / "ODDS.docx",
-        [
-            ["2.00", "3.40", "3.00", "", ""],
-            ["2.00", "3.40", "3.00", "1-0.", "0-0."],
-        ],
-    )
+            [
+                ["2.00", "3.40", "3.00", "", ""],
+                ["2.05", "3.45", "3.10", "1-0.", "0-0."],
+            ],
+        )
     db = Database(tmp_path / "auto_refresh.duckdb")
     match_id = _seed_match_with_required_1x2(db)
     refresh = HistoricalSignalAutoRefresh(db, HistoricalDocxImporter(db), [root])
@@ -114,7 +114,7 @@ def test_historical_auto_refresh_imports_docx_and_recomputes_signals(tmp_path: P
     signals = db.list_signals(match_id=match_id)
     assert first["files_seen"] == 1
     assert first["files_imported"] == 1
-    assert first["recompute_signals"] >= 1
+    assert first["recompute_signals"] == 2
     assert second["files_seen"] == 1
     assert second["files_imported"] == 0
     assert signals[0]["signal_type"] == "exact_odds"
@@ -137,7 +137,7 @@ def test_signal_stats_calculate_outcomes_totals_btts_and_double_chance() -> None
     assert stats["double_chance_12_pct"] == 50.0
 
 
-def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path) -> None:
+def test_database_recomputes_exact_six_odds_from_primary_database(tmp_path: Path) -> None:
     db = Database(tmp_path / "signals.duckdb")
     match_id = _seed_match_with_required_1x2(db)
     db.replace_historical_records(
@@ -151,8 +151,8 @@ def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path)
                 "query_home_odds": 2.00,
                 "query_draw_odds": 3.40,
                 "query_away_odds": 3.00,
-                "historical_home_odds": 1.95,
-                "historical_draw_odds": 3.35,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
                 "historical_away_odds": 3.10,
                 "full_time_score": "2-1",
                 "half_time_score": "1-0",
@@ -180,9 +180,9 @@ def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path)
                 "source_file": "usable.docx",
                 "source_home_bucket": 3.10,
                 "source_away_file": 3.10,
-                "query_home_odds": 2.05,
-                "query_draw_odds": 3.45,
-                "query_away_odds": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.40,
+                "query_away_odds": 3.00,
                 "historical_home_odds": 2.05,
                 "historical_draw_odds": 3.45,
                 "historical_away_odds": 3.10,
@@ -198,34 +198,80 @@ def test_database_recomputes_exact_neighbor_and_one_draw_signals(tmp_path: Path)
     signals = db.list_signals()
     match_signals = db.list_signals(match_id=match_id)
 
-    assert summary["signals"] >= 4
+    assert summary["signals"] == 2
     assert {signal["bookmaker"] for signal in signals} == {"Bwin", "Unibet"}
-    assert {"exact_odds", "neighbor_odds", "one_draw"}.issubset({signal["signal_type"] for signal in signals})
+    assert {signal["signal_type"] for signal in signals} == {"exact_odds"}
+    assert {signal["dataset"] for signal in signals} == {"Odds"}
     exact = next(signal for signal in signals if signal["bookmaker"] == "Bwin" and signal["signal_type"] == "exact_odds")
     assert exact["sample_size"] == 1
     assert exact["home_win_pct"] == 100.0
     assert exact["historical_scores"] == ["2-1"]
     assert exact["similarity_score"] == 100.0
     assert exact["signal_rank"] == 1
-    assert exact["match_explanation"] == "Exact 1X2 odds"
+    assert exact["match_explanation"] == "Exact 6-odds Bwin + Unibet match"
     assert exact["matched_odds_home"] == 2.0
     assert exact["matched_odds_draw"] == 3.4
     assert exact["matched_odds_away"] == 3.0
     assert exact["odds_distance_home"] == 0.0
     assert exact["odds_distance_draw"] == 0.0
     assert exact["odds_distance_away"] == 0.0
-    neighbor = next(signal for signal in signals if signal["bookmaker"] == "Bwin" and signal["signal_type"] == "neighbor_odds")
-    assert neighbor["signal_rank"] == 2
-    assert neighbor["match_explanation"] == "Nearby odds within 0.05"
-    assert neighbor["matched_odds_away"] == 3.05
-    assert neighbor["odds_distance_away"] == 0.05
-    assert neighbor["similarity_score"] == 66.7
-    one_draw = next(signal for signal in signals if signal["signal_type"] == "one_draw")
-    assert one_draw["signal_rank"] == 3
-    assert one_draw["match_explanation"] == "Draw-only historical pattern"
-    assert one_draw["sample_size"] == 2
-    assert one_draw["draw_pct"] == 50.0
     assert match_signals
+
+
+def test_database_recomputes_one_draw_only_when_no_exact_exists(tmp_path: Path) -> None:
+    db = Database(tmp_path / "one_draw.duckdb")
+    _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "one_draw.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "one_draw.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.50,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "1-1",
+                "half_time_score": "0-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+            {
+                "dataset": "Odds",
+                "source_file": "one_draw.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.60,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "2-2",
+                "half_time_score": "1-1",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+        ],
+    )
+
+    summary = db.recompute_historical_signals()
+    signals = db.list_signals()
+
+    assert summary["signals"] == 2
+    assert {signal["signal_type"] for signal in signals} == {"one_draw"}
+    one_draw = next(signal for signal in signals if signal["bookmaker"] == "Bwin")
+    assert one_draw["signal_rank"] == 3
+    assert one_draw["match_explanation"] == "One draw odd differs; other five odds match"
+    assert one_draw["sample_size"] == 2
+    assert one_draw["draw_pct"] == 100.0
+    assert one_draw["matched_odds_home"] == 2.0
+    assert one_draw["matched_odds_draw"] == 3.55
+    assert one_draw["matched_odds_away"] == 3.0
 
 
 def test_database_does_not_emit_one_draw_without_primary_odds_match(tmp_path: Path) -> None:
@@ -242,9 +288,9 @@ def test_database_does_not_emit_one_draw_without_primary_odds_match(tmp_path: Pa
                 "query_home_odds": 5.00,
                 "query_draw_odds": 3.40,
                 "query_away_odds": 5.00,
-                "historical_home_odds": 5.00,
-                "historical_draw_odds": 3.40,
-                "historical_away_odds": 5.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
                 "full_time_score": "1-1",
                 "half_time_score": "0-0",
                 "parse_status": "parsed",
@@ -258,9 +304,9 @@ def test_database_does_not_emit_one_draw_without_primary_odds_match(tmp_path: Pa
                 "query_home_odds": 6.00,
                 "query_draw_odds": 3.42,
                 "query_away_odds": 6.00,
-                "historical_home_odds": 6.00,
-                "historical_draw_odds": 3.42,
-                "historical_away_odds": 6.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
                 "full_time_score": "2-2",
                 "half_time_score": "1-1",
                 "parse_status": "parsed",
@@ -289,9 +335,9 @@ def test_list_signals_can_filter_to_actionable_matches(tmp_path: Path) -> None:
                 "query_home_odds": 2.00,
                 "query_draw_odds": 3.40,
                 "query_away_odds": 3.00,
-                "historical_home_odds": 2.00,
-                "historical_draw_odds": 3.40,
-                "historical_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
                 "full_time_score": "1-0",
                 "half_time_score": "0-0",
                 "parse_status": "parsed",
@@ -333,6 +379,7 @@ def test_list_signals_can_filter_archive_by_exact_date_and_list_signal_days(tmp_
             required_bookmakers=["Bwin", "Unibet"],
             bookmaker_odds=[
                 BookmakerOdds("Bwin", "bwin", 2.00, 3.40, 3.00),
+                BookmakerOdds("Unibet", "unibet", 2.05, 3.45, 3.10),
             ],
         ),
     )
@@ -347,9 +394,9 @@ def test_list_signals_can_filter_archive_by_exact_date_and_list_signal_days(tmp_
                 "query_home_odds": 2.00,
                 "query_draw_odds": 3.40,
                 "query_away_odds": 3.00,
-                "historical_home_odds": 2.00,
-                "historical_draw_odds": 3.40,
-                "historical_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
                 "full_time_score": "1-0",
                 "half_time_score": "0-0",
                 "parse_status": "parsed",
@@ -387,13 +434,38 @@ def test_database_archives_played_matches_with_required_bookmaker_odds(tmp_path:
 
 def test_played_match_archive_expands_historical_signal_pool(tmp_path: Path) -> None:
     db = Database(tmp_path / "archive_signals.duckdb")
-    match_id = _seed_match_with_required_1x2(db)
-    db.mark_result_captured(match_id, "2:1", datetime(2026, 5, 14, 22, 0))
+    archived_match_id = _seed_match_with_required_1x2(db)
+    db.mark_result_captured(archived_match_id, "2:1", datetime(2026, 5, 14, 22, 0))
     db.archive_played_matches()
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="future123",
+            source_url="https://www.betexplorer.com/football/test/future123/",
+            league="Signal League",
+            home_team="Future Home",
+            away_team="Future Away",
+            kickoff_time=datetime(2026, 5, 15, 20, 0),
+            timing_status=TimingStatus.UPCOMING_SOON,
+        )
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="future123",
+            market="1x2",
+            captured_at=datetime(2026, 5, 15, 19, 55),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 2.00, 3.40, 3.00),
+                BookmakerOdds("Unibet", "unibet", 2.05, 3.45, 3.10),
+            ],
+        ),
+    )
 
     summary = db.recompute_historical_signals()
     signals = db.list_signals(match_id=match_id)
 
-    assert summary["signals"] >= 2
-    assert {signal["dataset"] for signal in signals} >= {"Played archive Bwin", "Played archive Unibet"}
+    assert summary["signals"] == 2
+    assert {signal["dataset"] for signal in signals} == {"Played archive"}
     assert all(signal["sample_size"] >= 1 for signal in signals)

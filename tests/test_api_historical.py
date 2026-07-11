@@ -52,15 +52,18 @@ def test_historical_signal_api_exposes_status_recompute_and_match_signals(monkey
     )
     db.save_snapshot(
         match_id,
-        OddsSnapshot(
-            event_id="api123",
-            market="1x2",
-            captured_at=datetime(2026, 5, 14, 19, 55),
-            quality_status=SnapshotQuality.COMPLETE,
-            required_bookmakers=["Bwin"],
-            bookmaker_odds=[BookmakerOdds("Bwin", "bwin", 2.0, 3.4, 3.0)],
-        ),
-    )
+            OddsSnapshot(
+                event_id="api123",
+                market="1x2",
+                captured_at=datetime(2026, 5, 14, 19, 55),
+                quality_status=SnapshotQuality.COMPLETE,
+                required_bookmakers=["Bwin", "Unibet"],
+                bookmaker_odds=[
+                    BookmakerOdds("Bwin", "bwin", 2.0, 3.4, 3.0),
+                    BookmakerOdds("Unibet", "unibet", 2.05, 3.45, 3.1),
+                ],
+            ),
+        )
     db.replace_historical_records(
         "api.docx",
         [
@@ -72,9 +75,9 @@ def test_historical_signal_api_exposes_status_recompute_and_match_signals(monkey
                 "query_home_odds": 2.0,
                 "query_draw_odds": 3.4,
                 "query_away_odds": 3.0,
-                "historical_home_odds": 2.0,
-                "historical_draw_odds": 3.4,
-                "historical_away_odds": 3.0,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.1,
                 "full_time_score": "1-0",
                 "half_time_score": "0-0",
                 "parse_status": "parsed",
@@ -93,12 +96,12 @@ def test_historical_signal_api_exposes_status_recompute_and_match_signals(monkey
     assert status.status_code == 200
     assert status.json()["records"] == 1
     assert recompute.status_code == 200
-    assert recompute.json()["signals"] == 1
+    assert recompute.json()["signals"] == 2
     assert signals.status_code == 200
     assert signals.json()[0]["signal_type"] == "exact_odds"
     assert signals.json()[0]["historical_scores"] == ["1-0"]
     assert signals.json()[0]["similarity_score"] == 100.0
-    assert signals.json()[0]["match_explanation"] == "Exact 1X2 odds"
+    assert signals.json()[0]["match_explanation"] == "Exact 6-odds Bwin + Unibet match"
     assert signals.json()[0]["signal_rank"] == 1
     assert signals.json()[0]["matched_odds_home"] == 2.0
     assert signals.json()[0]["odds_distance_home"] == 0.0
@@ -121,15 +124,18 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     )
     db.save_snapshot(
         match_id,
-        OddsSnapshot(
-            event_id="zip123",
-            market="1x2",
-            captured_at=datetime(2026, 5, 14, 19, 55),
-            quality_status=SnapshotQuality.COMPLETE,
-            required_bookmakers=["Bwin"],
-            bookmaker_odds=[BookmakerOdds("Bwin", "bwin", 2.0, 3.4, 3.0)],
-        ),
-    )
+            OddsSnapshot(
+                event_id="zip123",
+                market="1x2",
+                captured_at=datetime(2026, 5, 14, 19, 55),
+                quality_status=SnapshotQuality.COMPLETE,
+                required_bookmakers=["Bwin", "Unibet"],
+                bookmaker_odds=[
+                    BookmakerOdds("Bwin", "bwin", 2.0, 3.4, 3.0),
+                    BookmakerOdds("Unibet", "unibet", 2.05, 3.45, 3.1),
+                ],
+            ),
+        )
     monkeypatch.setattr(api, "database", db)
     monkeypatch.setattr(api, "historical_importer", HistoricalDocxImporter(db))
     monkeypatch.setattr(api.settings, "historical_database_root", tmp_path / "SAMPLE_DATABASE", raising=False)
@@ -139,9 +145,9 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     table.rows[0].cells[0].text = "2.00"
     table.rows[0].cells[1].text = "3.40"
     table.rows[0].cells[2].text = "3.00"
-    table.rows[1].cells[0].text = "2.00"
-    table.rows[1].cells[1].text = "3.40"
-    table.rows[1].cells[2].text = "3.00"
+    table.rows[1].cells[0].text = "2.05"
+    table.rows[1].cells[1].text = "3.45"
+    table.rows[1].cells[2].text = "3.10"
     table.rows[1].cells[3].text = "1-0"
     docx_buffer = io.BytesIO()
     document.save(docx_buffer)
@@ -159,7 +165,7 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     assert response.status_code == 200
     assert response.json()["files_seen"] == 1
     assert response.json()["records_imported"] == 1
-    assert response.json()["recompute_signals"] == 1
+    assert response.json()["recompute_signals"] == 2
     assert Path(response.json()["import_root"]).exists()
     assert signals.json()[0]["historical_scores"] == ["1-0"]
 
