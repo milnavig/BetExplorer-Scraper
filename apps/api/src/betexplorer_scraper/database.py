@@ -851,9 +851,11 @@ class Database:
     def recompute_historical_signals(self) -> dict[str, int]:
         self.connection.execute("DELETE FROM historical_signals")
         candidates = self._signal_candidates()
+        complete_records = self._fetch_complete_historical_records()
+        record_index = _build_complete_record_index(complete_records)
         inserted = 0
         for candidate in candidates:
-            for signal_type, records in self._historical_record_groups_for_candidate(candidate):
+            for signal_type, records in self._historical_record_groups_for_candidate(candidate, record_index):
                 if not records:
                     continue
                 inserted += self._insert_historical_signal(candidate, signal_type, records)
@@ -896,26 +898,26 @@ class Database:
     def _historical_record_groups_for_candidate(
         self,
         candidate: dict[str, object],
+        record_index: dict[str, dict[tuple[object, ...], list[dict[str, object]]]],
     ) -> list[tuple[str, list[dict[str, object]]]]:
         if not _candidate_has_complete_required_odds(candidate):
             return []
-        complete_records = self._fetch_complete_historical_records(candidate)
         dataset_order = ["Odds", "Usable Odds", "Played archive"]
 
-        exact_records = _matching_complete_records(candidate, complete_records, "exact_odds")
+        exact_records = _matching_indexed_records(candidate, record_index, "exact_odds")
         for dataset in dataset_order:
             dataset_records = [record for record in exact_records if record["dataset"] == dataset]
             if dataset_records:
                 return [("exact_odds", dataset_records)]
 
-        one_draw_records = _matching_complete_records(candidate, complete_records, "one_draw")
+        one_draw_records = _matching_indexed_records(candidate, record_index, "one_draw")
         for dataset in dataset_order:
             dataset_records = [record for record in one_draw_records if record["dataset"] == dataset]
             if len(dataset_records) >= ONE_DRAW_MIN_SAMPLE:
                 return [("one_draw", dataset_records)]
         return []
 
-    def _fetch_complete_historical_records(self, candidate: dict[str, object]) -> list[dict[str, object]]:
+    def _fetch_complete_historical_records(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
             """
             WITH historical_pool AS (
@@ -954,7 +956,6 @@ class Database:
                   AND bwin_home_odds IS NOT NULL
                   AND bwin_draw_odds IS NOT NULL
                   AND bwin_away_odds IS NOT NULL
-                  AND event_id <> ?
             )
             SELECT dataset, source_file,
                    bwin_home_odds, bwin_draw_odds, bwin_away_odds,
@@ -962,8 +963,7 @@ class Database:
                    full_time_score, allow_reverse
             FROM historical_pool
             ORDER BY dataset, source_file, bwin_home_odds, bwin_draw_odds, bwin_away_odds
-            """,
-            [candidate.get("event_id")],
+            """
         ).fetchall()
         columns = [
             "dataset",
@@ -1769,33 +1769,85 @@ def _candidate_has_complete_required_odds(candidate: dict[str, object]) -> bool:
     return all(normalize_odds(candidate.get(key)) is not None for key in keys)
 
 
-def _matching_complete_records(
-    candidate: dict[str, object],
+def _build_complete_record_index(
     records: list[dict[str, object]],
+) -> dict[str, dict[tuple[object, ...], list[dict[str, object]]]]:
+    index: dict[str, dict[tuple[object, ...], list[dict[str, object]]]] = {
+        "exact_odds": {},
+        "one_draw": {},
+    }
+    for record in records:
+        orientations = [_record_with_orientation(record, reverse=False)]
+        if record.get("allow_reverse"):
+            orientations.append(_record_with_orientation(record, reverse=True))
+        for oriented in orientations:
+            exact_key = _exact_six_odds_key(oriented)
+            if exact_key:
+                index["exact_odds"].setdefault(exact_key, []).append(oriented)
+            for key in _one_draw_keys(oriented):
+                index["one_draw"].setdefault(key, []).append(oriented)
+    return index
+
+
+def _matching_indexed_records(
+    candidate: dict[str, object],
+    record_index: dict[str, dict[tuple[object, ...], list[dict[str, object]]]],
     signal_type: str,
 ) -> list[dict[str, object]]:
-    matched: list[dict[str, object]] = []
-    for record in records:
-        oriented = _oriented_complete_record(candidate, record, signal_type)
-        if oriented:
-            matched.append(oriented)
-    return matched
+    if signal_type == "exact_odds":
+        keys = [_exact_six_odds_key(candidate)]
+    elif signal_type == "one_draw":
+        keys = _one_draw_keys(candidate)
+    else:
+        keys = []
+    matched_by_identity: dict[tuple[object, ...], dict[str, object]] = {}
+    for key in [key for key in keys if key]:
+        for record in record_index.get(signal_type, {}).get(key, []):
+            if record.get("dataset") == "Played archive" and record.get("source_file") == candidate.get("event_id"):
+                continue
+            if signal_type == "exact_odds" and not _is_exact_six_odds(candidate, record):
+                continue
+            if signal_type == "one_draw" and not _is_one_draw_match(candidate, record):
+                continue
+            identity = (
+                record.get("dataset"),
+                record.get("source_file"),
+                record.get("full_time_score"),
+                record.get("bwin_home_odds"),
+                record.get("bwin_draw_odds"),
+                record.get("bwin_away_odds"),
+                record.get("unibet_home_odds"),
+                record.get("unibet_draw_odds"),
+                record.get("unibet_away_odds"),
+            )
+            matched_by_identity[identity] = record
+    return list(matched_by_identity.values())
 
 
-def _oriented_complete_record(
-    candidate: dict[str, object],
-    record: dict[str, object],
-    signal_type: str,
-) -> dict[str, object] | None:
-    orientations = [_record_with_orientation(record, reverse=False)]
-    if record.get("allow_reverse"):
-        orientations.append(_record_with_orientation(record, reverse=True))
-    for oriented in orientations:
-        if signal_type == "exact_odds" and _is_exact_six_odds(candidate, oriented):
-            return oriented
-        if signal_type == "one_draw" and _is_one_draw_match(candidate, oriented):
-            return oriented
-    return None
+def _exact_six_odds_key(record: dict[str, object]) -> tuple[object, ...] | None:
+    values = [
+        normalize_odds(record.get(f"{bookmaker}_{side}_odds"))
+        for bookmaker in ["bwin", "unibet"]
+        for side in ["home", "draw", "away"]
+    ]
+    if any(value is None for value in values):
+        return None
+    return tuple(values)
+
+
+def _one_draw_keys(record: dict[str, object]) -> list[tuple[object, ...]]:
+    bwin_home = normalize_odds(record.get("bwin_home_odds"))
+    bwin_draw = normalize_odds(record.get("bwin_draw_odds"))
+    bwin_away = normalize_odds(record.get("bwin_away_odds"))
+    unibet_home = normalize_odds(record.get("unibet_home_odds"))
+    unibet_draw = normalize_odds(record.get("unibet_draw_odds"))
+    unibet_away = normalize_odds(record.get("unibet_away_odds"))
+    if any(value is None for value in [bwin_home, bwin_draw, bwin_away, unibet_home, unibet_draw, unibet_away]):
+        return []
+    return [
+        ("bwin_draw_differs", bwin_home, bwin_away, unibet_home, unibet_draw, unibet_away),
+        ("unibet_draw_differs", unibet_home, unibet_away, bwin_home, bwin_draw, bwin_away),
+    ]
 
 
 def _record_with_orientation(record: dict[str, object], reverse: bool) -> dict[str, object]:

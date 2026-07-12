@@ -237,19 +237,20 @@ export default function MatchPage() {
       !nextPage.items.some((match) => match.id === requestedMatch.id)
         ? [requestedMatch, ...nextPage.items]
         : nextPage.items;
+    const nextItems = uniqueMatchesById(pageItems);
     setMatches((current) =>
-      mode === "append" ? [...current, ...pageItems] : pageItems,
+      mode === "append" ? uniqueMatchesById([...current, ...pageItems]) : nextItems,
     );
     setMatchesTotal(nextPage.total);
     if (mode !== "replace") return;
     setMatchRenderLimit(MATCH_RENDER_BATCH);
     const currentSelectedId = selectedIdRef.current;
     const nextId =
-      requestedId && pageItems.some((match) => match.id === requestedId)
+      requestedId && nextItems.some((match) => match.id === requestedId)
         ? requestedId
-        : currentSelectedId && pageItems.some((match) => match.id === currentSelectedId)
+        : currentSelectedId && nextItems.some((match) => match.id === currentSelectedId)
           ? currentSelectedId
-          : pageItems[0]?.id ?? null;
+          : nextItems[0]?.id ?? null;
     selectedIdRef.current = nextId;
     setSelectedId(nextId);
   };
@@ -1183,6 +1184,15 @@ function preferredMatchDate(days: MatchDay[], targetDate: string) {
 
 function selectedMatchDay(days: MatchDay[], selectedDate: string) {
   return days.find((day) => day.date === selectedDate);
+}
+
+function uniqueMatchesById(matches: MatchRow[]) {
+  const seen = new Set<string>();
+  return matches.filter((match) => {
+    if (seen.has(match.id)) return false;
+    seen.add(match.id);
+    return true;
+  });
 }
 
 function adjacentMatchDate(days: MatchDay[], selectedDate: string, direction: -1 | 1) {

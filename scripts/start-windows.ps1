@@ -158,6 +158,15 @@ function Wait-ForUrl($Url, $Name, $TimeoutSeconds) {
     throw "$Name did not start in $TimeoutSeconds seconds. Check logs in data\logs."
 }
 
+function Test-UrlReady($Url) {
+    try {
+        Invoke-WebRequest $Url -UseBasicParsing -TimeoutSec 3 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Start-ServiceProcess($Name, $FilePath, [string[]] $Arguments, $OutLog, $ErrLog) {
     Write-Host "Starting $Name..." -ForegroundColor Cyan
     $process = Start-Process `
@@ -196,11 +205,19 @@ $web = $null
 $script:ProcessJob = New-KillOnCloseJob
 
 try {
-    $api = Start-ServiceProcess "API" $UvFilePath ($UvPrefixArgs + @("run", "uvicorn", "betexplorer_scraper.api:app", "--host", "127.0.0.1", "--port", "8000")) $apiOut $apiErr
-    Wait-ForUrl $ApiUrl "API" 90
+    if (Test-UrlReady $ApiUrl) {
+        Write-Host "API is already running: $ApiUrl" -ForegroundColor Green
+    } else {
+        $api = Start-ServiceProcess "API" $UvFilePath ($UvPrefixArgs + @("run", "uvicorn", "betexplorer_scraper.api:app", "--host", "127.0.0.1", "--port", "8000")) $apiOut $apiErr
+        Wait-ForUrl $ApiUrl "API" 90
+    }
 
-    $web = Start-ServiceProcess "UI" $npm @("--prefix", "apps/desktop/web", "run", "dev") $webOut $webErr
-    Wait-ForUrl $UiUrl "UI" 90
+    if (Test-UrlReady $UiUrl) {
+        Write-Host "UI is already running: $UiUrl" -ForegroundColor Green
+    } else {
+        $web = Start-ServiceProcess "UI" $npm @("--prefix", "apps/desktop/web", "run", "dev") $webOut $webErr
+        Wait-ForUrl $UiUrl "UI" 90
+    }
 
     Start-Process $UiUrl
 
@@ -210,11 +227,22 @@ try {
     Write-Host "Logs: $LogDir"
     Write-Host "Keep this window open. Press Ctrl+C to stop."
 
-    while (($api -and -not $api.HasExited) -and ($web -and -not $web.HasExited)) {
+    $managedProcesses = @($api, $web) | Where-Object { $_ -ne $null }
+    while ($true) {
+        foreach ($process in $managedProcesses) {
+            if ($process.HasExited) {
+                throw "One of the app processes stopped. Check logs in data\logs."
+            }
+        }
         Start-Sleep -Seconds 2
     }
-
-    throw "One of the app processes stopped. Check logs in data\logs."
+} catch {
+    Write-Host ""
+    Write-Host "BetExplorer Monitor failed to stay running." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "Logs: $LogDir"
+    Read-Host "Press Enter to close"
+    throw
 } finally {
     foreach ($process in @($api, $web)) {
         if ($process -and -not $process.HasExited) {

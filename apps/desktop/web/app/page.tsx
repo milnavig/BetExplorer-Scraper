@@ -535,14 +535,17 @@ export default function Dashboard() {
       const nextPage = await api<MatchPageResult>(matchesPagePath(offset));
       startTransition(() => {
         setMatches((current) =>
-          mode === "append" ? [...current, ...nextPage.items] : nextPage.items,
+          mode === "append"
+            ? uniqueMatchesById([...current, ...nextPage.items])
+            : uniqueMatchesById(nextPage.items),
         );
         setMatchesTotal(nextPage.total);
         if (mode === "replace") {
           setMatchRenderLimit(MATCH_RENDER_BATCH);
+          const nextItems = uniqueMatchesById(nextPage.items);
           const nextSelected =
-            nextPage.items.find((match) => match.bookmaker_count > 0) ??
-            nextPage.items[0];
+            nextItems.find((match) => match.bookmaker_count > 0) ??
+            nextItems[0];
           if (nextSelected) {
             selectedIdRef.current = nextSelected.id;
             setSelectedId(nextSelected.id);
@@ -2806,6 +2809,15 @@ function signalGroupBookmakerOdds(
 
 function uniqueSorted(values: string[]) {
   return [...new Set(values.filter(Boolean))].sort();
+}
+
+function uniqueMatchesById(matches: MatchRow[]) {
+  const seen = new Set<string>();
+  return matches.filter((match) => {
+    if (seen.has(match.id)) return false;
+    seen.add(match.id);
+    return true;
+  });
 }
 
 function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
