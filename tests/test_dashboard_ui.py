@@ -166,7 +166,7 @@ def test_dashboard_labels_one_draw_similarity_as_draw_only_not_full_confidence()
     styles = read_repo_file("apps/desktop/web/app/globals.css")
 
     assert 'signal.signal_type === "one_draw"' in page
-    assert 'return "5 of 6 odds";' in page
+    assert 'return "One Draw 5/6";' in page
     assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
     assert ".similarity-badge.draw-only" in styles
 

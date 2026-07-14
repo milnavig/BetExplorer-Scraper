@@ -1887,7 +1887,7 @@ function SelectedSignalPanel({
             </div>
             <strong>{signalPrimaryReason(bestSignal)}</strong>
             <small>
-              {bestGroup.datasets.join(" + ")} · Signal strength{" "}
+              {historicalDatasetLabel(bestGroup.datasets)} · Signal strength{" "}
               {signalStrengthLabel(bestSignal)} · {groups.length} matched
               pattern{groups.length === 1 ? "" : "s"}
             </small>
@@ -2829,9 +2829,9 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
+  if (signal.signal_type === "exact_odds") return "Exact 6/6 odds";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "5 of 6 odds";
+  if (signal.signal_type === "one_draw") return "One Draw 5/6";
   return `Similarity ${formatPct(signal.similarity_score)}`;
 }
 
@@ -2845,6 +2845,12 @@ function similarityBadgeClass(signal: HistoricalSignal) {
 
 function signalPrimaryReason(signal: HistoricalSignal) {
   return signal.match_explanation || signalTypeLabel(signal.signal_type);
+}
+
+function historicalDatasetLabel(datasets: string[]) {
+  const values = uniqueSorted(datasets);
+  if (values.includes("Odds + Usable Odds")) return "Merged Odds + Usable Odds";
+  return values.join(" + ");
 }
 
 function signalStrengthLabel(signal: HistoricalSignal) {

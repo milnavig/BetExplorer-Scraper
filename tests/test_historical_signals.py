@@ -274,6 +274,104 @@ def test_database_recomputes_one_draw_only_when_no_exact_exists(tmp_path: Path) 
     assert one_draw["matched_odds_away"] == 3.0
 
 
+def test_database_collects_exact_and_merged_one_draw_by_final_workflow(tmp_path: Path) -> None:
+    db = Database(tmp_path / "final_workflow.duckdb")
+    _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "final_workflow.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "odds_exact.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.40,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "2-1",
+                "half_time_score": "1-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+            {
+                "dataset": "Odds",
+                "source_file": "odds_one_draw.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.50,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "1-1",
+                "half_time_score": "0-0",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+            {
+                "dataset": "Usable Odds",
+                "source_file": "usable_one_draw.docx",
+                "source_home_bucket": 3.00,
+                "source_away_file": 3.10,
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.60,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "2-2",
+                "half_time_score": "1-1",
+                "parse_status": "parsed",
+                "parse_warning": None,
+            },
+        ],
+    )
+
+    summary = db.recompute_historical_signals()
+    signals = db.list_signals()
+
+    assert summary["signals"] == 4
+    assert {signal["signal_type"] for signal in signals} == {"exact_odds", "one_draw"}
+    exact = [signal for signal in signals if signal["signal_type"] == "exact_odds"]
+    one_draw = [signal for signal in signals if signal["signal_type"] == "one_draw"]
+    assert {signal["dataset"] for signal in exact} == {"Odds"}
+    assert {signal["dataset"] for signal in one_draw} == {"Odds + Usable Odds"}
+    assert {signal["sample_size"] for signal in one_draw} == {2}
+    assert sorted(one_draw[0]["historical_scores"]) == ["1-1", "2-2"]
+
+
+def test_identical_historical_rows_count_as_separate_matches(tmp_path: Path) -> None:
+    db = Database(tmp_path / "duplicate_samples.duckdb")
+    _seed_match_with_required_1x2(db)
+    record = {
+        "dataset": "Odds",
+        "source_file": "same_odds.docx",
+        "source_home_bucket": 3.00,
+        "source_away_file": 3.10,
+        "query_home_odds": 2.00,
+        "query_draw_odds": 3.40,
+        "query_away_odds": 3.00,
+        "historical_home_odds": 2.05,
+        "historical_draw_odds": 3.45,
+        "historical_away_odds": 3.10,
+        "full_time_score": "1-0",
+        "half_time_score": "0-0",
+        "parse_status": "parsed",
+        "parse_warning": None,
+    }
+    db.replace_historical_records("same_odds.docx", [record, dict(record)])
+
+    db.recompute_historical_signals()
+    signals = db.list_signals()
+
+    assert {signal["sample_size"] for signal in signals} == {2}
+    assert all(signal["historical_scores"] == ["1-0", "1-0"] for signal in signals)
+
+
 def test_database_does_not_emit_one_draw_without_primary_odds_match(tmp_path: Path) -> None:
     db = Database(tmp_path / "draw_only_noise.duckdb")
     _seed_match_with_required_1x2(db)

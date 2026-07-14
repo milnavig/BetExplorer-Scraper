@@ -941,7 +941,7 @@ function ComparisonBrief({ signal }: { signal: HistoricalSignal }) {
       <div className="comparison-brief-grid">
         <Info
           label="Compared with historical database"
-          value={`${signal.dataset} · ${signal.sample_size} matches`}
+          value={`${historicalDatasetLabel(signal.dataset)} · ${signal.sample_size} matches`}
         />
         <Info label="Matched by" value={matchBasisLabel(signal)} />
         <Info label="Current odds" value={`${formatOdd(signal.current_home_odds)} / ${formatOdd(signal.current_draw_odds)} / ${formatOdd(signal.current_away_odds)}`} />
@@ -963,7 +963,7 @@ function SignalSummaryCard({ signal }: { signal: HistoricalSignal }) {
         <Info label="Matched by" value={matchBasisLabel(signal)} />
         <Info label="Signal strength" value={signalStrengthLabel(signal)} />
         <Info label="Sample" value={String(signal.sample_size)} />
-        <Info label="Dataset" value={signal.dataset} />
+        <Info label="Dataset" value={historicalDatasetLabel(signal.dataset)} />
       </div>
     </div>
   );
@@ -1213,10 +1213,15 @@ function formatSelectedDay(value: string) {
 }
 
 function signalSimilarityBadge(signal: HistoricalSignal) {
-  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
+  if (signal.signal_type === "exact_odds") return "Exact 6/6 odds";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "5 of 6 odds";
+  if (signal.signal_type === "one_draw") return "One Draw 5/6";
   return `Similarity ${formatPct(signal.similarity_score)}`;
+}
+
+function historicalDatasetLabel(dataset: string) {
+  if (dataset === "Odds + Usable Odds") return "Merged Odds + Usable Odds";
+  return dataset;
 }
 
 function oddsReadinessMessage(match: MatchRow, signals: HistoricalSignal[]) {

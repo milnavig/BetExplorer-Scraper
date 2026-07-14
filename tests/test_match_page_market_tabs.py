@@ -73,7 +73,7 @@ def test_match_page_labels_one_draw_similarity_as_draw_only_not_full_confidence(
     styles = (ROOT / "apps/desktop/web/app/globals.css").read_text(encoding="utf-8")
 
     assert 'signal.signal_type === "one_draw"' in page
-    assert 'return "5 of 6 odds";' in page
+    assert 'return "One Draw 5/6";' in page
     assert "<span className={similarityBadgeClass(signal)}>{signalSimilarityBadge(signal)}</span>" in page
     assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
     assert ".similarity-badge.draw-only" in styles

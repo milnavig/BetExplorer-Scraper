@@ -902,26 +902,34 @@ class Database:
     ) -> list[tuple[str, list[dict[str, object]]]]:
         if not _candidate_has_complete_required_odds(candidate):
             return []
-        dataset_order = ["Odds", "Usable Odds", "Played archive"]
+        groups: list[tuple[str, list[dict[str, object]]]] = []
 
         exact_records = _matching_indexed_records(candidate, record_index, "exact_odds")
-        for dataset in dataset_order:
-            dataset_records = [record for record in exact_records if record["dataset"] == dataset]
-            if dataset_records:
-                return [("exact_odds", dataset_records)]
+        odds_exact = _records_from_datasets(exact_records, ["Odds"])
+        usable_exact = _records_from_datasets(exact_records, ["Usable Odds"])
+        played_exact = _records_from_datasets(exact_records, ["Played archive"])
+        if odds_exact:
+            groups.append(("exact_odds", odds_exact))
+        elif usable_exact:
+            groups.append(("exact_odds", usable_exact))
+        elif played_exact:
+            groups.append(("exact_odds", played_exact))
 
         one_draw_records = _matching_indexed_records(candidate, record_index, "one_draw")
-        for dataset in dataset_order:
-            dataset_records = [record for record in one_draw_records if record["dataset"] == dataset]
-            if len(dataset_records) >= ONE_DRAW_MIN_SAMPLE:
-                return [("one_draw", dataset_records)]
-        return []
+        docx_one_draw = _records_from_datasets(one_draw_records, ["Odds", "Usable Odds"])
+        if len(docx_one_draw) >= ONE_DRAW_MIN_SAMPLE:
+            groups.append(("one_draw", _records_with_dataset_label(docx_one_draw, _merged_dataset_label(docx_one_draw))))
+        else:
+            played_one_draw = _records_from_datasets(one_draw_records, ["Played archive"])
+            if len(played_one_draw) >= ONE_DRAW_MIN_SAMPLE:
+                groups.append(("one_draw", played_one_draw))
+        return groups
 
     def _fetch_complete_historical_records(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
             """
             WITH historical_pool AS (
-                SELECT dataset, source_file,
+                SELECT id AS record_id, dataset, source_file,
                        query_home_odds AS bwin_home_odds,
                        query_draw_odds AS bwin_draw_odds,
                        query_away_odds AS bwin_away_odds,
@@ -939,7 +947,7 @@ class Database:
                   AND historical_draw_odds IS NOT NULL
                   AND historical_away_odds IS NOT NULL
                 UNION ALL
-                SELECT 'Played archive' AS dataset, event_id AS source_file,
+                SELECT event_id AS record_id, 'Played archive' AS dataset, event_id AS source_file,
                        bwin_home_odds AS query_home_odds,
                        bwin_draw_odds AS query_draw_odds,
                        bwin_away_odds AS query_away_odds,
@@ -957,7 +965,7 @@ class Database:
                   AND bwin_draw_odds IS NOT NULL
                   AND bwin_away_odds IS NOT NULL
             )
-            SELECT dataset, source_file,
+            SELECT record_id, dataset, source_file,
                    bwin_home_odds, bwin_draw_odds, bwin_away_odds,
                    unibet_home_odds, unibet_draw_odds, unibet_away_odds,
                    full_time_score, allow_reverse
@@ -966,6 +974,7 @@ class Database:
             """
         ).fetchall()
         columns = [
+            "record_id",
             "dataset",
             "source_file",
             "bwin_home_odds",
@@ -1809,19 +1818,23 @@ def _matching_indexed_records(
                 continue
             if signal_type == "one_draw" and not _is_one_draw_match(candidate, record):
                 continue
-            identity = (
-                record.get("dataset"),
-                record.get("source_file"),
-                record.get("full_time_score"),
-                record.get("bwin_home_odds"),
-                record.get("bwin_draw_odds"),
-                record.get("bwin_away_odds"),
-                record.get("unibet_home_odds"),
-                record.get("unibet_draw_odds"),
-                record.get("unibet_away_odds"),
-            )
+            identity = (record.get("dataset"), record.get("record_id"))
             matched_by_identity[identity] = record
     return list(matched_by_identity.values())
+
+
+def _records_from_datasets(records: list[dict[str, object]], datasets: list[str]) -> list[dict[str, object]]:
+    allowed = set(datasets)
+    return [record for record in records if record.get("dataset") in allowed]
+
+
+def _records_with_dataset_label(records: list[dict[str, object]], dataset: str) -> list[dict[str, object]]:
+    return [dict(record, dataset=dataset) for record in records]
+
+
+def _merged_dataset_label(records: list[dict[str, object]]) -> str:
+    ordered = [dataset for dataset in ["Odds", "Usable Odds"] if any(record.get("dataset") == dataset for record in records)]
+    return " + ".join(ordered) if ordered else str(records[0].get("dataset", "Historical"))
 
 
 def _exact_six_odds_key(record: dict[str, object]) -> tuple[object, ...] | None:

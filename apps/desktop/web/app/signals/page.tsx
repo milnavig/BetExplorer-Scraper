@@ -664,7 +664,7 @@ function SignalRow({ group }: { group: SignalGroup }) {
   const signal = group.bestSignal;
   const bwin = bookmakerOdds(group, "bwin");
   const unibet = bookmakerOdds(group, "unibet");
-  const signalMeta = `${signalMatchLabel(group)} · ${group.datasets.map(datasetLabel).join(" + ")}`;
+  const signalMeta = `${signalMatchLabel(group)} · ${datasetGroupLabel(group.datasets)}`;
 
   return (
     <article className={`signal-row ${signal.signal_type}`}>
@@ -793,15 +793,15 @@ function signalTypeLabel(group: SignalGroup) {
 
 function signalMatchBadge(group: SignalGroup) {
   const signal = group.bestSignal;
-  if (signal.signal_type === "exact_odds") return "Bwin + Unibet";
+  if (signal.signal_type === "exact_odds") return "Exact 6/6 odds";
   if (signal.signal_type === "neighbor_odds") return `Nearby ${formatPct(signal.similarity_score)}`;
-  if (signal.signal_type === "one_draw") return "5 of 6 odds";
+  if (signal.signal_type === "one_draw") return "One Draw 5/6";
   return formatPct(signal.similarity_score);
 }
 
 function signalMatchLabel(group: SignalGroup) {
   const signal = group.bestSignal;
-  const source = group.datasets.map(datasetLabel).join(" + ");
+  const source = datasetGroupLabel(group.datasets);
   if (signal.signal_type === "exact_odds") return `${source} exact 6 odds`;
   if (signal.signal_type === "neighbor_odds") return `${source} nearby ${formatPct(signal.similarity_score)}`;
   if (signal.signal_type === "one_draw") return `${source} one draw odd differs`;
@@ -819,8 +819,14 @@ function similarityBadgeClass(signal: HistoricalSignal) {
 function datasetLabel(value: string) {
   if (value === "Odds") return "ODDS";
   if (value === "Usable Odds") return "USABLE ODDS";
+  if (value === "Odds + Usable Odds") return "MERGED ODDS + USABLE ODDS";
   if (value === "Played archive") return "PLAYED ARCHIVE";
   return value;
+}
+
+function datasetGroupLabel(values: string[]) {
+  if (values.includes("Odds + Usable Odds")) return "MERGED ODDS + USABLE ODDS";
+  return values.map(datasetLabel).join(" + ");
 }
 
 function archivePhaseLabel(phase: string | null | undefined) {
