@@ -1442,6 +1442,43 @@ small {
   color: var(--text);
 }
 
+.archive-errors {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #e7c36d;
+  border-radius: 8px;
+  background: #fffaf0;
+}
+
+.archive-errors-head,
+.archive-error-list > div {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.archive-errors-head {
+  justify-content: space-between;
+}
+
+.archive-error-list {
+  display: grid;
+  gap: 5px;
+  max-height: 190px;
+  overflow: auto;
+}
+
+.archive-error-list > div {
+  display: grid;
+  grid-template-columns: 90px 90px 90px minmax(180px, 1fr);
+  padding: 6px 8px;
+  border-top: 1px solid #eadfca;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .archive-empty-note {
   grid-column: 1 / -1;
   margin: 0;
@@ -2089,6 +2126,49 @@ code {
   gap: 10px;
 }
 
+.historical-pattern-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f5f8fa;
+}
+
+.historical-pattern-tabs > span {
+  align-self: center;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.historical-pattern-tabs button {
+  display: grid;
+  gap: 2px;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.historical-pattern-tabs button.active {
+  border-color: var(--accent);
+  background: #eaf6f9;
+  color: var(--accent);
+}
+
+.historical-pattern-tabs button small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .required-cards {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2521,6 +2601,23 @@ code {
   overflow-x: auto;
 }
 
+.signal-pattern-badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.signal-pattern-badges .signal-type {
+  margin-right: 0;
+}
+
+.why-matched-note {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .why-matched table {
   width: 100%;
   min-width: 520px;
@@ -2533,6 +2630,11 @@ code {
   padding: 8px;
   border-bottom: 1px solid var(--line);
   text-align: left;
+}
+
+.why-matched td[rowspan] {
+  vertical-align: top;
+  background: #f7fafb;
 }
 
 .score-examples {

@@ -18,6 +18,7 @@ target/
 
 out/
 har/
+/tmp/
 
 .venv/
 /apps/api/data/test_tmp

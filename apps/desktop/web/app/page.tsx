@@ -18,6 +18,7 @@ import {
   Table2,
   CalendarDays,
   Upload,
+  Loader2,
 } from "lucide-react";
 import type { ChangeEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState, useTransition } from "react";
@@ -191,6 +192,12 @@ type MatchDetail = {
   snapshots: SnapshotRow[];
   bookmaker_odds: BookmakerOdds[];
   attempts: AttemptRow[];
+  pagination?: {
+    snapshots_total: number;
+    snapshots_returned: number;
+    attempts_total: number;
+    attempts_returned: number;
+  };
 };
 
 type LogRow = {
@@ -339,6 +346,17 @@ type HistoricalImportResult = {
   import_root?: string;
 };
 
+type MaintenanceJob = {
+  id: string;
+  kind: string;
+  status: "pending" | "running" | "completed" | "failed";
+  phase: string;
+  progress_current: number;
+  progress_total: number;
+  result: HistoricalImportResult | null;
+  last_error: string | null;
+};
+
 type MatchFilter =
   | "all"
   | "with_odds"
@@ -413,6 +431,7 @@ export default function Dashboard() {
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [lastRun, setLastRun] = useState<CaptureRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [maintenanceMessage, setMaintenanceMessage] = useState<string | null>(null);
   const [isLoadingMatches, setIsLoadingMatches] = useState(false);
   const [isPending, startTransition] = useTransition();
   const [clientTimezone, setClientTimezone] = useState("-");
@@ -894,7 +913,16 @@ export default function Dashboard() {
         if (!response.ok) {
           throw new Error(`${response.status} ${response.statusText}`);
         }
-        await response.json() as HistoricalImportResult;
+        let job = await response.json() as MaintenanceJob;
+        setMaintenanceMessage("Importing DOCX database in the background");
+        while (job.status === "pending" || job.status === "running") {
+          await new Promise((resolve) => window.setTimeout(resolve, 1000));
+          job = await api<MaintenanceJob>(`/api/maintenance/jobs/${job.id}`);
+          setMaintenanceMessage(maintenancePhaseLabel(job.phase));
+        }
+        if (job.status === "failed") {
+          throw new Error(job.last_error || "Historical ZIP import failed");
+        }
         await refreshHistoricalSignalState();
       } catch (nextError) {
         setError(
@@ -902,6 +930,8 @@ export default function Dashboard() {
             ? nextError.message
             : "Historical ZIP import failed",
         );
+      } finally {
+        setMaintenanceMessage(null);
       }
     });
   };
@@ -1085,6 +1115,13 @@ export default function Dashboard() {
         </header>
 
         {error ? <div className="error">{error}</div> : null}
+        {maintenanceMessage ? (
+          <div className="busy-banner" role="status">
+            <Loader2 className="spin" size={16} />
+            <strong>Working</strong>
+            <span>{maintenanceMessage}. The API remains available.</span>
+          </div>
+        ) : null}
         {lastRun ? (
           <div className={lastRun.due > 0 ? "run-result active" : "run-result"}>
             <strong>Run once</strong>
@@ -1487,7 +1524,7 @@ export default function Dashboard() {
                   </MiniTable>
                   {(detail?.snapshots.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
                     <p className="table-note">
-                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.snapshots.length} snapshots.
+                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.pagination?.snapshots_total ?? detail?.snapshots.length} snapshots.
                       Open full page for the complete capture history.
                     </p>
                   ) : null}
@@ -1529,7 +1566,7 @@ export default function Dashboard() {
                   </MiniTable>
                   {(detail?.attempts.length ?? 0) > DETAIL_TABLE_PREVIEW_ROWS ? (
                     <p className="table-note">
-                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.attempts.length} attempts.
+                      Showing latest {DETAIL_TABLE_PREVIEW_ROWS} of {detail?.pagination?.attempts_total ?? detail?.attempts.length} attempts.
                       Open full page for the complete retry history.
                     </p>
                   ) : null}
@@ -2868,4 +2905,17 @@ function formatBytes(value: number) {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function maintenancePhaseLabel(phase: string) {
+  const labels: Record<string, string> = {
+    queued: "DOCX import queued",
+    starting: "Preparing DOCX import",
+    extracting: "Extracting DOCX files",
+    importing_docx: "Parsing and validating historical records",
+    archiving_played_matches: "Updating played-match archive",
+    recomputing_signals: "Rebuilding historical signals",
+    complete: "Historical database import complete",
+  };
+  return labels[phase] ?? "Processing historical database";
 }

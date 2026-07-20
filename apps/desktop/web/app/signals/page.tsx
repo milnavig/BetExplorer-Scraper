@@ -75,11 +75,45 @@ type ArchiveDateResult = {
   discovered: number;
   captured: number;
   complete: number;
+  partial: number;
+  unavailable: number;
   failed: number;
   results_captured: number;
   archived: number;
   signals: number;
   matches_evaluated: number;
+};
+
+type ArchiveJob = ArchiveDateResult & {
+  id: string;
+  target_date: string;
+  status: "pending" | "running" | "completed" | "completed_with_gaps" | "completed_with_errors" | "failed";
+  phase: string;
+  total_items: number;
+  completed: number;
+  scores: number;
+  current_event_id: string | null;
+  last_error: string | null;
+};
+
+type ArchiveJobItem = {
+  event_id: string;
+  state: string;
+  odds_status: string;
+  score_status: string;
+  archive_status: string;
+  attempt_count: number;
+  error_message: string | null;
+};
+
+type MaintenanceJob = {
+  id: string;
+  status: "pending" | "running" | "completed" | "failed";
+  phase: string;
+  progress_current: number;
+  progress_total: number;
+  result: Record<string, number> | null;
+  last_error: string | null;
 };
 
 type CaptureProgress = {
@@ -92,15 +126,14 @@ type CaptureProgress = {
   active: number;
   completed: number;
   captured: number;
+  complete: number;
+  partial: number;
+  unavailable: number;
   failed: number;
   results_captured: number;
   results_checked: number;
   current_event_id: string | null;
   last_error: string | null;
-};
-
-type ApiStatus = {
-  capture_progress: CaptureProgress;
 };
 
 type SignalGroup = {
@@ -145,6 +178,9 @@ export default function SignalsPage() {
   const [archiveDate, setArchiveDate] = useState(() => todayDateSlug());
   const [archiveResult, setArchiveResult] = useState<ArchiveDateResult | null>(null);
   const [archiveProgress, setArchiveProgress] = useState<CaptureProgress | null>(null);
+  const [archiveJobId, setArchiveJobId] = useState<string | null>(null);
+  const [completedArchiveJobId, setCompletedArchiveJobId] = useState<string | null>(null);
+  const [archiveErrors, setArchiveErrors] = useState<ArchiveJobItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busyLabel, setBusyLabel] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -190,16 +226,53 @@ export default function SignalsPage() {
   }, [scope, archiveSignalDate, archiveSort]);
 
   useEffect(() => {
-    if (!isBackfilling) return;
+    const storedJobId = window.localStorage.getItem("betexplorer.archiveJobId");
+    if (storedJobId) {
+      setArchiveJobId(storedJobId);
+      setIsBackfilling(true);
+      setBusyLabel("Resuming historical archive progress");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!archiveJobId) return;
     let cancelled = false;
     const loadProgress = async () => {
       try {
-        const nextStatus = await api<ApiStatus>("/api/status");
-        if (!cancelled) setArchiveProgress(nextStatus.capture_progress);
-      } catch {
+        const job = await api<ArchiveJob>(`/api/archive/jobs/${archiveJobId}`);
+        if (cancelled) return;
+        setArchiveProgress(archiveJobProgress(job));
+        setArchiveDate(job.date);
+        const running = job.status === "pending" || job.status === "running";
+        setIsBackfilling(running);
+        if (running) return;
+
+        window.localStorage.removeItem("betexplorer.archiveJobId");
+        setCompletedArchiveJobId(job.id);
+        setArchiveJobId(null);
+        setBusyLabel(null);
+        setArchiveResult(job);
+        if (["completed_with_gaps", "completed_with_errors", "failed"].includes(job.status)) {
+          const items = await api<ArchiveJobItem[]>(`/api/archive/jobs/${job.id}/items?incomplete_only=true`);
+          setArchiveErrors(items);
+        } else {
+          setArchiveErrors([]);
+        }
+        setArchiveSignalDate(job.date);
+        if (job.status === "failed") {
+          setError(job.last_error || "Date archive failed");
+        }
+        await load(scope, job.date, archiveSort);
+      } catch (nextError) {
         if (!cancelled) {
           setArchiveProgress((current) =>
-            current ? { ...current, last_error: "Progress update failed" } : current,
+            current
+              ? {
+                  ...current,
+                  last_error:
+                    nextError instanceof Error ? nextError.message : "Progress update failed",
+                }
+              : current,
           );
         }
       }
@@ -210,7 +283,7 @@ export default function SignalsPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [isBackfilling]);
+  }, [archiveJobId]);
 
   const archiveDay = signalDays.find((day) => day.date === archiveSignalDate);
   const previousArchiveDate = adjacentSignalDate(signalDays, archiveSignalDate, -1);
@@ -245,10 +318,16 @@ export default function SignalsPage() {
     setIsRecomputing(true);
     setBusyLabel("Recomputing signals and updating played-match archive");
     try {
-      await api("/api/signals/recompute", {
+      let job = await api<MaintenanceJob>("/api/signals/recompute", {
         method: "POST",
         body: JSON.stringify({ archive_played: true }),
       });
+      while (job.status === "pending" || job.status === "running") {
+        setBusyLabel(maintenancePhaseLabel(job.phase));
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        job = await api<MaintenanceJob>(`/api/maintenance/jobs/${job.id}`);
+      }
+      if (job.status === "failed") throw new Error(job.last_error || "Signal recompute failed");
       await load(scope, archiveSignalDate, archiveSort);
     } catch (nextError) {
       setError(
@@ -265,16 +344,17 @@ export default function SignalsPage() {
     setIsBackfilling(true);
     setBusyLabel(`Backfilling BetExplorer football archive for ${archiveDate}`);
     setArchiveResult(null);
+    setArchiveErrors([]);
+    setCompletedArchiveJobId(null);
     setArchiveProgress(initialArchiveProgress());
     try {
-      const result = await api<ArchiveDateResult>("/api/archive/date", {
+      const job = await api<ArchiveJob>("/api/archive/date", {
         method: "POST",
         body: JSON.stringify({ date: archiveDate }),
       });
-      setArchiveResult(result);
-      setArchiveProgress((current) => completeArchiveProgress(current, result));
-      setArchiveSignalDate(result.date);
-      await load(scope, result.date, archiveSort);
+      window.localStorage.setItem("betexplorer.archiveJobId", job.id);
+      setArchiveJobId(job.id);
+      setArchiveProgress(archiveJobProgress(job));
     } catch (nextError) {
       setError(
         nextError instanceof Error ? nextError.message : "Date archive failed",
@@ -289,7 +369,25 @@ export default function SignalsPage() {
             }
           : current,
       );
-    } finally {
+      setIsBackfilling(false);
+      setBusyLabel(null);
+    }
+  };
+
+  const retryIncomplete = async () => {
+    if (!completedArchiveJobId) return;
+    setError(null);
+    setArchiveErrors([]);
+    setIsBackfilling(true);
+    setBusyLabel(`Retrying incomplete matches for ${archiveDate}`);
+    try {
+      const job = await api<ArchiveJob>(`/api/archive/jobs/${completedArchiveJobId}/retry`, { method: "POST" });
+      window.localStorage.setItem("betexplorer.archiveJobId", job.id);
+      setArchiveJobId(job.id);
+      setCompletedArchiveJobId(null);
+      setArchiveProgress(archiveJobProgress(job));
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "Retry failed");
       setIsBackfilling(false);
       setBusyLabel(null);
     }
@@ -377,7 +475,11 @@ export default function SignalsPage() {
           <div className="busy-banner" role="status">
             <Loader2 className="spin" size={16} />
             <strong>Working</strong>
-            <span>{busyLabel}. The API is busy with this job, not offline.</span>
+            <span>
+              {busyLabel}. {isBackfilling
+                ? "This runs in the background; the monitor remains available and progress survives a page refresh."
+                : "The API is processing this maintenance action, not offline."}
+            </span>
           </div>
         ) : null}
         {scope === "archive" ? (
@@ -460,8 +562,31 @@ export default function SignalsPage() {
                   <span>found <strong>{archiveResult.discovered}</strong></span>
                   <span>captured <strong>{archiveResult.captured}</strong></span>
                   <span>complete <strong>{archiveResult.complete}</strong></span>
+                  <span>partial <strong>{archiveResult.partial}</strong></span>
+                  <span>no odds <strong>{archiveResult.unavailable}</strong></span>
+                  <span>failed <strong>{archiveResult.failed}</strong></span>
                   <span>archived <strong>{archiveResult.archived}</strong></span>
                   <span>signals <strong>{archiveResult.signals}</strong></span>
+                </div>
+              ) : null}
+              {archiveErrors.length > 0 ? (
+                <div className="archive-errors">
+                  <div className="archive-errors-head">
+                    <strong>{archiveErrors.length} matches not archived</strong>
+                    <button type="button" onClick={retryIncomplete} disabled={operationBusy}>
+                      <RefreshCcw size={14} /> Retry incomplete
+                    </button>
+                  </div>
+                  <div className="archive-error-list">
+                    {archiveErrors.slice(0, 20).map((item) => (
+                      <div key={item.event_id}>
+                        <code>{item.event_id}</code>
+                        <span>odds {item.odds_status}</span>
+                        <span>score {item.score_status}</span>
+                        <span>{archiveItemMessage(item)}</span>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ) : null}
               {archiveResult && archiveResult.signals === 0 ? (
@@ -563,6 +688,9 @@ function initialArchiveProgress(): CaptureProgress {
     active: 0,
     completed: 0,
     captured: 0,
+    complete: 0,
+    partial: 0,
+    unavailable: 0,
     failed: 0,
     results_captured: 0,
     results_checked: 0,
@@ -571,23 +699,25 @@ function initialArchiveProgress(): CaptureProgress {
   };
 }
 
-function completeArchiveProgress(
-  current: CaptureProgress | null,
-  result: ArchiveDateResult,
-): CaptureProgress {
+function archiveJobProgress(job: ArchiveJob): CaptureProgress {
+  const running = job.status === "pending" || job.status === "running";
   return {
-    ...(current ?? initialArchiveProgress()),
-    running: false,
+    ...initialArchiveProgress(),
+    running,
     trigger: "archive_date",
-    phase: "archive_complete",
-    discovered: result.discovered,
-    queued: result.discovered,
-    completed: result.discovered,
-    captured: result.captured,
-    failed: result.failed,
-    results_captured: result.results_captured,
-    current_event_id: null,
-    last_error: null,
+    phase: job.phase,
+    discovered: job.discovered,
+    due: job.total_items,
+    queued: job.total_items,
+    completed: job.completed,
+    captured: job.captured,
+    complete: job.complete,
+    partial: job.partial,
+    unavailable: job.unavailable,
+    failed: job.failed,
+    results_captured: job.scores,
+    current_event_id: job.current_event_id,
+    last_error: job.last_error,
   };
 }
 
@@ -603,7 +733,9 @@ function ArchiveProgressBar({
   const total = Math.max(0, progress?.queued || progress?.discovered || result?.discovered || 0);
   const completed = Math.max(0, progress?.completed ?? (result ? result.discovered : 0));
   const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
-  const captured = progress?.captured ?? result?.captured ?? 0;
+  const complete = progress?.complete ?? result?.complete ?? 0;
+  const partial = progress?.partial ?? result?.partial ?? 0;
+  const unavailable = progress?.unavailable ?? result?.unavailable ?? 0;
   const failed = progress?.failed ?? result?.failed ?? 0;
   const scores = progress?.results_captured ?? result?.results_captured ?? 0;
   const archived = result?.archived ?? 0;
@@ -628,7 +760,9 @@ function ArchiveProgressBar({
         <span style={{ width: `${percent}%` }} />
       </div>
       <div className="archive-progress-meta">
-        <span>Captured <strong>{captured}</strong></span>
+        <span>Complete <strong>{complete}</strong></span>
+        <span>Partial <strong>{partial}</strong></span>
+        <span>No odds <strong>{unavailable}</strong></span>
         <span>Failed <strong>{failed}</strong></span>
         <span>Scores <strong>{scores}</strong></span>
         <span>Archived <strong>{archived}</strong></span>
@@ -669,8 +803,10 @@ function SignalRow({ group }: { group: SignalGroup }) {
   return (
     <article className={`signal-row ${signal.signal_type}`}>
       <div className="signal-match-cell">
-        <div>
-          <span className="signal-type">{signalTypeLabel(group)}</span>
+        <div className="signal-pattern-badges">
+          {group.signalTypes.map((signalType) => (
+            <span className="signal-type" key={signalType}>{signalTypeLabel(signalType)}</span>
+          ))}
           <span className={similarityBadgeClass(signal)}>
             {signalMatchBadge(group)}
           </span>
@@ -783,12 +919,19 @@ function compareSignals(left: HistoricalSignal, right: HistoricalSignal) {
   return right.sample_size - left.sample_size;
 }
 
-function signalTypeLabel(group: SignalGroup) {
-  const signal = group.bestSignal;
-  if (signal.signal_type === "exact_odds") return "6-odds exact";
-  if (signal.signal_type === "neighbor_odds") return "Nearby";
-  if (signal.signal_type === "one_draw") return "One draw";
-  return signal.signal_type;
+function signalTypeLabel(signalType: string) {
+  if (signalType === "exact_odds") return "6-odds exact";
+  if (signalType === "neighbor_odds") return "Nearby";
+  if (signalType === "one_draw") return "One draw";
+  return signalType;
+}
+
+function archiveItemMessage(item: ArchiveJobItem) {
+  if (item.odds_status === "unavailable") return "BetExplorer reports no bookmaker odds";
+  if (item.odds_status === "partial") return "Bwin/Unibet coverage is incomplete";
+  if (item.odds_status === "failed") return item.error_message || "Odds request or parsing failed";
+  if (item.score_status !== "complete") return "Final score is unavailable";
+  return item.error_message || "Archive requirements are incomplete";
 }
 
 function signalMatchBadge(group: SignalGroup) {
@@ -837,6 +980,16 @@ function archivePhaseLabel(phase: string | null | undefined) {
     error: "Backfill error",
   };
   return labels[phase ?? ""] ?? "Preparing archive job";
+}
+
+function maintenancePhaseLabel(phase: string | null | undefined) {
+  const labels: Record<string, string> = {
+    queued: "Signal rebuild queued",
+    starting: "Preparing signal rebuild",
+    archiving_played_matches: "Updating played-match archive",
+    recomputing_signals: "Recomputing historical signals",
+  };
+  return labels[phase ?? ""] ?? "Recomputing signals";
 }
 
 function uniqueSorted(values: string[]) {

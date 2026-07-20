@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import wraps
 from pathlib import Path
 from threading import RLock
@@ -10,10 +10,96 @@ from threading import RLock
 import duckdb
 
 from .clock import utc_now
-from .historical import ONE_DRAW_MIN_SAMPLE, compute_outcome_stats, normalize_odds, normalize_score
+from .historical import compute_outcome_stats, normalize_odds, normalize_score
 from .models import BookmakerOdds, CaptureType, DiscoveredMatch, OddsSnapshot, SnapshotQuality, TimingStatus
 from .snapshot_metrics import final_snapshot_age_to_kickoff_seconds
 from .utils import normalize_bookmaker_name
+
+
+MATCH_SUMMARY_CTE = """
+WITH final_snapshot_summary AS (
+    SELECT
+        match_id,
+        arg_max(id, captured_at) AS snapshot_id,
+        arg_max(quality_status, captured_at) AS quality_status,
+        MAX(captured_at) AS captured_at
+    FROM odds_snapshots
+    WHERE is_final = TRUE AND lower(market) = '1x2'
+    GROUP BY match_id
+),
+composed_required_summary AS (
+    SELECT match_id,
+           COUNT(DISTINCT normalized_bookmaker) AS required_count,
+           MAX(captured_at) AS captured_at,
+           MAX(CASE WHEN normalized_bookmaker = 'bwin' THEN 1 ELSE 0 END) > 0 AS has_bwin,
+           MAX(CASE WHEN normalized_bookmaker = 'unibet' THEN 1 ELSE 0 END) > 0 AS has_unibet
+    FROM final_bookmaker_odds
+    WHERE lower(market) = '1x2'
+      AND normalized_bookmaker IN ('bwin', 'unibet')
+    GROUP BY match_id
+),
+final_bookmaker_summary AS (
+    SELECT s.match_id,
+           COUNT(o.id) AS bookmaker_count,
+           SUM(CASE WHEN o.normalized_bookmaker = 'bwin' THEN 1 ELSE 0 END) > 0 AS has_bwin,
+           SUM(CASE WHEN o.normalized_bookmaker = 'unibet' THEN 1 ELSE 0 END) > 0 AS has_unibet
+    FROM odds_snapshots s
+    LEFT JOIN bookmaker_odds o ON o.snapshot_id = s.id
+    WHERE s.is_final = TRUE AND lower(s.market) = '1x2'
+    GROUP BY s.match_id
+),
+attempt_summary AS (
+    SELECT match_id, COUNT(*) AS attempt_count
+    FROM scrape_attempts
+    GROUP BY match_id
+),
+match_summary AS (
+    SELECT m.id, m.betexplorer_match_id AS event_id, m.league, m.home_team, m.away_team,
+           m.kickoff_time, m.status, m.timing_status, m.source_url, m.live_score,
+           m.capture_phase, m.next_capture_at, m.last_capture_at, m.finalized_at,
+           m.result_captured_at, s.snapshot_id,
+           CASE
+               WHEN c.required_count >= 2 THEN 'COMPLETE'
+               WHEN c.required_count = 1 THEN 'PARTIAL'
+               ELSE s.quality_status
+           END AS quality_status,
+           COALESCE(c.captured_at, s.captured_at) AS captured_at,
+           COALESCE(f.bookmaker_count, 0) AS bookmaker_count,
+           COALESCE(c.has_bwin, f.has_bwin, FALSE) AS has_bwin,
+           COALESCE(c.has_unibet, f.has_unibet, FALSE) AS has_unibet,
+           COALESCE(a.attempt_count, 0) AS attempt_count
+    FROM matches m
+    LEFT JOIN final_snapshot_summary s ON s.match_id = m.id
+    LEFT JOIN composed_required_summary c ON c.match_id = m.id
+    LEFT JOIN final_bookmaker_summary f ON f.match_id = m.id
+    LEFT JOIN attempt_summary a ON a.match_id = m.id
+)
+"""
+
+MATCH_SUMMARY_COLUMNS = [
+    "id",
+    "event_id",
+    "league",
+    "home_team",
+    "away_team",
+    "kickoff_time",
+    "status",
+    "timing_status",
+    "source_url",
+    "live_score",
+    "capture_phase",
+    "next_capture_at",
+    "last_capture_at",
+    "finalized_at",
+    "result_captured_at",
+    "snapshot_id",
+    "quality_status",
+    "captured_at",
+    "bookmaker_count",
+    "has_bwin",
+    "has_unibet",
+    "attempt_count",
+]
 
 
 def _locked(method):
@@ -26,13 +112,14 @@ def _locked(method):
 
 
 class Database:
-    def __init__(self, path: Path, timezone_offset: str = "+0") -> None:
+    def __init__(self, path: Path, timezone_offset: str = "+0", initialize: bool = True) -> None:
         self.path = path
         self.timezone_offset = timezone_offset
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
         self.connection = duckdb.connect(str(path))
-        self.migrate()
+        if initialize:
+            self.migrate()
 
     @_locked
     def migrate(self) -> None:
@@ -149,6 +236,43 @@ class Database:
         )
         self.connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS final_bookmaker_odds (
+                match_id VARCHAR,
+                market VARCHAR,
+                normalized_bookmaker VARCHAR,
+                bookmaker VARCHAR,
+                snapshot_id VARCHAR,
+                captured_at TIMESTAMP,
+                quality_status VARCHAR,
+                capture_type VARCHAR,
+                source_page_type VARCHAR,
+                home_odds DOUBLE,
+                draw_odds DOUBLE,
+                away_odds DOUBLE,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (match_id, market, normalized_bookmaker)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS historical_import_batches (
+                id VARCHAR PRIMARY KEY,
+                source_name VARCHAR,
+                source_kind VARCHAR,
+                content_hash VARCHAR,
+                files INTEGER,
+                records INTEGER,
+                warnings INTEGER,
+                status VARCHAR,
+                is_active BOOLEAN,
+                created_at TIMESTAMP,
+                activated_at TIMESTAMP
+            )
+            """
+        )
+        self.connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS historical_records (
                 id VARCHAR PRIMARY KEY,
                 dataset VARCHAR,
@@ -244,6 +368,60 @@ class Database:
             )
             """
         )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archive_jobs (
+                id VARCHAR PRIMARY KEY,
+                target_date DATE,
+                status VARCHAR,
+                phase VARCHAR,
+                total_items INTEGER,
+                last_error VARCHAR,
+                created_at TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archive_job_items (
+                job_id VARCHAR,
+                event_id VARCHAR,
+                match_id VARCHAR,
+                source_url VARCHAR,
+                state VARCHAR,
+                odds_status VARCHAR,
+                score_status VARCHAR,
+                archive_status VARCHAR,
+                attempt_count INTEGER,
+                error_message VARCHAR,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (job_id, event_id)
+            )
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance_jobs (
+                id VARCHAR PRIMARY KEY,
+                kind VARCHAR,
+                status VARCHAR,
+                phase VARCHAR,
+                progress_current INTEGER,
+                progress_total INTEGER,
+                payload_json VARCHAR,
+                result_json VARCHAR,
+                last_error VARCHAR,
+                created_at TIMESTAMP,
+                started_at TIMESTAMP,
+                finished_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+            """
+        )
 
     @_locked
     def _ensure_column(self, table: str, column: str, data_type: str) -> None:
@@ -257,6 +435,362 @@ class Database:
         ).fetchone()[0]
         if not exists:
             self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {data_type}")
+
+    @_locked
+    def create_archive_job(self, target_date: date) -> dict[str, object]:
+        existing = self.connection.execute(
+            """
+            SELECT id
+            FROM archive_jobs
+            WHERE target_date = ? AND status IN ('pending', 'running')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            [target_date],
+        ).fetchone()
+        if existing:
+            return self.get_archive_job(str(existing[0])) or {}
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        self.connection.execute(
+            """
+            INSERT INTO archive_jobs VALUES (?, ?, 'pending', 'queued', 0, NULL, ?, NULL, NULL, ?)
+            """,
+            [job_id, target_date, now, now],
+        )
+        return self.get_archive_job(job_id) or {}
+
+    @_locked
+    def start_archive_job(self, job_id: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE archive_jobs
+            SET status = 'running', phase = 'discovery', started_at = COALESCE(started_at, ?),
+                finished_at = NULL, last_error = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            [utc_now(), utc_now(), job_id],
+        )
+
+    @_locked
+    def set_archive_job_items(self, job_id: str, items: list[dict[str, object]]) -> None:
+        now = utc_now()
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            for item in items:
+                self.connection.execute(
+                    """
+                    INSERT INTO archive_job_items VALUES (?, ?, NULL, ?, 'discovered', 'pending', 'pending',
+                                                          'pending', 0, NULL, ?, ?)
+                    ON CONFLICT (job_id, event_id) DO UPDATE SET
+                        source_url = excluded.source_url,
+                        updated_at = excluded.updated_at
+                    """,
+                    [job_id, item["event_id"], item["source_url"], now, now],
+                )
+            total = int(
+                self.connection.execute(
+                    "SELECT COUNT(*) FROM archive_job_items WHERE job_id = ?",
+                    [job_id],
+                ).fetchone()[0]
+            )
+            self.connection.execute(
+                "UPDATE archive_jobs SET phase = 'capturing', total_items = ?, updated_at = ? WHERE id = ?",
+                [total, now, job_id],
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    @_locked
+    def pending_archive_job_events(self, job_id: str) -> set[str]:
+        rows = self.connection.execute(
+            """
+            SELECT event_id
+            FROM archive_job_items
+            WHERE job_id = ? AND archive_status != 'complete'
+            """,
+            [job_id],
+        ).fetchall()
+        return {str(row[0]) for row in rows}
+
+    @_locked
+    def retry_archive_job(self, job_id: str) -> dict[str, object] | None:
+        exists = self.connection.execute("SELECT 1 FROM archive_jobs WHERE id = ?", [job_id]).fetchone()
+        if not exists:
+            return None
+        now = utc_now()
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            self.connection.execute(
+                """
+                UPDATE archive_job_items
+                SET state = 'discovered',
+                    odds_status = CASE WHEN odds_status = 'complete' THEN odds_status ELSE 'pending' END,
+                    score_status = CASE WHEN score_status = 'complete' THEN score_status ELSE 'pending' END,
+                    archive_status = 'pending', error_message = NULL, updated_at = ?
+                WHERE job_id = ? AND archive_status != 'complete'
+                """,
+                [now, job_id],
+            )
+            self.connection.execute(
+                """
+                UPDATE archive_jobs
+                SET status = 'pending', phase = 'queued', last_error = NULL,
+                    started_at = NULL, finished_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                [now, job_id],
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self.get_archive_job(job_id)
+
+    @_locked
+    def list_archive_job_items(self, job_id: str, incomplete_only: bool = False) -> list[dict[str, object]]:
+        clause = "AND archive_status != 'complete'" if incomplete_only else ""
+        cursor = self.connection.execute(
+            f"""
+            SELECT event_id, match_id, source_url, state, odds_status, score_status,
+                   archive_status, attempt_count, error_message, updated_at
+            FROM archive_job_items
+            WHERE job_id = ? {clause}
+            ORDER BY updated_at DESC, event_id
+            """,
+            [job_id],
+        )
+        columns = [column[0] for column in cursor.description]
+        return [self._serialize(dict(zip(columns, row))) for row in cursor.fetchall()]
+
+    @_locked
+    def create_maintenance_job(self, kind: str, payload: dict[str, object]) -> dict[str, object]:
+        job_id = str(uuid.uuid4())
+        now = utc_now()
+        self.connection.execute(
+            """
+            INSERT INTO maintenance_jobs
+            VALUES (?, ?, 'pending', 'queued', 0, 0, ?, NULL, NULL, ?, NULL, NULL, ?)
+            """,
+            [job_id, kind, json.dumps(payload), now, now],
+        )
+        return self.get_maintenance_job(job_id) or {}
+
+    @_locked
+    def update_maintenance_job(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        phase: str | None = None,
+        current: int | None = None,
+        total: int | None = None,
+        result: dict[str, object] | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = utc_now()
+        self.connection.execute(
+            """
+            UPDATE maintenance_jobs
+            SET status = COALESCE(?, status), phase = COALESCE(?, phase),
+                progress_current = COALESCE(?, progress_current),
+                progress_total = COALESCE(?, progress_total),
+                result_json = COALESCE(?, result_json), last_error = ?,
+                started_at = CASE WHEN ? = 'running' THEN COALESCE(started_at, ?) ELSE started_at END,
+                finished_at = CASE WHEN ? IN ('completed', 'failed') THEN ? ELSE finished_at END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            [
+                status, phase, current, total,
+                json.dumps(result) if result is not None else None,
+                error, status, now, status, now, now, job_id,
+            ],
+        )
+
+    @_locked
+    def get_maintenance_job(self, job_id: str) -> dict[str, object] | None:
+        cursor = self.connection.execute("SELECT * FROM maintenance_jobs WHERE id = ?", [job_id])
+        row = cursor.fetchone()
+        if not row:
+            return None
+        columns = [column[0] for column in cursor.description]
+        result = self._serialize(dict(zip(columns, row)))
+        for key in ("payload_json", "result_json"):
+            raw = result.pop(key, None)
+            result[key.removesuffix("_json")] = json.loads(raw) if raw else None
+        return result
+
+    @_locked
+    def resumable_maintenance_jobs(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            "SELECT id FROM maintenance_jobs WHERE status IN ('pending', 'running') ORDER BY created_at"
+        ).fetchall()
+        return [job for row in rows if (job := self.get_maintenance_job(str(row[0]))) is not None]
+
+    @_locked
+    def update_archive_job_item(
+        self,
+        job_id: str,
+        event_id: str,
+        *,
+        match_id: str | None = None,
+        state: str | None = None,
+        odds_status: str | None = None,
+        score_status: str | None = None,
+        archive_status: str | None = None,
+        error_message: str | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE archive_job_items
+            SET match_id = COALESCE(?, match_id),
+                state = COALESCE(?, state),
+                odds_status = COALESCE(?, odds_status),
+                score_status = COALESCE(?, score_status),
+                archive_status = COALESCE(?, archive_status),
+                error_message = ?,
+                attempt_count = attempt_count + CASE WHEN ? THEN 1 ELSE 0 END,
+                updated_at = ?
+            WHERE job_id = ? AND event_id = ?
+            """,
+            [
+                match_id,
+                state,
+                odds_status,
+                score_status,
+                archive_status,
+                error_message,
+                increment_attempt,
+                utc_now(),
+                job_id,
+                event_id,
+            ],
+        )
+
+    @_locked
+    def finish_archive_job(self, job_id: str, error: str | None = None) -> None:
+        if error:
+            status = "failed"
+            phase = "failed"
+        else:
+            self.connection.execute(
+                """
+                UPDATE archive_job_items
+                SET state = 'incomplete', updated_at = ?
+                WHERE job_id = ? AND archive_status != 'complete'
+                  AND state NOT IN ('failed', 'incomplete')
+                """,
+                [utc_now(), job_id],
+            )
+            incomplete = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM archive_job_items
+                    WHERE job_id = ? AND archive_status != 'complete'
+                    """,
+                    [job_id],
+                ).fetchone()[0]
+            )
+            technical_errors = int(
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM archive_job_items
+                    WHERE job_id = ? AND (state = 'failed' OR odds_status = 'failed')
+                    """,
+                    [job_id],
+                ).fetchone()[0]
+            )
+            if technical_errors:
+                status = "completed_with_errors"
+            elif incomplete:
+                status = "completed_with_gaps"
+            else:
+                status = "completed"
+            phase = "complete"
+        self.connection.execute(
+            """
+            UPDATE archive_jobs
+            SET status = ?, phase = ?, last_error = ?, finished_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            [status, phase, error, utc_now(), utc_now(), job_id],
+        )
+
+    @_locked
+    def mark_archive_job_archived_items(self, job_id: str) -> None:
+        self.connection.execute(
+            """
+            UPDATE archive_job_items
+            SET odds_status = 'complete', archive_status = 'complete', state = 'archived',
+                error_message = NULL, updated_at = ?
+            WHERE job_id = ?
+              AND match_id IN (SELECT match_id FROM played_match_archive)
+            """,
+            [utc_now(), job_id],
+        )
+
+    @_locked
+    def get_archive_job(self, job_id: str) -> dict[str, object] | None:
+        row = self.connection.execute(
+            """
+            SELECT j.id, j.target_date, j.status, j.phase, j.total_items, j.last_error,
+                   j.created_at, j.started_at, j.finished_at, j.updated_at,
+                   COUNT(i.event_id) AS discovered,
+                   SUM(CASE WHEN i.state IN ('archived', 'incomplete', 'failed') THEN 1 ELSE 0 END) AS completed,
+                   SUM(CASE WHEN i.odds_status IN ('complete', 'partial') THEN 1 ELSE 0 END) AS captured,
+                   SUM(CASE WHEN i.odds_status = 'complete' THEN 1 ELSE 0 END) AS complete,
+                   SUM(CASE WHEN i.odds_status = 'partial' THEN 1 ELSE 0 END) AS partial,
+                   SUM(CASE WHEN i.odds_status = 'unavailable' THEN 1 ELSE 0 END) AS unavailable,
+                   SUM(CASE WHEN i.odds_status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                   SUM(CASE WHEN i.score_status = 'complete' THEN 1 ELSE 0 END) AS scores,
+                   SUM(CASE WHEN i.archive_status = 'complete' THEN 1 ELSE 0 END) AS archived,
+                   MAX(CASE WHEN i.state = 'processing' THEN i.event_id END) AS current_event_id
+            FROM archive_jobs j
+            LEFT JOIN archive_job_items i ON i.job_id = j.id
+            WHERE j.id = ?
+            GROUP BY j.id, j.target_date, j.status, j.phase, j.total_items, j.last_error,
+                     j.created_at, j.started_at, j.finished_at, j.updated_at
+            """,
+            [job_id],
+        ).fetchone()
+        if not row:
+            return None
+        columns = [column[0] for column in self.connection.description]
+        result = self._serialize(dict(zip(columns, row)))
+        for key in [
+            "total_items", "discovered", "completed", "captured", "complete", "partial",
+            "unavailable", "failed", "scores", "archived",
+        ]:
+            result[key] = int(result.get(key) or 0)
+        target_date = str(result["target_date"])
+        signal_row = self.connection.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT match_id)
+            FROM historical_signals
+            WHERE CAST(kickoff_time AS DATE) = ?
+            """,
+            [target_date],
+        ).fetchone()
+        result["date"] = target_date
+        result["results_captured"] = result["scores"]
+        result["signals"] = int(signal_row[0] or 0)
+        result["matches_evaluated"] = int(signal_row[1] or 0)
+        return result
+
+    @_locked
+    def resumable_archive_jobs(self) -> list[dict[str, object]]:
+        rows = self.connection.execute(
+            """
+            SELECT id FROM archive_jobs
+            WHERE status IN ('pending', 'running')
+            ORDER BY created_at
+            """
+        ).fetchall()
+        return [job for row in rows if (job := self.get_archive_job(str(row[0]))) is not None]
 
     @_locked
     def upsert_match(self, match: DiscoveredMatch) -> str:
@@ -560,11 +1094,24 @@ class Database:
 
     @_locked
     def save_snapshot(self, match_id: str, snapshot: OddsSnapshot) -> str:
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            snapshot_id = self._save_snapshot_unlocked(match_id, snapshot)
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return snapshot_id
+
+    def _save_snapshot_unlocked(self, match_id: str, snapshot: OddsSnapshot) -> str:
         snapshot_id = str(uuid.uuid4())
         now = utc_now()
         should_be_final = self._should_promote_snapshot(match_id, snapshot)
         if should_be_final:
-            self.connection.execute("UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ? AND market = ?", [match_id, snapshot.market])
+            self.connection.execute(
+                "UPDATE odds_snapshots SET is_final = FALSE WHERE match_id = ? AND market = ?",
+                [match_id, snapshot.market],
+            )
         self.connection.execute(
             """
             INSERT INTO odds_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -586,8 +1133,54 @@ class Database:
             ],
         )
         for odds in snapshot.bookmaker_odds:
-            self.save_bookmaker_odds(snapshot_id, odds, now)
+            self._save_bookmaker_odds_unlocked(snapshot_id, odds, now)
+        self._rebuild_final_bookmaker_observations(match_id, snapshot.market)
         return snapshot_id
+
+    def _rebuild_final_bookmaker_observations(self, match_id: str, market: str) -> None:
+        self.connection.execute(
+            "DELETE FROM final_bookmaker_odds WHERE match_id = ? AND market = ?",
+            [match_id, market],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO final_bookmaker_odds
+            WITH ranked AS (
+                SELECT
+                    s.match_id,
+                    s.market,
+                    o.normalized_bookmaker,
+                    o.bookmaker,
+                    s.id AS snapshot_id,
+                    s.captured_at,
+                    s.quality_status,
+                    s.capture_type,
+                    s.source_page_type,
+                    o.home_odds,
+                    o.draw_odds,
+                    o.away_odds,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.match_id, s.market, o.normalized_bookmaker
+                        ORDER BY s.captured_at DESC, s.id DESC, o.id DESC
+                    ) AS observation_rank
+                FROM odds_snapshots s
+                JOIN bookmaker_odds o ON o.snapshot_id = s.id
+                WHERE s.match_id = ?
+                  AND s.market = ?
+                  AND o.normalized_bookmaker IN ('bwin', 'unibet')
+                  AND o.is_available = TRUE
+                  AND o.home_odds IS NOT NULL
+                  AND o.draw_odds IS NOT NULL
+                  AND o.away_odds IS NOT NULL
+            )
+            SELECT match_id, market, normalized_bookmaker, bookmaker, snapshot_id,
+                   captured_at, quality_status, capture_type, source_page_type,
+                   home_odds, draw_odds, away_odds, ?
+            FROM ranked
+            WHERE observation_rank = 1
+            """,
+            [match_id, market, utc_now()],
+        )
 
     def _should_promote_snapshot(self, match_id: str, snapshot: OddsSnapshot) -> bool:
         current = self.connection.execute(
@@ -677,10 +1270,24 @@ class Database:
                 f"UPDATE odds_snapshots SET is_final = TRUE WHERE id IN ({chunk_placeholders})",
                 chunk,
             )
-        return {"groups_checked": len(best_rows), "groups_repaired": repaired}
+        self.connection.execute("DELETE FROM final_bookmaker_odds")
+        groups = self.connection.execute(
+            "SELECT DISTINCT match_id, market FROM odds_snapshots"
+        ).fetchall()
+        for match_id, market in groups:
+            self._rebuild_final_bookmaker_observations(str(match_id), str(market))
+        observation_count = int(self.connection.execute("SELECT COUNT(*) FROM final_bookmaker_odds").fetchone()[0])
+        return {
+            "groups_checked": len(best_rows),
+            "groups_repaired": repaired,
+            "bookmaker_observations": observation_count,
+        }
 
     @_locked
     def save_bookmaker_odds(self, snapshot_id: str, odds: BookmakerOdds, created_at: datetime) -> None:
+        self._save_bookmaker_odds_unlocked(snapshot_id, odds, created_at)
+
+    def _save_bookmaker_odds_unlocked(self, snapshot_id: str, odds: BookmakerOdds, created_at: datetime) -> None:
         self.connection.execute(
             """
             INSERT INTO bookmaker_odds VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -704,6 +1311,30 @@ class Database:
 
     @_locked
     def save_attempt(
+        self,
+        match_id: str,
+        event_id: str,
+        source_url: str,
+        attempt_number: int,
+        status: str,
+        error_message: str | None,
+        required_found: dict[str, bool],
+        started_at: datetime,
+        finished_at: datetime,
+    ) -> None:
+        self._save_attempt_unlocked(
+            match_id,
+            event_id,
+            source_url,
+            attempt_number,
+            status,
+            error_message,
+            required_found,
+            started_at,
+            finished_at,
+        )
+
+    def _save_attempt_unlocked(
         self,
         match_id: str,
         event_id: str,
@@ -750,39 +1381,181 @@ class Database:
         return bool(row and row[0] == fingerprint)
 
     @_locked
+    def active_historical_batch(self) -> dict[str, object] | None:
+        row = self.connection.execute(
+            """
+            SELECT id, source_name, source_kind, content_hash, files, records,
+                   warnings, status, created_at, activated_at
+            FROM historical_import_batches
+            WHERE is_active = TRUE
+            ORDER BY activated_at DESC NULLS LAST, created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if not row:
+            legacy_records = int(self.connection.execute("SELECT COUNT(*) FROM historical_records").fetchone()[0])
+            if legacy_records <= 0:
+                return None
+            batch_id = str(uuid.uuid4())
+            now = utc_now()
+            legacy_files = int(self.connection.execute("SELECT COUNT(*) FROM historical_import_files").fetchone()[0])
+            legacy_warnings = int(
+                self.connection.execute("SELECT COALESCE(SUM(warnings), 0) FROM historical_import_files").fetchone()[0]
+            )
+            self.connection.execute(
+                """
+                INSERT INTO historical_import_batches
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    batch_id,
+                    "Legacy historical database",
+                    "legacy",
+                    None,
+                    legacy_files,
+                    legacy_records,
+                    legacy_warnings,
+                    "active",
+                    True,
+                    now,
+                    now,
+                ],
+            )
+            row = (
+                batch_id,
+                "Legacy historical database",
+                "legacy",
+                None,
+                legacy_files,
+                legacy_records,
+                legacy_warnings,
+                "active",
+                now,
+                now,
+            )
+        columns = [
+            "id",
+            "source_name",
+            "source_kind",
+            "content_hash",
+            "files",
+            "records",
+            "warnings",
+            "status",
+            "created_at",
+            "activated_at",
+        ]
+        return self._serialize(dict(zip(columns, row)))
+
+    @_locked
+    def replace_active_historical_dataset(
+        self,
+        source_name: str,
+        source_kind: str,
+        content_hash: str,
+        files: list[dict[str, object]],
+    ) -> dict[str, object]:
+        current = self.active_historical_batch()
+        if current and current.get("content_hash") == content_hash:
+            return {"batch_id": current["id"], "activated": False}
+
+        batch_id = str(uuid.uuid4())
+        now = utc_now()
+        record_count = sum(len(file.get("records", [])) for file in files)  # type: ignore[arg-type]
+        warning_count = sum(len(file.get("warnings", [])) for file in files)  # type: ignore[arg-type]
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            self.connection.execute("UPDATE historical_import_batches SET is_active = FALSE, status = 'inactive'")
+            self.connection.execute("DELETE FROM historical_signals")
+            self.connection.execute("DELETE FROM historical_records")
+            self.connection.execute("DELETE FROM historical_import_files")
+            for file in files:
+                logical_source_file = str(file["source_file"])
+                dataset = str(file["dataset"])
+                records = list(file.get("records", []))
+                warnings = list(file.get("warnings", []))
+                for record in records:
+                    self._insert_historical_record(logical_source_file, record, now)
+                self.connection.execute(
+                    """
+                    INSERT INTO historical_import_files VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        logical_source_file,
+                        dataset,
+                        file["fingerprint"],
+                        len(records),
+                        len(warnings),
+                        now,
+                    ],
+                )
+            self.connection.execute(
+                """
+                INSERT INTO historical_import_batches
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    batch_id,
+                    source_name,
+                    source_kind,
+                    content_hash,
+                    len(files),
+                    record_count,
+                    warning_count,
+                    "active",
+                    True,
+                    now,
+                    now,
+                ],
+            )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return {"batch_id": batch_id, "activated": True}
+
+    @_locked
     def replace_historical_records(self, source_file: str, records: list[dict[str, object]]) -> None:
         now = utc_now()
         self.connection.execute("DELETE FROM historical_records WHERE source_file = ?", [source_file])
         for row in records:
-            self.connection.execute(
-                """
-                INSERT INTO historical_records (
-                    id, dataset, source_file, source_home_bucket, source_away_file,
-                    query_home_odds, query_draw_odds, query_away_odds,
-                    historical_home_odds, historical_draw_odds, historical_away_odds,
-                    full_time_score, half_time_score, parse_status, parse_warning, imported_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    str(uuid.uuid4()),
-                    row["dataset"],
-                    row.get("source_file", source_file),
-                    row.get("source_home_bucket"),
-                    row.get("source_away_file"),
-                    row["query_home_odds"],
-                    row["query_draw_odds"],
-                    row["query_away_odds"],
-                    row.get("historical_home_odds"),
-                    row.get("historical_draw_odds"),
-                    row.get("historical_away_odds"),
-                    row["full_time_score"],
-                    row.get("half_time_score"),
-                    row.get("parse_status", "parsed"),
-                    row.get("parse_warning"),
-                    now,
-                ],
+            self._insert_historical_record(source_file, row, now)
+
+    def _insert_historical_record(
+        self,
+        source_file: str,
+        row: dict[str, object],
+        imported_at: datetime,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO historical_records (
+                id, dataset, source_file, source_home_bucket, source_away_file,
+                query_home_odds, query_draw_odds, query_away_odds,
+                historical_home_odds, historical_draw_odds, historical_away_odds,
+                full_time_score, half_time_score, parse_status, parse_warning, imported_at
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                str(uuid.uuid4()),
+                row["dataset"],
+                row.get("source_file", source_file),
+                row.get("source_home_bucket"),
+                row.get("source_away_file"),
+                row["query_home_odds"],
+                row["query_draw_odds"],
+                row["query_away_odds"],
+                row.get("historical_home_odds"),
+                row.get("historical_draw_odds"),
+                row.get("historical_away_odds"),
+                row["full_time_score"],
+                row.get("half_time_score"),
+                row.get("parse_status", "parsed"),
+                row.get("parse_warning"),
+                imported_at,
+            ],
+        )
 
     @_locked
     def record_historical_import_file(
@@ -839,18 +1612,31 @@ class Database:
             if row[0]
         ]
         last_import = self.connection.execute("SELECT MAX(imported_at) FROM historical_import_files").fetchone()[0]
-        return {
+        result = {
             "records": records,
             "files": files,
             "warnings": warnings,
             "datasets": datasets,
             "last_import": last_import.isoformat() if last_import else None,
         }
+        result["active_batch"] = self.active_historical_batch()
+        return result
 
     @_locked
-    def recompute_historical_signals(self) -> dict[str, int]:
-        self.connection.execute("DELETE FROM historical_signals")
-        candidates = self._signal_candidates()
+    def recompute_historical_signals(self, match_ids: list[str] | None = None) -> dict[str, int]:
+        if match_ids is not None:
+            unique_match_ids = sorted(set(match_ids))
+            if not unique_match_ids:
+                return {"matches_evaluated": 0, "signals": 0}
+            placeholders = ", ".join(["?"] * len(unique_match_ids))
+            self.connection.execute(
+                f"DELETE FROM historical_signals WHERE match_id IN ({placeholders})",
+                unique_match_ids,
+            )
+        else:
+            self.connection.execute("DELETE FROM historical_signals")
+            unique_match_ids = None
+        candidates = self._signal_candidates(unique_match_ids)
         complete_records = self._fetch_complete_historical_records()
         record_index = _build_complete_record_index(complete_records)
         inserted = 0
@@ -861,9 +1647,15 @@ class Database:
                 inserted += self._insert_historical_signal(candidate, signal_type, records)
         return {"matches_evaluated": len({row["match_id"] for row in candidates}), "signals": inserted}
 
-    def _signal_candidates(self) -> list[dict[str, object]]:
+    def _signal_candidates(self, match_ids: list[str] | None = None) -> list[dict[str, object]]:
+        match_filter = ""
+        params: list[object] = []
+        if match_ids:
+            placeholders = ", ".join(["?"] * len(match_ids))
+            match_filter = f"AND m.id IN ({placeholders})"
+            params.extend(match_ids)
         rows = self.connection.execute(
-            """
+            f"""
             SELECT m.id AS match_id, m.betexplorer_match_id AS event_id, m.league, m.home_team, m.away_team,
                    m.kickoff_time, m.capture_phase, m.finalized_at,
                    MAX(CASE WHEN o.normalized_bookmaker = 'bwin' THEN o.bookmaker END) AS bwin_bookmaker,
@@ -875,12 +1667,12 @@ class Database:
                    MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.draw_odds END) AS unibet_draw_odds,
                    MAX(CASE WHEN o.normalized_bookmaker = 'unibet' THEN o.away_odds END) AS unibet_away_odds
             FROM matches m
-            JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE AND lower(s.market) = '1x2'
-            JOIN bookmaker_odds o ON o.snapshot_id = s.id
+            JOIN final_bookmaker_odds o ON o.match_id = m.id AND lower(o.market) = '1x2'
             WHERE o.normalized_bookmaker IN ('bwin', 'unibet')
               AND o.home_odds IS NOT NULL
               AND o.draw_odds IS NOT NULL
               AND o.away_odds IS NOT NULL
+              {match_filter}
             GROUP BY m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team,
                      m.kickoff_time, m.capture_phase, m.finalized_at
             HAVING bwin_home_odds IS NOT NULL
@@ -890,7 +1682,8 @@ class Database:
                AND unibet_draw_odds IS NOT NULL
                AND unibet_away_odds IS NOT NULL
             ORDER BY m.kickoff_time NULLS LAST, m.home_team
-            """
+            """,
+            params,
         ).fetchall()
         columns = [col[0] for col in self.connection.description]
         return [dict(zip(columns, row)) for row in rows]
@@ -907,69 +1700,37 @@ class Database:
         exact_records = _matching_indexed_records(candidate, record_index, "exact_odds")
         odds_exact = _records_from_datasets(exact_records, ["Odds"])
         usable_exact = _records_from_datasets(exact_records, ["Usable Odds"])
-        played_exact = _records_from_datasets(exact_records, ["Played archive"])
         if odds_exact:
             groups.append(("exact_odds", odds_exact))
         elif usable_exact:
             groups.append(("exact_odds", usable_exact))
-        elif played_exact:
-            groups.append(("exact_odds", played_exact))
 
         one_draw_records = _matching_indexed_records(candidate, record_index, "one_draw")
         docx_one_draw = _records_from_datasets(one_draw_records, ["Odds", "Usable Odds"])
-        if len(docx_one_draw) >= ONE_DRAW_MIN_SAMPLE:
+        if docx_one_draw:
             groups.append(("one_draw", _records_with_dataset_label(docx_one_draw, _merged_dataset_label(docx_one_draw))))
-        else:
-            played_one_draw = _records_from_datasets(one_draw_records, ["Played archive"])
-            if len(played_one_draw) >= ONE_DRAW_MIN_SAMPLE:
-                groups.append(("one_draw", played_one_draw))
         return groups
 
     def _fetch_complete_historical_records(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
             """
-            WITH historical_pool AS (
-                SELECT id AS record_id, dataset, source_file,
-                       query_home_odds AS bwin_home_odds,
-                       query_draw_odds AS bwin_draw_odds,
-                       query_away_odds AS bwin_away_odds,
-                       historical_home_odds AS unibet_home_odds,
-                       historical_draw_odds AS unibet_draw_odds,
-                       historical_away_odds AS unibet_away_odds,
-                       full_time_score,
-                       TRUE AS allow_reverse
-                FROM historical_records
-                WHERE full_time_score IS NOT NULL
-                  AND query_home_odds IS NOT NULL
-                  AND query_draw_odds IS NOT NULL
-                  AND query_away_odds IS NOT NULL
-                  AND historical_home_odds IS NOT NULL
-                  AND historical_draw_odds IS NOT NULL
-                  AND historical_away_odds IS NOT NULL
-                UNION ALL
-                SELECT event_id AS record_id, 'Played archive' AS dataset, event_id AS source_file,
-                       bwin_home_odds AS query_home_odds,
-                       bwin_draw_odds AS query_draw_odds,
-                       bwin_away_odds AS query_away_odds,
-                       unibet_home_odds AS query_home_odds,
-                       unibet_draw_odds AS query_draw_odds,
-                       unibet_away_odds AS query_away_odds,
-                       full_time_score,
-                       FALSE AS allow_reverse
-                FROM played_match_archive
-                WHERE full_time_score IS NOT NULL
-                  AND unibet_home_odds IS NOT NULL
-                  AND unibet_draw_odds IS NOT NULL
-                  AND unibet_away_odds IS NOT NULL
-                  AND bwin_home_odds IS NOT NULL
-                  AND bwin_draw_odds IS NOT NULL
-                  AND bwin_away_odds IS NOT NULL
-            )
-            SELECT record_id, dataset, source_file,
-                   bwin_home_odds, bwin_draw_odds, bwin_away_odds,
-                   unibet_home_odds, unibet_draw_odds, unibet_away_odds,
-                   full_time_score, allow_reverse
-            FROM historical_pool
+            SELECT id AS record_id, dataset, source_file,
+                   query_home_odds AS bwin_home_odds,
+                   query_draw_odds AS bwin_draw_odds,
+                   query_away_odds AS bwin_away_odds,
+                   historical_home_odds AS unibet_home_odds,
+                   historical_draw_odds AS unibet_draw_odds,
+                   historical_away_odds AS unibet_away_odds,
+                   full_time_score,
+                   FALSE AS allow_reverse
+            FROM historical_records
+            WHERE full_time_score IS NOT NULL
+              AND query_home_odds IS NOT NULL
+              AND query_draw_odds IS NOT NULL
+              AND query_away_odds IS NOT NULL
+              AND historical_home_odds IS NOT NULL
+              AND historical_draw_odds IS NOT NULL
+              AND historical_away_odds IS NOT NULL
             ORDER BY dataset, source_file, bwin_home_odds, bwin_draw_odds, bwin_away_odds
             """
         ).fetchall()
@@ -1081,6 +1842,70 @@ class Database:
         return inserted
 
     @_locked
+    def persist_capture_batch(self, captures: list[object], schedules: list[object]) -> list[str | None]:
+        snapshot_ids: list[str | None] = []
+        self.connection.execute("BEGIN TRANSACTION")
+        try:
+            for write in captures:
+                snapshot = getattr(write, "snapshot")
+                snapshot_ids.append(
+                    self._save_snapshot_unlocked(str(getattr(write, "match_id")), snapshot)
+                    if snapshot is not None
+                    else None
+                )
+                self._save_attempt_unlocked(
+                    str(getattr(write, "match_id")),
+                    str(getattr(write, "event_id")),
+                    str(getattr(write, "source_url")),
+                    int(getattr(write, "attempt_number")),
+                    str(getattr(write, "status")),
+                    getattr(write, "error_message"),
+                    dict(getattr(write, "required_found")),
+                    getattr(write, "started_at"),
+                    getattr(write, "finished_at"),
+                )
+            for write in schedules:
+                captured_at = getattr(write, "captured_at")
+                if captured_at is None:
+                    self.connection.execute(
+                        """
+                        UPDATE matches
+                        SET capture_phase = ?, next_capture_at = ?,
+                            finalized_at = COALESCE(?, finalized_at), updated_at = ?
+                        WHERE id = ?
+                        """,
+                        [
+                            getattr(write, "capture_phase"),
+                            getattr(write, "next_capture_at"),
+                            getattr(write, "finalized_at"),
+                            utc_now(),
+                            getattr(write, "match_id"),
+                        ],
+                    )
+                else:
+                    self.connection.execute(
+                        """
+                        UPDATE matches
+                        SET last_capture_at = ?, next_capture_at = ?, capture_phase = ?,
+                            finalized_at = COALESCE(?, finalized_at), updated_at = ?
+                        WHERE id = ?
+                        """,
+                        [
+                            captured_at,
+                            getattr(write, "next_capture_at"),
+                            getattr(write, "capture_phase"),
+                            getattr(write, "finalized_at"),
+                            utc_now(),
+                            getattr(write, "match_id"),
+                        ],
+                    )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+        return snapshot_ids
+
+    @_locked
     def list_signals(
         self,
         match_id: str | None = None,
@@ -1168,18 +1993,30 @@ class Database:
         ]
 
     @_locked
-    def archive_played_matches(self) -> dict[str, int]:
+    def archive_played_matches(self, match_ids: list[str] | None = None) -> dict[str, int]:
+        match_filter = ""
+        params: list[object] = []
+        if match_ids is not None:
+            unique_match_ids = sorted(set(match_ids))
+            if not unique_match_ids:
+                return {"archived": 0}
+            placeholders = ", ".join(["?"] * len(unique_match_ids))
+            match_filter = f"AND m.id IN ({placeholders})"
+            params.extend(unique_match_ids)
         rows = self.connection.execute(
-            """
+            f"""
             SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team,
                    m.kickoff_time, m.finalized_at, m.result_captured_at, m.live_score,
                    o.normalized_bookmaker, o.home_odds, o.draw_odds, o.away_odds
             FROM matches m
-            JOIN odds_snapshots s ON s.match_id = m.id AND s.is_final = TRUE AND lower(s.market) = '1x2'
-            JOIN bookmaker_odds o ON o.snapshot_id = s.id AND o.normalized_bookmaker IN ('bwin', 'unibet')
+            JOIN final_bookmaker_odds o ON o.match_id = m.id
+                AND lower(o.market) = '1x2'
+                AND o.normalized_bookmaker IN ('bwin', 'unibet')
             WHERE m.result_captured_at IS NOT NULL
+              {match_filter}
             ORDER BY m.id, o.normalized_bookmaker
-            """
+            """,
+            params,
         ).fetchall()
         grouped: dict[str, dict[str, object]] = {}
         for row in rows:
@@ -1347,67 +2184,14 @@ class Database:
     @_locked
     def list_matches(self) -> list[dict[str, object]]:
         rows = self.connection.execute(
-            """
-            WITH final_snapshot_summary AS (
-                SELECT
-                    match_id,
-                    arg_max(id, captured_at) AS snapshot_id,
-                    arg_max(quality_status, captured_at) AS quality_status,
-                    MAX(captured_at) AS captured_at
-                FROM odds_snapshots
-                WHERE is_final = TRUE AND lower(market) = '1x2'
-                GROUP BY match_id
-            )
-            SELECT m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
-                   m.status, m.timing_status, m.source_url, m.live_score,
-                   m.capture_phase, m.next_capture_at, m.last_capture_at, m.finalized_at,
-                   m.result_captured_at, s.snapshot_id, s.quality_status, s.captured_at,
-                   COUNT(o.id) AS bookmaker_count,
-                   COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'bwin' THEN 1 ELSE 0 END), 0) > 0 AS has_bwin,
-                   COALESCE(SUM(CASE WHEN o.normalized_bookmaker = 'unibet' THEN 1 ELSE 0 END), 0) > 0 AS has_unibet,
-                   COALESCE(a.attempt_count, 0) AS attempt_count
-            FROM matches m
-            LEFT JOIN final_snapshot_summary s ON s.match_id = m.id
-            LEFT JOIN odds_snapshots fs ON fs.match_id = m.id AND fs.is_final = TRUE AND lower(fs.market) = '1x2'
-            LEFT JOIN bookmaker_odds o ON o.snapshot_id = fs.id
-            LEFT JOIN (
-                SELECT match_id, COUNT(*) AS attempt_count
-                FROM scrape_attempts
-                GROUP BY match_id
-            ) a ON a.match_id = m.id
-            GROUP BY m.id, m.betexplorer_match_id, m.league, m.home_team, m.away_team, m.kickoff_time,
-                     m.status, m.timing_status, m.source_url, m.live_score, m.capture_phase,
-                     m.next_capture_at, m.last_capture_at, m.finalized_at, m.result_captured_at,
-                     s.snapshot_id, s.quality_status, s.captured_at,
-                     a.attempt_count
-            ORDER BY (s.snapshot_id IS NULL), s.captured_at DESC NULLS LAST, m.kickoff_time NULLS LAST, m.home_team
+            MATCH_SUMMARY_CTE
+            + """
+            SELECT * FROM match_summary
+            ORDER BY (snapshot_id IS NULL), captured_at DESC NULLS LAST,
+                     kickoff_time NULLS LAST, home_team
             """
         ).fetchall()
-        columns = [
-            "id",
-            "event_id",
-            "league",
-            "home_team",
-            "away_team",
-            "kickoff_time",
-            "status",
-            "timing_status",
-            "source_url",
-            "live_score",
-            "capture_phase",
-            "next_capture_at",
-            "last_capture_at",
-            "finalized_at",
-            "result_captured_at",
-            "snapshot_id",
-            "quality_status",
-            "captured_at",
-            "bookmaker_count",
-            "has_bwin",
-            "has_unibet",
-            "attempt_count",
-        ]
-        return [self._with_final_snapshot_age(self._serialize(dict(zip(columns, row)))) for row in rows]
+        return [self._with_final_snapshot_age(self._serialize(dict(zip(MATCH_SUMMARY_COLUMNS, row)))) for row in rows]
 
     @_locked
     def list_matches_page(
@@ -1419,14 +2203,62 @@ class Database:
         offset: int = 0,
         limit: int = 120,
     ) -> dict[str, object]:
-        rows = self.list_matches()
-        visible = [row for row in rows if self._match_row_visible(row, query, match_filter, match_date)]
-        visible.sort(key=lambda row: self._match_sort_key(row, sort_mode), reverse=sort_mode in {"capture_desc", "bookmakers_desc", "attempts_desc"})
         safe_offset = max(0, offset)
         safe_limit = min(max(1, limit), 500)
+        clauses: list[str] = []
+        params: list[object] = []
+        if match_date:
+            clauses.append("CAST(kickoff_time AS DATE) = ?")
+            params.append(match_date)
+        needle = query.strip().lower()
+        if needle:
+            clauses.append(
+                """
+                lower(concat_ws(' ', league, home_team, away_team, event_id,
+                                quality_status, capture_phase, timing_status)) LIKE ?
+                """
+            )
+            params.append(f"%{needle}%")
+        filter_sql = {
+            "with_odds": "bookmaker_count > 0",
+            "req_full": "quality_status = 'COMPLETE'",
+            "req_partial": "quality_status = 'PARTIAL'",
+            "req_missing": "quality_status = 'FAILED'",
+            "missing_bwin": "bookmaker_count > 0 AND has_bwin = FALSE",
+            "missing_unibet": "bookmaker_count > 0 AND has_unibet = FALSE",
+            "capture_miss": "finalized_at IS NOT NULL AND bookmaker_count = 0 AND attempt_count > 0",
+            "skipped_old": "finalized_at IS NOT NULL AND bookmaker_count = 0 AND attempt_count = 0",
+            "due": "next_capture_at IS NOT NULL",
+            "finalized": "finalized_at IS NOT NULL",
+            "new": "quality_status IS NULL",
+        }.get(match_filter)
+        if filter_sql:
+            clauses.append(filter_sql)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_sql = {
+            "kickoff_asc": "kickoff_time ASC NULLS LAST, home_team",
+            "bookmakers_desc": "bookmaker_count DESC, captured_at DESC NULLS LAST",
+            "attempts_desc": "attempt_count DESC, captured_at DESC NULLS LAST",
+            "capture_desc": "captured_at DESC NULLS LAST, kickoff_time NULLS LAST",
+        }.get(sort_mode, "captured_at DESC NULLS LAST, kickoff_time NULLS LAST")
+        total = int(
+            self.connection.execute(
+                MATCH_SUMMARY_CTE + f"SELECT COUNT(*) FROM match_summary {where_sql}",
+                params,
+            ).fetchone()[0]
+        )
+        rows = self.connection.execute(
+            MATCH_SUMMARY_CTE
+            + f"SELECT * FROM match_summary {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+            [*params, safe_limit, safe_offset],
+        ).fetchall()
+        items = [
+            self._with_final_snapshot_age(self._serialize(dict(zip(MATCH_SUMMARY_COLUMNS, row))))
+            for row in rows
+        ]
         return {
-            "items": visible[safe_offset : safe_offset + safe_limit],
-            "total": len(visible),
+            "items": items,
+            "total": total,
             "offset": safe_offset,
             "limit": safe_limit,
         }
@@ -1506,10 +2338,35 @@ class Database:
         ]
 
     @_locked
-    def match_detail(self, match_id: str) -> dict[str, object] | None:
-        match = next((row for row in self.list_matches() if row["id"] == match_id), None)
-        if not match:
+    def match_detail(
+        self,
+        match_id: str,
+        snapshots_limit: int = 100,
+        attempts_limit: int = 100,
+    ) -> dict[str, object] | None:
+        match_row = self.connection.execute(
+            MATCH_SUMMARY_CTE + "SELECT * FROM match_summary WHERE id = ?",
+            [match_id],
+        ).fetchone()
+        if not match_row:
             return None
+        match = self._with_final_snapshot_age(
+            self._serialize(dict(zip(MATCH_SUMMARY_COLUMNS, match_row)))
+        )
+        safe_snapshots_limit = min(max(1, snapshots_limit), 500)
+        safe_attempts_limit = min(max(1, attempts_limit), 500)
+        snapshot_total = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM odds_snapshots WHERE match_id = ?",
+                [match_id],
+            ).fetchone()[0]
+        )
+        attempt_total = int(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM scrape_attempts WHERE match_id = ?",
+                [match_id],
+            ).fetchone()[0]
+        )
         snapshots = self.connection.execute(
             """
             SELECT s.*, COUNT(o.id) AS bookmaker_count,
@@ -1522,8 +2379,9 @@ class Database:
                      s.quality_status, s.is_final_candidate, s.is_final, s.source_page_type,
                      s.raw_payload_path, s.required_bookmakers_json, s.created_at, m.kickoff_time
             ORDER BY s.captured_at DESC
+            LIMIT ?
             """,
-            [match_id],
+            [match_id, safe_snapshots_limit],
         ).fetchall()
         snapshot_columns = [col[0] for col in self.connection.description]
         odds_rows = self.connection.execute(
@@ -1537,9 +2395,19 @@ class Database:
             [match_id],
         ).fetchall()
         odds_columns = [col[0] for col in self.connection.description]
-        attempts = self.connection.execute(
-            "SELECT * FROM scrape_attempts WHERE match_id = ? ORDER BY started_at DESC",
+        final_required_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM final_bookmaker_odds
+            WHERE match_id = ? AND lower(market) = '1x2'
+            ORDER BY normalized_bookmaker
+            """,
             [match_id],
+        ).fetchall()
+        final_required_columns = [col[0] for col in self.connection.description]
+        attempts = self.connection.execute(
+            "SELECT * FROM scrape_attempts WHERE match_id = ? ORDER BY started_at DESC LIMIT ?",
+            [match_id, safe_attempts_limit],
         ).fetchall()
         attempt_columns = [col[0] for col in self.connection.description]
         return self._serialize(
@@ -1547,7 +2415,14 @@ class Database:
                 "match": match,
                 "snapshots": [self._with_final_snapshot_age(self._serialize(dict(zip(snapshot_columns, row)))) for row in snapshots],
                 "bookmaker_odds": [dict(zip(odds_columns, row)) for row in odds_rows],
+                "final_required_odds": [dict(zip(final_required_columns, row)) for row in final_required_rows],
                 "attempts": [dict(zip(attempt_columns, row)) for row in attempts],
+                "pagination": {
+                    "snapshots_total": snapshot_total,
+                    "snapshots_returned": len(snapshots),
+                    "attempts_total": attempt_total,
+                    "attempts_returned": len(attempts),
+                },
             }
         )
 

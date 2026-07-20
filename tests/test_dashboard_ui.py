@@ -112,7 +112,7 @@ def test_dashboard_moves_historical_signals_to_separate_page() -> None:
         "Signal monitor",
         "\"/api/signals?actionable_only=true\"",
         "api<HistoricalImportStatus>(\"/api/historical/import-status\")",
-        "api(\"/api/signals/recompute\"",
+        "api<MaintenanceJob>(\"/api/signals/recompute\"",
         "similarityBadgeClass",
         "Actionable",
         "BTTS",
@@ -125,11 +125,14 @@ def test_dashboard_moves_historical_signals_to_separate_page() -> None:
         "api<SignalDay[]>(\"/api/signal-days\")",
         "Previous day with signals",
         "Best match first",
-        "The API is busy with this job, not offline.",
+        "This runs in the background; the monitor remains available",
         "datasetLabel",
         "samples",
         "ArchiveProgressBar",
-        "api<ApiStatus>(\"/api/status\")",
+        "No odds",
+        "completed_with_gaps",
+        "BetExplorer reports no bookmaker odds",
+        "api<ArchiveJob>(`/api/archive/jobs/${archiveJobId}`)",
         "Capturing final odds and scores",
         "completed / total",
         "date <strong>{archiveResult.date}</strong>",
@@ -169,6 +172,42 @@ def test_dashboard_labels_one_draw_similarity_as_draw_only_not_full_confidence()
     assert 'return "One Draw 5/6";' in page
     assert 'if (signal.signal_type === "one_draw") return "similarity-badge draw-only";' in page
     assert ".similarity-badge.draw-only" in styles
+
+
+def test_match_page_explains_the_complete_bwin_unibet_six_odds_pair() -> None:
+    page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+
+    expected_phrases = [
+        "<ComparisonBrief signal={signal} signals={signals} />",
+        "<WhyMatched signal={signal} signals={signals} />",
+        "The historical block is matched as one Bwin + Unibet six-odds pair.",
+        "Current six odds",
+        "Historical average",
+        'return ["bwin", "unibet"]',
+        'return "Allowed draw difference";',
+    ]
+
+    for phrase in expected_phrases:
+        assert phrase in page
+
+
+def test_match_page_keeps_exact_and_one_draw_as_separate_selectable_patterns() -> None:
+    match_page = read_repo_file("apps/desktop/web/app/match/page.tsx")
+    signals_page = read_repo_file("apps/desktop/web/app/signals/page.tsx")
+    styles = read_repo_file("apps/desktop/web/app/globals.css")
+
+    expected_match_phrases = [
+        "<HistoricalSignalDetails key={match.id} signals={signals} />",
+        "logicalSignalOptions(signals)",
+        'role="tablist"',
+        'return "Exact 6/6";',
+        'return "One Draw 5/6";',
+        "`${signal.signal_type}|${signal.dataset}`",
+    ]
+    for phrase in expected_match_phrases:
+        assert phrase in match_page
+    assert "group.signalTypes.map" in signals_page
+    assert ".historical-pattern-tabs" in styles
 
 
 def test_dashboard_uses_chunked_match_acquisition_and_render_derender_hints() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -11,6 +12,19 @@ from betexplorer_scraper.config import Settings
 from betexplorer_scraper.database import Database
 from betexplorer_scraper.models import DiscoveredMatch, TimingStatus
 from betexplorer_scraper.transport import BetExplorerTransport, HttpBetExplorerTransport, RawResponse
+
+
+def test_raw_payloads_are_gzip_compressed(tmp_path: Path) -> None:
+    db_path = tmp_path / "raw_payload.duckdb"
+    settings = _settings(db_path)
+    settings.raw_snapshot_dir = tmp_path / "raw"
+    service = CaptureService(settings, Database(db_path), FakeTransport(datetime(2026, 7, 18, 20, 0)))
+
+    path = service._save_raw_payload("raw123", 1, "1x2", '{"odds":"payload"}')
+
+    assert path.suffixes[-2:] == [".json", ".gz"]
+    with gzip.open(path, "rt", encoding="utf-8") as source:
+        assert source.read() == '{"odds":"payload"}'
 
 
 class FakeTransport(BetExplorerTransport):
@@ -151,6 +165,17 @@ class FinishedResultTransport(FakeTransport):
         </table>
         """
         return RawResponse("https://www.betexplorer.com/football/", html, 200)
+
+
+class NoOddsArchiveTransport(FinishedResultTransport):
+    async def fetch_match_odds(self, event_id: str, referer_url: str, market: str = "1x2") -> RawResponse:
+        self.match_odds_calls += 1
+        html = "<div>There isn't any bookmaker offering odds for this match.</div>"
+        return RawResponse(
+            "https://www.betexplorer.com/match-odds/abc12345/0/1x2/bestOdds/?lang=en",
+            json.dumps({"odds": html}),
+            200,
+        )
 
 
 class MatchPageResultTransport(NoDiscoveryTransport):
@@ -484,6 +509,53 @@ async def test_archive_football_date_captures_played_matches_and_updates_archive
     assert archive_rows[0]["full_time_score"] == "2-1"
     assert archive_rows[0]["bwin_home_odds"] == 2.2
     assert archive_rows[0]["unibet_away_odds"] == 2.38
+
+
+@pytest.mark.asyncio
+async def test_durable_archive_job_persists_real_event_progress(tmp_path: Path) -> None:
+    target_day = date(2026, 5, 14)
+    kickoff = datetime(2026, 5, 14, 20, 0)
+    db_path = tmp_path / "durable_archive_job.duckdb"
+    db = Database(db_path)
+    service = CaptureService(_settings(db_path), db, FinishedResultTransport(kickoff))
+    job = db.create_archive_job(target_day)
+
+    await service.run_archive_job(str(job["id"]), target_day)
+
+    saved = db.get_archive_job(str(job["id"]))
+    assert saved is not None
+    assert saved["status"] == "completed"
+    assert saved["total_items"] == 1
+    assert saved["discovered"] == 1
+    assert saved["completed"] == 1
+    assert saved["captured"] == 1
+    assert saved["scores"] == 1
+    assert saved["archived"] == 1
+    assert db.resumable_archive_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_archive_job_reports_explicit_no_odds_as_unavailable_not_failed(tmp_path: Path) -> None:
+    target_day = date(2026, 5, 14)
+    kickoff = datetime(2026, 5, 14, 20, 0)
+    db_path = tmp_path / "archive_no_odds.duckdb"
+    db = Database(db_path)
+    settings = _settings(db_path).model_copy(update={"max_retries_per_match": 2, "retry_delay_seconds": 0})
+    service = CaptureService(settings, db, NoOddsArchiveTransport(kickoff))
+    job = db.create_archive_job(target_day)
+
+    result = await service.run_archive_job(str(job["id"]), target_day)
+    saved = db.get_archive_job(str(job["id"]))
+    items = db.list_archive_job_items(str(job["id"]))
+
+    assert result["unavailable"] == 1
+    assert result["failed"] == 0
+    assert saved is not None
+    assert saved["status"] == "completed_with_gaps"
+    assert saved["unavailable"] == 1
+    assert saved["failed"] == 0
+    assert items[0]["odds_status"] == "unavailable"
+    assert items[0]["error_message"] == "BetExplorer reports no bookmaker odds for this match"
 
 
 @pytest.mark.asyncio

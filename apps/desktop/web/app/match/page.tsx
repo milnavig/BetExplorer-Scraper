@@ -105,6 +105,12 @@ type MatchDetail = {
   snapshots: SnapshotRow[];
   bookmaker_odds: BookmakerOdds[];
   attempts: AttemptRow[];
+  pagination?: {
+    snapshots_total: number;
+    snapshots_returned: number;
+    attempts_total: number;
+    attempts_returned: number;
+  };
 };
 
 type MatchPageResult = {
@@ -620,23 +626,7 @@ export default function MatchPage() {
                 <OddsBookmakerCard bookmaker="Unibet" odds={signalGroupBookmakerOdds(signals, "unibet")} present={match.has_unibet} />
               </div>
               {signals.length > 0 ? (
-                <div className="match-signal-layout">
-                  <ComparisonBrief signal={bestSignal(signals)} />
-                  <SignalSummaryCard signal={bestSignal(signals)} />
-                  <OutcomeBars signal={bestSignal(signals)} />
-                  <div className="signal-stats secondary-signal-stats">
-                    <Info label="Over 0.5" value={formatPct(bestSignal(signals).over_0_5_pct)} />
-                    <Info label="Over 1.5" value={formatPct(bestSignal(signals).over_1_5_pct)} />
-                    <Info label="Over 2.5" value={formatPct(bestSignal(signals).over_2_5_pct)} />
-                    <Info label="BTTS" value={formatPct(bestSignal(signals).btts_pct)} />
-                    <Info
-                      label="Double Chance"
-                      value={`1X ${formatPct(bestSignal(signals).double_chance_1x_pct)} · X2 ${formatPct(bestSignal(signals).double_chance_x2_pct)} · 12 ${formatPct(bestSignal(signals).double_chance_12_pct)}`}
-                    />
-                  </div>
-                  <WhyMatched signal={bestSignal(signals)} />
-                  <ScoreExamples signal={bestSignal(signals)} />
-                </div>
+                <HistoricalSignalDetails key={match.id} signals={signals} />
               ) : (
                 <p className="empty">{historicalEmptyMessage(match)}</p>
               )}
@@ -748,7 +738,7 @@ export default function MatchPage() {
 
             <section className="dual-grid match-dual">
               <div className="panel">
-                <PanelHeader title="Snapshots" subtitle={`${Math.min(detail?.snapshots.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.snapshots.length ?? 0} saved attempts`} />
+                <PanelHeader title="Snapshots" subtitle={`${Math.min(detail?.snapshots.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.pagination?.snapshots_total ?? detail?.snapshots.length ?? 0} saved snapshots`} />
                 <div className="table-wrap medium">
                   <table>
                     <thead>
@@ -795,7 +785,7 @@ export default function MatchPage() {
               </div>
 
               <div className="panel">
-                <PanelHeader title="Attempts" subtitle={`${Math.min(detail?.attempts.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.attempts.length ?? 0} HTTP/parser attempts`} />
+                <PanelHeader title="Attempts" subtitle={`${Math.min(detail?.attempts.length ?? 0, DETAIL_TABLE_PREVIEW_ROWS)} shown of ${detail?.pagination?.attempts_total ?? detail?.attempts.length ?? 0} HTTP/parser attempts`} />
                 <div className="table-wrap medium">
                   <table>
                     <thead>
@@ -928,7 +918,59 @@ function OddsBookmakerCard({ bookmaker, odds, present }: { bookmaker: string; od
   );
 }
 
-function ComparisonBrief({ signal }: { signal: HistoricalSignal }) {
+function HistoricalSignalDetails({ signals }: { signals: HistoricalSignal[] }) {
+  const options = useMemo(() => logicalSignalOptions(signals), [signals]);
+  const [selectedKey, setSelectedKey] = useState(() => signalOptionKey(options[0]));
+  const signal = options.find((option) => signalOptionKey(option) === selectedKey) ?? options[0];
+
+  if (!signal) return null;
+
+  return (
+    <>
+      {options.length > 1 ? (
+        <div className="historical-pattern-tabs" role="tablist" aria-label="Historical patterns">
+          <span>Historical patterns</span>
+          {options.map((option) => {
+            const optionKey = signalOptionKey(option);
+            return (
+              <button
+                type="button"
+                role="tab"
+                aria-selected={optionKey === signalOptionKey(signal)}
+                className={optionKey === signalOptionKey(signal) ? "active" : ""}
+                key={optionKey}
+                onClick={() => setSelectedKey(optionKey)}
+              >
+                <strong>{signalMatchTypeLabel(option)}</strong>
+                <small>{historicalDatasetLabel(option.dataset)} · {option.sample_size} sample{option.sample_size === 1 ? "" : "s"}</small>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+      <div className="match-signal-layout">
+        <ComparisonBrief signal={signal} signals={signals} />
+        <SignalSummaryCard signal={signal} />
+        <OutcomeBars signal={signal} />
+        <div className="signal-stats secondary-signal-stats">
+          <Info label="Over 0.5" value={formatPct(signal.over_0_5_pct)} />
+          <Info label="Over 1.5" value={formatPct(signal.over_1_5_pct)} />
+          <Info label="Over 2.5" value={formatPct(signal.over_2_5_pct)} />
+          <Info label="BTTS" value={formatPct(signal.btts_pct)} />
+          <Info
+            label="Double Chance"
+            value={`1X ${formatPct(signal.double_chance_1x_pct)} · X2 ${formatPct(signal.double_chance_x2_pct)} · 12 ${formatPct(signal.double_chance_12_pct)}`}
+          />
+        </div>
+        <WhyMatched signal={signal} signals={signals} />
+        <ScoreExamples signal={signal} />
+      </div>
+    </>
+  );
+}
+
+function ComparisonBrief({ signal, signals }: { signal: HistoricalSignal; signals: HistoricalSignal[] }) {
+  const pairedSignals = signalPair(signals, signal);
   return (
     <div className="comparison-brief">
       <div>
@@ -944,7 +986,12 @@ function ComparisonBrief({ signal }: { signal: HistoricalSignal }) {
           value={`${historicalDatasetLabel(signal.dataset)} · ${signal.sample_size} matches`}
         />
         <Info label="Matched by" value={matchBasisLabel(signal)} />
-        <Info label="Current odds" value={`${formatOdd(signal.current_home_odds)} / ${formatOdd(signal.current_draw_odds)} / ${formatOdd(signal.current_away_odds)}`} />
+        <Info
+          label="Current six odds"
+          value={pairedSignals
+            .map((item) => `${item.bookmaker} ${formatOdd(item.current_home_odds)} / ${formatOdd(item.current_draw_odds)} / ${formatOdd(item.current_away_odds)}`)
+            .join(" · ")}
+        />
         <Info label="Signal strength" value={signalStrengthLabel(signal)} />
       </div>
     </div>
@@ -995,24 +1042,38 @@ function OutcomeBar({ label, value }: { label: string; value: number }) {
   );
 }
 
-function WhyMatched({ signal }: { signal: HistoricalSignal }) {
+function WhyMatched({ signal, signals }: { signal: HistoricalSignal; signals: HistoricalSignal[] }) {
+  const pairedSignals = signalPair(signals, signal);
   return (
     <div className="why-matched">
       <h4>Why matched</h4>
+      <p className="why-matched-note">
+        The historical block is matched as one Bwin + Unibet six-odds pair.
+      </p>
       <table>
         <thead>
           <tr>
+            <th>Bookmaker</th>
             <th>Side</th>
             <th>Current odds</th>
-            <th>Matched historical odds</th>
+            <th>Historical average</th>
             <th>Difference</th>
-            <th>Used for match</th>
+            <th>Match rule</th>
           </tr>
         </thead>
         <tbody>
-          <tr><td>1</td><td>{formatOdd(signal.current_home_odds)}</td><td>{formatOdd(signal.matched_odds_home)}</td><td>{formatOdd(signal.odds_distance_home)}</td><td>{usedForMatch(signal, "home")}</td></tr>
-          <tr><td>X</td><td>{formatOdd(signal.current_draw_odds)}</td><td>{formatOdd(signal.matched_odds_draw)}</td><td>{formatOdd(signal.odds_distance_draw)}</td><td>{usedForMatch(signal, "draw")}</td></tr>
-          <tr><td>2</td><td>{formatOdd(signal.current_away_odds)}</td><td>{formatOdd(signal.matched_odds_away)}</td><td>{formatOdd(signal.odds_distance_away)}</td><td>{usedForMatch(signal, "away")}</td></tr>
+          {pairedSignals.flatMap((bookmakerSignal) =>
+            (["home", "draw", "away"] as const).map((side, index) => (
+              <tr key={`${bookmakerSignal.id}-${side}`}>
+                {index === 0 ? <td rowSpan={3}><strong>{bookmakerSignal.bookmaker}</strong></td> : null}
+                <td>{side === "home" ? "1" : side === "draw" ? "X" : "2"}</td>
+                <td>{formatOdd(signalOdd(bookmakerSignal, side, "current"))}</td>
+                <td>{formatOdd(signalOdd(bookmakerSignal, side, "matched"))}</td>
+                <td>{formatOdd(signalOdd(bookmakerSignal, side, "distance"))}</td>
+                <td>{matchRuleForSide(bookmakerSignal, side)}</td>
+              </tr>
+            )),
+          )}
         </tbody>
       </table>
     </div>
@@ -1133,6 +1194,27 @@ function signalTypeLabel(value: string) {
   return labels[value] ?? value;
 }
 
+function logicalSignalOptions(signals: HistoricalSignal[]) {
+  const options = new Map<string, HistoricalSignal>();
+  for (const signal of signals) {
+    const key = signalOptionKey(signal);
+    const current = options.get(key);
+    if (!current || signal.normalized_bookmaker === "bwin") options.set(key, signal);
+  }
+  return [...options.values()].sort(compareSignals);
+}
+
+function signalOptionKey(signal: HistoricalSignal | undefined) {
+  return signal ? `${signal.signal_type}|${signal.dataset}` : "";
+}
+
+function signalMatchTypeLabel(signal: HistoricalSignal) {
+  if (signal.signal_type === "exact_odds") return "Exact 6/6";
+  if (signal.signal_type === "one_draw") return "One Draw 5/6";
+  if (signal.signal_type === "neighbor_odds") return "Nearby odds";
+  return signal.signal_type;
+}
+
 function matchBasisLabel(signal: HistoricalSignal) {
   if (signal.signal_type === "exact_odds") return "Bwin + Unibet exact 6 odds";
   if (signal.signal_type === "neighbor_odds") return "Full 1X2 nearby odds";
@@ -1147,8 +1229,32 @@ function signalStrengthLabel(signal: HistoricalSignal) {
   return "Low";
 }
 
-function usedForMatch(signal: HistoricalSignal, side: "home" | "draw" | "away") {
-  return "Yes";
+function signalPair(signals: HistoricalSignal[], selected: HistoricalSignal) {
+  const sameGroup = signals.filter(
+    (signal) =>
+      signal.signal_type === selected.signal_type &&
+      signal.dataset === selected.dataset,
+  );
+  return ["bwin", "unibet"]
+    .map((bookmaker) => sameGroup.find((signal) => signal.normalized_bookmaker === bookmaker))
+    .filter((signal): signal is HistoricalSignal => Boolean(signal));
+}
+
+function signalOdd(
+  signal: HistoricalSignal,
+  side: "home" | "draw" | "away",
+  kind: "current" | "matched" | "distance",
+) {
+  if (kind === "current") return signal[`current_${side}_odds`];
+  if (kind === "matched") return signal[`matched_odds_${side}`];
+  return signal[`odds_distance_${side}`];
+}
+
+function matchRuleForSide(signal: HistoricalSignal, side: "home" | "draw" | "away") {
+  const difference = signalOdd(signal, side, "distance") ?? 0;
+  if (difference === 0) return "Exact";
+  if (signal.signal_type === "one_draw" && side === "draw") return "Allowed draw difference";
+  return "Different";
 }
 
 function similarityBadgeClass(signal: HistoricalSignal) {
@@ -1228,7 +1334,10 @@ function oddsReadinessMessage(match: MatchRow, signals: HistoricalSignal[]) {
   if (!match.has_bwin) return "Waiting for Bwin final 1X2 odds";
   if (!match.has_unibet) return "Waiting for Unibet final 1X2 odds";
   if (signals.length === 0) return "No historical match for current Bwin/Unibet odds";
-  return `${signals.length} historical signal rows ranked by similarity`;
+  const signalCount = new Set(
+    signals.map((signal) => `${signal.signal_type}|${signal.dataset}`),
+  ).size;
+  return `${signalCount} historical ${signalCount === 1 ? "signal" : "signals"} ranked by match quality`;
 }
 
 function historicalEmptyMessage(match: MatchRow) {

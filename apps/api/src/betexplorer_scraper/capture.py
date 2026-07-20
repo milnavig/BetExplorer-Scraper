@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
+import time as monotonic_time
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -9,8 +11,10 @@ from typing import Any
 from .clock import now_for_timezone_offset, utc_now
 from .config import Settings
 from .database import Database
+from .ingest import CapturePriority, CaptureRequest, IngestCoordinator
 from .models import DiscoveredMatch, OddsSnapshot, TimingStatus
 from .parsers import DiscoveryParser, OddsParser
+from .persistence import AttemptWrite, PersistenceCoordinator, ScheduleWrite
 from .scheduler import Scheduler, SchedulerConfig
 from .timing import classify_timing
 from .transport import BetExplorerTransport, HttpBetExplorerTransport
@@ -48,13 +52,37 @@ class CaptureService:
             )
         )
         self._run_lock = asyncio.Lock()
+        self._archive_lock = asyncio.Lock()
+        self.ingest = IngestCoordinator(settings.max_concurrent_captures, settings.ingest_queue_size)
+        self.persistence = PersistenceCoordinator(
+            database,
+            settings.persistence_batch_size,
+            settings.persistence_flush_interval_ms,
+            settings.persistence_queue_size,
+        )
         self._last_discovery_at: datetime | None = None
         self._markets_cache: dict[str, tuple[datetime, list[str]]] = {}
         self._match_page_cache: dict[str, tuple[datetime, str]] = {}
         self._progress: dict[str, Any] = self._idle_progress()
+        self._archive_progress: dict[str, Any] = self._idle_progress()
+        self._last_changed_match_ids: list[str] = []
+        self._last_raw_cleanup_at = 0.0
 
     def progress_status(self) -> dict[str, Any]:
         return dict(self._progress)
+
+    def archive_progress_status(self) -> dict[str, Any]:
+        return dict(self._archive_progress)
+
+    def last_changed_match_ids(self) -> list[str]:
+        return list(self._last_changed_match_ids)
+
+    def ingest_status(self) -> dict[str, object]:
+        return {**self.ingest.metrics(), "persistence": self.persistence.metrics()}
+
+    async def close(self) -> None:
+        await self.persistence.close()
+        await self.ingest.close()
 
     def _idle_progress(self) -> dict[str, Any]:
         return {
@@ -69,6 +97,9 @@ class CaptureService:
             "active": 0,
             "completed": 0,
             "captured": 0,
+            "complete": 0,
+            "partial": 0,
+            "unavailable": 0,
             "failed": 0,
             "skipped": 0,
             "finalized": 0,
@@ -84,7 +115,10 @@ class CaptureService:
     def _set_progress(self, **values: Any) -> None:
         self._progress = {**self._progress, **values}
 
-    async def run_once(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
+    def _set_archive_progress(self, **values: Any) -> None:
+        self._archive_progress = {**self._archive_progress, **values}
+
+    async def run_once(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, object]:
         async with self._run_lock:
             try:
                 return await self._run_once_locked(now, trigger, force_discovery)
@@ -98,74 +132,191 @@ class CaptureService:
                 raise
 
     async def archive_football_date(self, target_date: date) -> dict[str, int]:
-        async with self._run_lock:
-            return await self._archive_football_date_locked(target_date)
+        async with self._archive_lock:
+            return await self._archive_football_date_locked(target_date, None)
 
-    async def _archive_football_date_locked(self, target_date: date) -> dict[str, int]:
+    async def run_archive_job(self, job_id: str, target_date: date) -> dict[str, int]:
+        async with self._archive_lock:
+            self.database.start_archive_job(job_id)
+            try:
+                result = await self._archive_football_date_locked(target_date, job_id)
+                self.database.finish_archive_job(job_id)
+                return result
+            except Exception as exc:
+                self.database.finish_archive_job(job_id, str(exc))
+                raise
+
+    async def _archive_football_date_locked(self, target_date: date, job_id: str | None) -> dict[str, int]:
         archive_now = datetime.combine(target_date, time(23, 59))
-        self._progress = {
+        self._archive_progress = {
             **self._idle_progress(),
             "running": True,
             "trigger": "archive_date",
             "phase": "archive_discovery",
             "started_at": utc_now().isoformat(),
         }
-        page = await self.transport.fetch_football_date(target_date)
+        page = await self.ingest.submit(
+            CaptureRequest(
+                f"date:{target_date.isoformat()}",
+                "html",
+                CapturePriority.BACKFILL,
+                "archive_discovery",
+                request_kind="discovery_date",
+            ),
+            lambda: self.transport.fetch_football_date(target_date),
+        )
         parsed_matches = self.discovery_parser.parse_homepage(page.text, archive_now)
-        matches = [
-            match
+        matches_by_event_id = {
+            match.event_id: match
             for match in parsed_matches
             if match.kickoff_time is not None and match.kickoff_time.date() == target_date
-        ]
+        }
+        matches = list(matches_by_event_id.values())
         discovered = len(matches)
+        if job_id:
+            self.database.set_archive_job_items(
+                job_id,
+                [{"event_id": match.event_id, "source_url": match.source_url} for match in matches],
+            )
+            pending_event_ids = self.database.pending_archive_job_events(job_id)
+            matches = [match for match in matches if match.event_id in pending_event_ids]
         captured = 0
         complete = 0
+        partial = 0
+        unavailable = 0
         failed = 0
         results_captured = 0
         results_checked = 0
-        self._set_progress(discovered=discovered, due=discovered, queued=discovered, phase="archive_capturing")
+        processed_match_ids: list[str] = []
+        self._set_archive_progress(discovered=discovered, due=discovered, queued=discovered, phase="archive_capturing")
+        counter_lock = asyncio.Lock()
 
-        for index, match in enumerate(matches, start=1):
-            self._set_progress(active=1, completed=index - 1, current_event_id=match.event_id)
-            await self._enrich_kickoff_from_match_page_if_needed(match, archive_now)
+        async def process_match(match: DiscoveredMatch) -> None:
+            nonlocal captured, complete, partial, unavailable, failed, results_captured, results_checked
+            if job_id:
+                self.database.update_archive_job_item(
+                    job_id,
+                    match.event_id,
+                    state="processing",
+                    increment_attempt=True,
+                )
+            self._set_archive_progress(
+                active=int(self._archive_progress["active"]) + 1,
+                current_event_id=match.event_id,
+            )
+            await self._enrich_kickoff_from_match_page_if_needed(
+                match,
+                archive_now,
+                CapturePriority.BACKFILL,
+                "archive_kickoff",
+            )
             match.timing_status = TimingStatus.FINISHED
             match.status = "finished"
             match_id = self.database.upsert_match(match)
-            self.database.update_match_schedule(match_id, "FINALIZED", None, utc_now())
-            saved, market_complete = await self.capture_match_market(match_id, match.event_id, match.source_url, "1x2")
-            captured += 1 if saved else 0
-            complete += 1 if market_complete else 0
-            failed += 0 if saved else 1
+            processed_match_ids.append(match_id)
+            if job_id:
+                self.database.update_archive_job_item(
+                    job_id,
+                    match.event_id,
+                    match_id=match_id,
+                    state="processing",
+                )
+            await self.persistence.submit_schedule(
+                ScheduleWrite(match_id, "FINALIZED", None, utc_now())
+            )
+            saved, market_complete, odds_status = await self.capture_match_market(
+                match_id, match.event_id, match.source_url, "1x2", CapturePriority.BACKFILL, "backfill"
+            )
+            if job_id:
+                self.database.update_archive_job_item(
+                    job_id,
+                    match.event_id,
+                    odds_status=odds_status,
+                    error_message=self._archive_odds_message(odds_status),
+                )
 
             score = match.live_score
+            checked = 0
+            captured_result = 0
             if not score:
-                results_checked += 1
+                checked = 1
                 try:
-                    match_page = await self._fetch_match_page_cached(match.source_url)
+                    match_page = await self._fetch_match_page_cached(
+                        match.source_url,
+                        CapturePriority.RESULT_RECOVERY,
+                        "archive_result",
+                    )
                     finished, parsed_score = self.discovery_parser.parse_match_page_result(match_page)
-                    # Historical date pages are already past dates. Some archived match
-                    # pages expose the full-time score without the structured Finished
-                    # marker, so keeping the parsed score is safer than dropping it.
                     score = parsed_score if finished or parsed_score else None
                 except Exception as exc:
-                    self.database.log("warning", "archive", "archive_result_lookup_failed", match.event_id, {"error": str(exc)})
+                    self.database.log(
+                        "warning",
+                        "archive",
+                        "archive_result_lookup_failed",
+                        match.event_id,
+                        {"error": str(exc)},
+                    )
             if score and self.database.mark_result_captured(match_id, score, utc_now()):
-                results_captured += 1
-            self._set_progress(
-                captured=captured,
-                failed=failed,
-                completed=index,
-                results_captured=results_captured,
-                results_checked=results_checked,
-            )
+                captured_result = 1
+            if job_id:
+                score_captured = bool(score) and bool(
+                    self.database.get_match_schedule(match_id).get("result_captured_at")
+                )
+                error_message = self._archive_odds_message(odds_status)
+                if error_message is None and not score_captured:
+                    error_message = "Final score is unavailable"
+                self.database.update_archive_job_item(
+                    job_id,
+                    match.event_id,
+                    state="ready",
+                    score_status="complete" if score_captured else "failed",
+                    error_message=error_message,
+                )
 
-        archive = self.database.archive_played_matches()
-        recompute = self.database.recompute_historical_signals()
+            async with counter_lock:
+                captured += 1 if saved else 0
+                complete += 1 if market_complete else 0
+                partial += 1 if odds_status == "partial" else 0
+                unavailable += 1 if odds_status == "unavailable" else 0
+                failed += 1 if odds_status == "failed" else 0
+                results_checked += checked
+                results_captured += captured_result
+                self._set_archive_progress(
+                    active=max(0, int(self._archive_progress["active"]) - 1),
+                    completed=int(self._archive_progress["completed"]) + 1,
+                    captured=captured,
+                    complete=complete,
+                    partial=partial,
+                    unavailable=unavailable,
+                    failed=failed,
+                    results_captured=results_captured,
+                    results_checked=results_checked,
+                )
+
+        match_iterator = iter(matches)
+
+        async def archive_worker() -> None:
+            while True:
+                try:
+                    match = next(match_iterator)
+                except StopIteration:
+                    return
+                await process_match(match)
+
+        worker_count = min(len(matches), max(1, self.settings.historical_backfill_concurrency))
+        await asyncio.gather(*(archive_worker() for _ in range(worker_count)))
+
+        archive = self.database.archive_played_matches(processed_match_ids)
+        if job_id:
+            self.database.mark_archive_job_archived_items(job_id)
+        recompute = self.database.recompute_historical_signals(processed_match_ids)
         result = {
             "date": target_date.isoformat(),
             "discovered": discovered,
             "captured": captured,
             "complete": complete,
+            "partial": partial,
+            "unavailable": unavailable,
             "failed": failed,
             "results_captured": results_captured,
             "results_checked": results_checked,
@@ -173,10 +324,10 @@ class CaptureService:
             "signals": recompute["signals"],
             "matches_evaluated": recompute["matches_evaluated"],
         }
-        self._set_progress(running=False, active=0, phase="archive_complete", finished_at=utc_now().isoformat())
+        self._set_archive_progress(running=False, active=0, phase="archive_complete", finished_at=utc_now().isoformat())
         return result
 
-    async def _run_once_locked(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, int]:
+    async def _run_once_locked(self, now: datetime | None = None, trigger: str = "manual", force_discovery: bool = True) -> dict[str, object]:
         now = now or now_for_timezone_offset(self.settings.betexplorer_timezone_offset)
         next_discovery = self._next_discovery_at()
         self._progress = {
@@ -201,7 +352,16 @@ class CaptureService:
                 next_discovery_at=next_discovery.isoformat() if next_discovery else None,
             )
             try:
-                live = await self.transport.fetch_live_results()
+                live = await self.ingest.submit(
+                    CaptureRequest(
+                        "live-results",
+                        "json",
+                        CapturePriority.KICKOFF,
+                        "live_results",
+                        request_kind="live_results",
+                    ),
+                    self.transport.fetch_live_results,
+                )
                 matches = self.discovery_parser.apply_live_results(matches, live.text)
             except Exception as exc:
                 self.database.log("warning", "capture", "live_results_failed", details={"error": str(exc)})
@@ -219,6 +379,8 @@ class CaptureService:
         results_captured = 0
         results_checked = 0
         capture_jobs: list[tuple[str, str, str, datetime | None, str, datetime | None]] = []
+        planned_schedules: list[ScheduleWrite] = []
+        changed_match_ids: list[str] = []
         self._set_progress(phase="planning")
 
         seen_match_ids: set[str] = set()
@@ -232,7 +394,9 @@ class CaptureService:
                 finalized_at=schedule_state["finalized_at"],
                 last_capture_at=schedule_state["last_capture_at"],
             )
-            self.database.update_match_schedule(match_id, decision.phase, decision.next_capture_at, decision.finalized_at)
+            planned_schedules.append(
+                ScheduleWrite(match_id, decision.phase, decision.next_capture_at, decision.finalized_at)
+            )
             if not decision.should_capture:
                 skipped += 1
                 finalized += 1 if decision.phase == "FINALIZED" else 0
@@ -287,30 +451,51 @@ class CaptureService:
             schedule_match(match_id, match, schedule_state)
 
         self._set_progress(due=due, queued=len(capture_jobs), skipped=skipped, finalized=finalized, waiting=waiting)
+        if planned_schedules:
+            await asyncio.gather(
+                *(self.persistence.submit_schedule(write) for write in planned_schedules)
+            )
         if capture_jobs:
             self._set_progress(phase="capturing", queued=len(capture_jobs), active=0, completed=0)
-            semaphore = asyncio.Semaphore(max(1, self.settings.max_concurrent_captures))
 
             async def run_capture(job: tuple[str, str, str, datetime | None, str, datetime | None]) -> bool:
                 nonlocal captured, failed
                 match_id, event_id, source_url, next_capture_at, phase, finalized_at = job
-                async with semaphore:
-                    self._set_progress(active=self._progress["active"] + 1, current_event_id=event_id)
-                    ok = await self.capture_match(match_id, event_id, source_url)
-                    stored_phase = "FINALIZED" if finalized_at is not None else phase
-                    self.database.mark_match_captured(match_id, utc_now(), next_capture_at, stored_phase, finalized_at)
-                    captured += 1 if ok else 0
-                    failed += 0 if ok else 1
-                    self._set_progress(
-                        active=max(0, self._progress["active"] - 1),
-                        completed=self._progress["completed"] + 1,
-                        captured=captured,
-                        failed=failed,
-                        current_event_id=event_id,
-                    )
-                    return ok
+                self._set_progress(active=self._progress["active"] + 1, current_event_id=event_id)
+                capture_priority = CapturePriority.KICKOFF if phase in {"FINALIZING", "FINAL"} else CapturePriority.UPCOMING
+                if trigger == "manual_force":
+                    capture_priority = CapturePriority.MANUAL
+                ok = await self.capture_match(match_id, event_id, source_url, capture_priority, trigger)
+                stored_phase = "FINALIZED" if finalized_at is not None else phase
+                await self.persistence.submit_schedule(
+                    ScheduleWrite(match_id, stored_phase, next_capture_at, finalized_at, utc_now())
+                )
+                captured += 1 if ok else 0
+                failed += 0 if ok else 1
+                if ok:
+                    changed_match_ids.append(match_id)
+                self._set_progress(
+                    active=max(0, self._progress["active"] - 1),
+                    completed=self._progress["completed"] + 1,
+                    captured=captured,
+                    failed=failed,
+                    current_event_id=event_id,
+                )
+                return ok
 
-            results = await asyncio.gather(*(run_capture(job) for job in capture_jobs))
+            job_iterator = iter(capture_jobs)
+            results: list[bool] = []
+
+            async def capture_worker() -> None:
+                while True:
+                    try:
+                        job = next(job_iterator)
+                    except StopIteration:
+                        return
+                    results.append(await run_capture(job))
+
+            worker_count = min(len(capture_jobs), max(1, self.settings.max_concurrent_captures))
+            await asyncio.gather(*(capture_worker() for _ in range(worker_count)))
             captured = sum(1 for ok in results if ok)
             failed = len(results) - captured
         else:
@@ -326,6 +511,7 @@ class CaptureService:
             "results_captured": results_captured,
             "results_checked": results_checked,
         }
+        self._last_changed_match_ids = sorted(set(changed_match_ids))
         self.database.log("info", "capture", "run_once_completed", details=result)
         self._set_progress(
             running=False,
@@ -359,22 +545,52 @@ class CaptureService:
         return self._last_discovery_at + timedelta(seconds=self.settings.discovery_poll_interval_seconds)
 
     async def _discover_matches(self, now: datetime) -> list:
-        pages = [await self.transport.fetch_homepage()]
+        pages = [
+            await self.ingest.submit(
+                CaptureRequest(
+                    "homepage",
+                    "html",
+                    CapturePriority.UPCOMING,
+                    "discovery",
+                    request_kind="discovery_homepage",
+                ),
+                self.transport.fetch_homepage,
+            )
+        ]
         past_days = max(1, (self.settings.result_capture_lookback_hours + 23) // 24)
         future_days = max(self.settings.discovery_days_ahead, (self.settings.odds_capture_lookahead_hours + 23) // 24)
+        discovery_semaphore = asyncio.Semaphore(max(1, self.settings.discovery_concurrency))
+
+        async def fetch_date_page(target_date: date):
+            async with discovery_semaphore:
+                try:
+                    return await self.ingest.submit(
+                        CaptureRequest(
+                            f"date:{target_date.isoformat()}",
+                            "html",
+                            CapturePriority.UPCOMING,
+                            "discovery",
+                            request_kind="discovery_date",
+                        ),
+                        lambda: self.transport.fetch_football_date(target_date),
+                    )
+                except NotImplementedError:
+                    return None
+                except Exception as exc:
+                    self.database.log(
+                        "warning",
+                        "capture",
+                        "date_discovery_failed",
+                        details={"date": target_date.isoformat(), "error": str(exc)},
+                    )
+                    return None
+
+        target_dates = []
         for offset in range(-past_days, future_days + 1):
             target_date = (now + timedelta(days=offset)).date()
-            try:
-                pages.append(await self.transport.fetch_football_date(target_date))
-            except NotImplementedError:
-                continue
-            except Exception as exc:
-                self.database.log(
-                    "warning",
-                    "capture",
-                    "date_discovery_failed",
-                    details={"date": target_date.isoformat(), "error": str(exc)},
-                )
+            target_dates.append(target_date)
+        date_pages = await asyncio.gather(*(fetch_date_page(target_date) for target_date in target_dates))
+        pages.extend(page for page in date_pages if page is not None)
 
         matches_by_event_id = {}
         for page in pages:
@@ -413,9 +629,12 @@ class CaptureService:
             checked += 1
             checked_at = utc_now()
             try:
-                page = await self.transport.fetch_match_page(match.source_url)
-                self._cache_match_page(match.source_url, page.text)
-                finished, score = self.discovery_parser.parse_match_page_result(page.text)
+                html = await self._fetch_match_page_cached(
+                    match.source_url,
+                    CapturePriority.RESULT_RECOVERY,
+                    "result_backfill",
+                )
+                finished, score = self.discovery_parser.parse_match_page_result(html)
                 if finished and score:
                     captured += 1 if self.database.mark_result_captured(match_id, score, checked_at) else 0
                 self.database.mark_result_checked(match_id, checked_at)
@@ -431,13 +650,24 @@ class CaptureService:
             self._set_progress(results_checked=checked, results_captured=captured)
         return checked, captured
 
-    async def _enrich_kickoff_from_match_page_if_needed(self, match: DiscoveredMatch, now: datetime) -> None:
+    async def _enrich_kickoff_from_match_page_if_needed(
+        self,
+        match: DiscoveredMatch,
+        now: datetime,
+        priority: CapturePriority | None = None,
+        reason: str = "kickoff_enrichment",
+    ) -> None:
         if not match.kickoff_time:
             return
         if abs((match.kickoff_time - now).total_seconds()) > (self.odds_capture_window_minutes + 180) * 60:
             return
         try:
-            html = await self._fetch_match_page_cached(match.source_url)
+            resolved_priority = priority or (
+                CapturePriority.KICKOFF
+                if abs((match.kickoff_time - now).total_seconds()) <= self.settings.final_capture_fast_window_minutes * 60
+                else CapturePriority.UPCOMING
+            )
+            html = await self._fetch_match_page_cached(match.source_url, resolved_priority, reason)
             kickoff = self.discovery_parser.parse_match_page_start_time(html, self.settings.betexplorer_timezone_offset)
         except Exception as exc:
             self.database.log("warning", "capture", "kickoff_enrichment_failed", match.event_id, {"error": str(exc)})
@@ -454,38 +684,89 @@ class CaptureService:
             )
             match.kickoff_time = kickoff
 
-    async def _fetch_match_page_cached(self, source_url: str) -> str:
+    async def _fetch_match_page_cached(
+        self,
+        source_url: str,
+        priority: CapturePriority = CapturePriority.UPCOMING,
+        reason: str = "match_page",
+    ) -> str:
         now = utc_now()
         cached = self._match_page_cache.get(source_url)
         if cached and cached[0] > now:
             return cached[1]
-        page = await self.transport.fetch_match_page(source_url)
+        page = await self.ingest.submit(
+            CaptureRequest(
+                source_url,
+                "html",
+                priority,
+                reason,
+                request_kind="match_page",
+            ),
+            lambda: self.transport.fetch_match_page(source_url),
+        )
         self._cache_match_page(source_url, page.text)
         return page.text
 
     def _cache_match_page(self, source_url: str, html: str) -> None:
         self._match_page_cache[source_url] = (utc_now() + timedelta(seconds=self.settings.market_discovery_cache_seconds), html)
 
-    async def capture_match(self, match_id: str, event_id: str, source_url: str) -> bool:
-        markets = await self._markets_for_match(source_url)
+    async def capture_match(
+        self,
+        match_id: str,
+        event_id: str,
+        source_url: str,
+        priority: CapturePriority = CapturePriority.UPCOMING,
+        reason: str = "monitor",
+    ) -> bool:
+        markets = await self._markets_for_match(source_url, priority, reason)
         market_semaphore = asyncio.Semaphore(max(1, self.settings.max_concurrent_markets_per_match))
 
-        async def capture_market(market: str) -> tuple[bool, bool]:
+        async def capture_market(market: str) -> tuple[bool, bool, str]:
             async with market_semaphore:
-                return await self.capture_match_market(match_id, event_id, source_url, market)
+                return await self.capture_match_market(match_id, event_id, source_url, market, priority, reason)
 
         results = await asyncio.gather(*(capture_market(market) for market in markets))
-        saved_any = any(saved for saved, _complete in results)
+        saved_any = any(saved for saved, _complete, _status in results)
         return saved_any
 
-    async def capture_match_market(self, match_id: str, event_id: str, source_url: str, market: str) -> tuple[bool, bool]:
+    async def capture_match_market(
+        self,
+        match_id: str,
+        event_id: str,
+        source_url: str,
+        market: str,
+        priority: CapturePriority = CapturePriority.UPCOMING,
+        reason: str = "monitor",
+    ) -> tuple[bool, bool, str]:
         saved = False
+        unavailable_responses = 0
+        technical_failures = 0
         for attempt in range(1, self.settings.max_retries_per_match + 1):
             started = utc_now()
             try:
-                response = await self.transport.fetch_match_odds(event_id, source_url, market)
-                raw_path = self._save_raw_payload(event_id, attempt, market, response.text)
+                deadline = (
+                    monotonic_time.monotonic() + self.settings.final_capture_poll_interval_seconds
+                    if priority == CapturePriority.KICKOFF
+                    else None
+                )
+                response = await self.ingest.submit(
+                    CaptureRequest(event_id, market, priority, reason, deadline),
+                    lambda: self.transport.fetch_match_odds(event_id, source_url, market),
+                )
+                raw_path = await asyncio.to_thread(
+                    self._save_raw_payload,
+                    event_id,
+                    attempt,
+                    market,
+                    response.text,
+                )
                 odds = self.odds_parser.parse_match_odds_payload(response.text)
+                diagnostics = self._odds_payload_diagnostics(response.text, odds)
+                if not odds:
+                    if diagnostics["no_data_message"]:
+                        unavailable_responses += 1
+                    else:
+                        technical_failures += 1
                 quality = classify_snapshot_quality(odds, self.settings.required_bookmakers)
                 presence = required_bookmaker_presence(odds, self.settings.required_bookmakers)
                 snapshot = OddsSnapshot(
@@ -497,9 +778,21 @@ class CaptureService:
                     bookmaker_odds=odds,
                     raw_payload_path=str(raw_path),
                 )
-                self.database.save_snapshot(match_id, snapshot)
+                await self.persistence.submit_capture(
+                    AttemptWrite(
+                        match_id=match_id,
+                        event_id=event_id,
+                        source_url=source_url,
+                        attempt_number=attempt,
+                        status=quality.value,
+                        error_message=None,
+                        required_found=presence,
+                        started_at=started,
+                        finished_at=utc_now(),
+                        snapshot=snapshot,
+                    )
+                )
                 saved = saved or bool(odds)
-                self.database.save_attempt(match_id, event_id, source_url, attempt, quality.value, None, presence, started, utc_now())
                 self.database.log(
                     "info",
                     "capture",
@@ -509,19 +802,59 @@ class CaptureService:
                         "market": market,
                         "quality": quality.value,
                         "bookmakers": len(odds),
-                        **self._odds_payload_diagnostics(response.text, odds),
+                        **diagnostics,
                     },
                 )
                 if quality.value == "COMPLETE":
-                    return True, True
+                    return True, True, "complete"
             except Exception as exc:
-                self.database.save_attempt(match_id, event_id, source_url, attempt, "ERROR", str(exc), {}, started, utc_now())
+                technical_failures += 1
+                try:
+                    await self.persistence.submit_capture(
+                        AttemptWrite(
+                            match_id=match_id,
+                            event_id=event_id,
+                            source_url=source_url,
+                            attempt_number=attempt,
+                            status="ERROR",
+                            error_message=str(exc),
+                            required_found={},
+                            started_at=started,
+                            finished_at=utc_now(),
+                        )
+                    )
+                except Exception as persistence_exc:
+                    self.database.log(
+                        "error",
+                        "capture",
+                        "attempt_persistence_failed",
+                        event_id,
+                        {"market": market, "attempt": attempt, "error": str(persistence_exc)},
+                    )
                 self.database.log("error", "capture", "capture_failed", event_id, {"market": market, "attempt": attempt, "error": str(exc)})
             if attempt < self.settings.max_retries_per_match:
                 await asyncio.sleep(self.settings.retry_delay_seconds)
-        return saved, False
+        if saved:
+            return True, False, "partial"
+        if unavailable_responses > 0 and technical_failures == 0:
+            return False, False, "unavailable"
+        return False, False, "failed"
 
-    async def _markets_for_match(self, source_url: str) -> list[str]:
+    def _archive_odds_message(self, odds_status: str) -> str | None:
+        if odds_status == "partial":
+            return "Bwin/Unibet coverage is incomplete"
+        if odds_status == "unavailable":
+            return "BetExplorer reports no bookmaker odds for this match"
+        if odds_status == "failed":
+            return "Odds response could not be retrieved or parsed"
+        return None
+
+    async def _markets_for_match(
+        self,
+        source_url: str,
+        priority: CapturePriority = CapturePriority.UPCOMING,
+        reason: str = "market_discovery",
+    ) -> list[str]:
         configured = self.settings.capture_market.strip().lower()
         if configured and configured != "all":
             return [configured]
@@ -530,7 +863,7 @@ class CaptureService:
         if cached and cached[0] > now:
             return cached[1]
         try:
-            html = await self._fetch_match_page_cached(source_url)
+            html = await self._fetch_match_page_cached(source_url, priority, reason)
             markets = self.odds_parser.parse_available_markets(html)
             resolved = markets or ["1x2"]
             expires_at = now + timedelta(seconds=self.settings.market_discovery_cache_seconds)
@@ -544,9 +877,40 @@ class CaptureService:
         self.settings.raw_snapshot_dir.mkdir(parents=True, exist_ok=True)
         timestamp = utc_now().strftime("%Y%m%dT%H%M%S%f")
         safe_market = "".join(char if char.isalnum() else "_" for char in market)
-        path = self.settings.raw_snapshot_dir / f"{event_id}_{safe_market}_{timestamp}_attempt{attempt}.json"
-        path.write_text(payload, encoding="utf-8")
+        path = self.settings.raw_snapshot_dir / f"{event_id}_{safe_market}_{timestamp}_attempt{attempt}.json.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as output:
+            output.write(payload)
+        self._cleanup_raw_payloads()
         return path
+
+    def _cleanup_raw_payloads(self) -> None:
+        now = monotonic_time.monotonic()
+        if now - self._last_raw_cleanup_at < self.settings.raw_snapshot_cleanup_interval_seconds:
+            return
+        self._last_raw_cleanup_at = now
+        files = [
+            path
+            for pattern in ("*.json", "*.json.gz")
+            for path in self.settings.raw_snapshot_dir.rglob(pattern)
+            if path.is_file()
+        ]
+        cutoff = utc_now().timestamp() - self.settings.raw_snapshot_retention_days * 86400
+        for path in files:
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+        remaining = sorted(
+            (path for path in files if path.exists()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        for path in remaining[self.settings.raw_snapshot_max_files :]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def _odds_payload_diagnostics(self, payload: str, odds: list[Any]) -> dict[str, Any]:
         try:

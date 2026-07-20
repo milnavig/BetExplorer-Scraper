@@ -40,13 +40,22 @@ class Settings(BaseSettings):
     scheduler_tick_seconds: int = 10
     enable_api_scheduler: bool = True
     max_concurrent_captures: int = 6
+    ingest_queue_size: int = 512
+    persistence_batch_size: int = 16
+    persistence_flush_interval_ms: int = 25
+    persistence_queue_size: int = 512
     max_concurrent_markets_per_match: int = 3
+    historical_backfill_concurrency: int = 2
+    discovery_concurrency: int = 3
     market_discovery_cache_seconds: int = 600
     max_retries_per_match: int = 3
     retry_delay_seconds: int = 1
-    database_path: Path = Field(default=Path("data/betexplorer.duckdb"))
+    database_path: Path = Field(default=Path("data/betexplorer_rebuilt.duckdb"))
     export_dir: Path = Field(default=Path("data/exports"))
     raw_snapshot_dir: Path = Field(default=Path("data/raw_snapshots"))
+    raw_snapshot_retention_days: int = 14
+    raw_snapshot_max_files: int = 50000
+    raw_snapshot_cleanup_interval_seconds: int = 3600
     log_dir: Path = Field(default=Path("data/logs"))
     historical_database_root: Path = Field(default=Path("SAMPLE_DATABASE"))
     historical_auto_import: bool = True

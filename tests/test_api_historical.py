@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from betexplorer_scraper.models import BookmakerOdds, DiscoveredMatch, OddsSnaps
 
 
 class _FakeCaptureService:
-    async def run_once(self) -> dict[str, int]:
+    async def run_once(self, **_kwargs: object) -> dict[str, int]:
         return {"discovered": 0, "captured": 1, "failed": 0, "finalized": 0, "results_captured": 0}
 
 
@@ -35,6 +36,15 @@ class _FakeHistoricalAutoRefresh:
             "recompute_signals": 2,
             "archived": 0,
         }
+
+
+def _wait_for_maintenance(client: TestClient, job_id: str) -> dict[str, object]:
+    for _ in range(100):
+        job = client.get(f"/api/maintenance/jobs/{job_id}").json()
+        if job["status"] not in {"pending", "running"}:
+            return job
+        time.sleep(0.02)
+    raise AssertionError("Maintenance job did not finish")
 
 
 def test_historical_signal_api_exposes_status_recompute_and_match_signals(monkeypatch, tmp_path: Path) -> None:
@@ -86,17 +96,19 @@ def test_historical_signal_api_exposes_status_recompute_and_match_signals(monkey
         ],
     )
     monkeypatch.setattr(api, "database", db)
-    client = TestClient(api.app)
-
-    status = client.get("/api/historical/import-status")
-    recompute = client.post("/api/signals/recompute", json={"archive_played": False})
-    signals = client.get("/api/signals")
-    match_signals = client.get(f"/api/signals/{match_id}")
+    monkeypatch.setattr(api.settings, "enable_api_scheduler", False)
+    monkeypatch.setattr(api.settings, "historical_auto_import", False)
+    with TestClient(api.app) as client:
+        status = client.get("/api/historical/import-status")
+        recompute = client.post("/api/signals/recompute", json={"archive_played": False})
+        recompute_job = _wait_for_maintenance(client, recompute.json()["id"])
+        signals = client.get("/api/signals")
+        match_signals = client.get(f"/api/signals/{match_id}")
 
     assert status.status_code == 200
     assert status.json()["records"] == 1
     assert recompute.status_code == 200
-    assert recompute.json()["signals"] == 2
+    assert recompute_job["result"]["signals"] == 2
     assert signals.status_code == 200
     assert signals.json()[0]["signal_type"] == "exact_odds"
     assert signals.json()[0]["historical_scores"] == ["1-0"]
@@ -139,7 +151,8 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     monkeypatch.setattr(api, "database", db)
     monkeypatch.setattr(api, "historical_importer", HistoricalDocxImporter(db))
     monkeypatch.setattr(api.settings, "historical_database_root", tmp_path / "SAMPLE_DATABASE", raising=False)
-    client = TestClient(api.app)
+    monkeypatch.setattr(api.settings, "enable_api_scheduler", False)
+    monkeypatch.setattr(api.settings, "historical_auto_import", False)
     document = Document()
     table = document.add_table(rows=2, cols=5)
     table.rows[0].cells[0].text = "2.00"
@@ -155,18 +168,20 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     with zipfile.ZipFile(zip_buffer, "w") as archive:
         archive.writestr("SAMPLE_DATABASE/Odds/2.00/ODDS.docx", docx_buffer.getvalue())
 
-    response = client.post(
-        "/api/historical/import-zip",
-        content=zip_buffer.getvalue(),
-        headers={"content-type": "application/zip", "x-filename": "sample-db.zip"},
-    )
-    signals = client.get("/api/signals")
+    with TestClient(api.app) as client:
+        response = client.post(
+            "/api/historical/import-zip",
+            content=zip_buffer.getvalue(),
+            headers={"content-type": "application/zip", "x-filename": "sample-db.zip"},
+        )
+        job = _wait_for_maintenance(client, response.json()["id"])
+        signals = client.get("/api/signals")
 
     assert response.status_code == 200
-    assert response.json()["files_seen"] == 1
-    assert response.json()["records_imported"] == 1
-    assert response.json()["recompute_signals"] == 2
-    assert Path(response.json()["import_root"]).exists()
+    assert job["result"]["files_seen"] == 1
+    assert job["result"]["records_imported"] == 1
+    assert job["result"]["recompute_signals"] == 2
+    assert Path(job["result"]["import_root"]).exists()
     assert signals.json()[0]["historical_scores"] == ["1-0"]
 
 

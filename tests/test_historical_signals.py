@@ -69,14 +69,86 @@ def test_historical_importer_parses_docx_rows_and_score_only_rows(tmp_path: Path
     assert summary["files_imported"] == 1
     assert summary["records_imported"] == 2
     assert summary["warnings"] == 1
-    assert rows[0]["dataset"] == "Odds"
-    assert rows[0]["query_home_odds"] == 2.0
-    assert rows[0]["query_draw_odds"] == 3.4
-    assert rows[0]["query_away_odds"] == 3.0
-    assert rows[0]["historical_home_odds"] == 1.95
-    assert rows[0]["full_time_score"] == "2-3"
-    assert rows[1]["full_time_score"] == "2-0"
-    assert rows[1]["parse_status"] == "inherited_odds"
+    assert {row["full_time_score"] for row in rows} == {"2-0", "2-3"}
+    assert all(row["dataset"] == "Odds" for row in rows)
+    assert all(row["query_home_odds"] == 2.0 for row in rows)
+    assert all(row["query_draw_odds"] == 3.4 for row in rows)
+    assert all(row["query_away_odds"] == 3.0 for row in rows)
+    assert all(row["historical_home_odds"] == 1.95 for row in rows)
+    assert all(row["historical_draw_odds"] == 3.35 for row in rows)
+    assert all(row["historical_away_odds"] == 3.10 for row in rows)
+    assert all(row["parse_status"] == "complete_block" for row in rows)
+
+
+def test_historical_importer_pairs_scored_odds_rows_and_keeps_both_outcomes(tmp_path: Path) -> None:
+    root = tmp_path / "SAMPLE_DATABASE"
+    _write_docx(
+        root / "2.00 Sample_Database ODDS" / "2.60" / "2.55.docx",
+        [
+            ["2.00", "4.00", "2.60", "4-1.", "2-0."],
+            ["2.04", "3.75", "2.55", "3-0.", "0-0."],
+        ],
+    )
+    db = Database(tmp_path / "scored_pair.duckdb")
+
+    summary = HistoricalDocxImporter(db).import_roots([root])
+    rows = db.list_historical_records()
+
+    assert summary["records_imported"] == 2
+    assert [row["full_time_score"] for row in rows] == ["3-0", "4-1"]
+    assert all(row["query_home_odds"] == 2.0 for row in rows)
+    assert all(row["historical_home_odds"] == 2.04 for row in rows)
+
+
+def test_historical_importer_pairs_every_two_odds_rows_in_one_table(tmp_path: Path) -> None:
+    root = tmp_path / "SAMPLE_DATABASE"
+    _write_docx(
+        root / "2.00 Sample_Database ODDS" / "3.00" / "ODDS.docx",
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.05", "3.45", "3.10", "1-0.", "0-0."],
+            ["2.10", "3.20", "3.00", "", ""],
+            ["2.15", "3.25", "3.10", "0-2.", "0-1."],
+        ],
+    )
+    db = Database(tmp_path / "multiple_pairs.duckdb")
+
+    HistoricalDocxImporter(db).import_roots([root])
+    rows = db.list_historical_records()
+
+    assert len(rows) == 2
+    assert {(row["query_home_odds"], row["historical_home_odds"], row["full_time_score"]) for row in rows} == {
+        (2.0, 2.05, "1-0"),
+        (2.1, 2.15, "0-2"),
+    }
+
+
+def test_historical_importer_handles_shifted_word_cells_and_ignores_date_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "SAMPLE_DATABASE"
+    path = root / "Odds" / "3.50" / "ODDS.docx"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = Document()
+    table = document.add_table(rows=4, cols=6)
+    rows = [
+        ["2.00", "2.00", "3.25", "3.50", "", ""],
+        ["2.00", "2.00", "3.30", "3.50", "1-1", "0-0"],
+        ["2-0", "1-0", "", "", "", ""],
+        ["", "", "", "15-01-25.", "", ""],
+    ]
+    for row_index, values in enumerate(rows):
+        for cell_index, value in enumerate(values):
+            table.cell(row_index, cell_index).text = value
+    document.save(path)
+    db = Database(tmp_path / "shifted_cells.duckdb")
+
+    report = HistoricalDocxImporter(db).import_roots([root])
+    records = db.list_historical_records()
+
+    assert report["warnings"] == 0
+    assert len(records) == 2
+    assert all(record["query_draw_odds"] == 3.25 for record in records)
+    assert all(record["historical_draw_odds"] == 3.30 for record in records)
+    assert {record["full_time_score"] for record in records} == {"1-1", "2-0"}
 
 
 def test_historical_importer_separates_usable_odds_dataset(tmp_path: Path) -> None:
@@ -93,6 +165,73 @@ def test_historical_importer_separates_usable_odds_dataset(tmp_path: Path) -> No
     HistoricalDocxImporter(db).import_roots([root])
 
     assert db.list_historical_records()[0]["dataset"] == "Usable Odds"
+
+
+def test_historical_import_replaces_active_batch_and_same_content_is_idempotent(tmp_path: Path) -> None:
+    first_root = tmp_path / "first" / "SAMPLE_DATABASE"
+    second_root = tmp_path / "second" / "SAMPLE_DATABASE"
+    first_path = first_root / "Odds" / "2.00" / "ODDS.docx"
+    second_path = second_root / "Odds" / "2.00" / "ODDS.docx"
+    _write_docx(
+        first_path,
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.05", "3.45", "3.10", "1-0", "0-0"],
+        ],
+    )
+    _write_docx(
+        second_path,
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.05", "3.45", "3.10", "0-2", "0-1"],
+        ],
+    )
+    db = Database(tmp_path / "active_batch.duckdb")
+    importer = HistoricalDocxImporter(db)
+
+    first = importer.import_roots(
+        [first_root], replace_active=True, source_name="first.zip", source_kind="zip", content_hash="first"
+    )
+    repeated = importer.import_roots(
+        [first_root], replace_active=True, source_name="first.zip", source_kind="zip", content_hash="first"
+    )
+    second = importer.import_roots(
+        [second_root], replace_active=True, source_name="second.zip", source_kind="zip", content_hash="second"
+    )
+
+    assert first["activated"] is True
+    assert repeated["activated"] is False
+    assert repeated["records_imported"] == 0
+    assert second["activated"] is True
+    assert [row["full_time_score"] for row in db.list_historical_records()] == ["0-2"]
+    status = db.historical_import_status()
+    assert status["records"] == 1
+    assert status["files"] == 1
+    assert status["active_batch"]["source_name"] == "second.zip"
+
+
+def test_startup_folder_import_does_not_mix_into_active_zip_database(tmp_path: Path) -> None:
+    zip_root = tmp_path / "zip" / "SAMPLE_DATABASE"
+    sample_root = tmp_path / "bundled" / "SAMPLE_DATABASE"
+    _write_docx(
+        zip_root / "Odds" / "2.00" / "ODDS.docx",
+        [["2.00", "3.40", "3.00", "", ""], ["2.05", "3.45", "3.10", "1-0", "0-0"]],
+    )
+    _write_docx(
+        sample_root / "Odds" / "2.00" / "ODDS.docx",
+        [["2.00", "3.40", "3.00", "", ""], ["2.05", "3.45", "3.10", "4-4", "2-2"]],
+    )
+    db = Database(tmp_path / "no_mix.duckdb")
+    importer = HistoricalDocxImporter(db)
+
+    importer.import_roots(
+        [zip_root], replace_active=True, source_name="client.zip", source_kind="zip", content_hash="client"
+    )
+    startup = importer.import_roots([sample_root])
+
+    assert startup["files_imported"] == 0
+    assert startup["skipped"] == "active client database is already selected"
+    assert [row["full_time_score"] for row in db.list_historical_records()] == ["1-0"]
 
 
 def test_historical_auto_refresh_imports_docx_and_recomputes_signals(tmp_path: Path) -> None:
@@ -272,6 +411,58 @@ def test_database_recomputes_one_draw_only_when_no_exact_exists(tmp_path: Path) 
     assert one_draw["matched_odds_home"] == 2.0
     assert one_draw["matched_odds_draw"] == 3.55
     assert one_draw["matched_odds_away"] == 3.0
+
+
+def test_database_emits_one_draw_with_one_historical_outcome(tmp_path: Path) -> None:
+    db = Database(tmp_path / "one_draw_single.duckdb")
+    _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "single.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "single.docx",
+                "query_home_odds": 2.00,
+                "query_draw_odds": 3.50,
+                "query_away_odds": 3.00,
+                "historical_home_odds": 2.05,
+                "historical_draw_odds": 3.45,
+                "historical_away_odds": 3.10,
+                "full_time_score": "1-1",
+            }
+        ],
+    )
+
+    summary = db.recompute_historical_signals()
+    signals = db.list_signals()
+
+    assert summary["signals"] == 2
+    assert {signal["signal_type"] for signal in signals} == {"one_draw"}
+    assert {signal["sample_size"] for signal in signals} == {1}
+
+
+def test_database_does_not_swap_bwin_and_unibet_rows_when_matching(tmp_path: Path) -> None:
+    db = Database(tmp_path / "bookmaker_order.duckdb")
+    _seed_match_with_required_1x2(db)
+    db.replace_historical_records(
+        "swapped.docx",
+        [
+            {
+                "dataset": "Odds",
+                "source_file": "swapped.docx",
+                "query_home_odds": 2.05,
+                "query_draw_odds": 3.45,
+                "query_away_odds": 3.10,
+                "historical_home_odds": 2.00,
+                "historical_draw_odds": 3.40,
+                "historical_away_odds": 3.00,
+                "full_time_score": "1-0",
+            }
+        ],
+    )
+
+    assert db.recompute_historical_signals()["signals"] == 0
+    assert db.list_signals() == []
 
 
 def test_database_collects_exact_and_merged_one_draw_by_final_workflow(tmp_path: Path) -> None:
@@ -530,7 +721,7 @@ def test_database_archives_played_matches_with_required_bookmaker_odds(tmp_path:
     assert rows[0]["full_time_score"] == "2-1"
 
 
-def test_played_match_archive_expands_historical_signal_pool(tmp_path: Path) -> None:
+def test_played_match_archive_does_not_enter_client_docx_signal_pool(tmp_path: Path) -> None:
     db = Database(tmp_path / "archive_signals.duckdb")
     archived_match_id = _seed_match_with_required_1x2(db)
     db.mark_result_captured(archived_match_id, "2:1", datetime(2026, 5, 14, 22, 0))
@@ -564,6 +755,5 @@ def test_played_match_archive_expands_historical_signal_pool(tmp_path: Path) -> 
     summary = db.recompute_historical_signals()
     signals = db.list_signals(match_id=match_id)
 
-    assert summary["signals"] == 2
-    assert {signal["dataset"] for signal in signals} == {"Played archive"}
-    assert all(signal["sample_size"] >= 1 for signal in signals)
+    assert summary["signals"] == 0
+    assert signals == []

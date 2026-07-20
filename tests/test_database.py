@@ -317,6 +317,79 @@ def test_late_incomplete_snapshot_does_not_replace_better_required_bookmaker_fin
     assert detail["snapshots"][1]["is_final"] is True
 
 
+def test_final_required_odds_are_composed_from_latest_valid_bookmaker_observations(tmp_path: Path) -> None:
+    db = Database(tmp_path / "composed_final.duckdb")
+    match_id = db.upsert_match(
+        DiscoveredMatch(
+            event_id="composed123",
+            source_url="https://www.betexplorer.com/football/test/composed123/",
+            league="Composed League",
+            home_team="Composed Home",
+            away_team="Composed Away",
+            kickoff_time=datetime(2026, 7, 8, 20, 0),
+            timing_status=TimingStatus.RECENTLY_STARTED,
+        )
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="composed123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 8, 19, 30),
+            quality_status=SnapshotQuality.COMPLETE,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[
+                BookmakerOdds("Bwin", "bwin", 1.80, 3.70, 3.90),
+                BookmakerOdds("Unibet", "unibet", 1.85, 3.65, 3.85),
+            ],
+        ),
+    )
+    bwin_snapshot_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="composed123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 8, 19, 59),
+            quality_status=SnapshotQuality.PARTIAL,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Bwin", "bwin", 1.70, 3.80, 3.70)],
+        ),
+    )
+    unibet_snapshot_id = db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="composed123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 8, 20, 2),
+            quality_status=SnapshotQuality.PARTIAL,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Unibet", "unibet", 1.75, 3.75, 3.80)],
+        ),
+    )
+    db.save_snapshot(
+        match_id,
+        OddsSnapshot(
+            event_id="composed123",
+            market="1x2",
+            captured_at=datetime(2026, 7, 8, 20, 5),
+            quality_status=SnapshotQuality.FAILED,
+            required_bookmakers=["Bwin", "Unibet"],
+            bookmaker_odds=[BookmakerOdds("Bet365", "bet365", 1.72, 3.72, 3.82)],
+        ),
+    )
+
+    detail = db.match_detail(match_id)
+    assert detail is not None
+    assert detail["match"]["quality_status"] == "COMPLETE"
+    assert detail["match"]["has_bwin"] is True
+    assert detail["match"]["has_unibet"] is True
+    final = {row["normalized_bookmaker"]: row for row in detail["final_required_odds"]}
+    assert final["bwin"]["snapshot_id"] == bwin_snapshot_id
+    assert final["bwin"]["home_odds"] == 1.70
+    assert final["unibet"]["snapshot_id"] == unibet_snapshot_id
+    assert final["unibet"]["home_odds"] == 1.75
+
+
 def test_match_summary_quality_uses_primary_1x2_market_not_latest_auxiliary_market() -> None:
     db_path = Path("data/test_tmp/test_match_summary_uses_1x2.duckdb")
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -642,3 +715,69 @@ def test_database_exposes_historical_import_status_before_import() -> None:
     assert status["files"] == 0
     assert status["warnings"] == 0
     assert status["datasets"] == []
+
+
+def test_archive_retry_resets_only_incomplete_items(tmp_path: Path) -> None:
+    db = Database(tmp_path / "archive_retry.duckdb")
+    job = db.create_archive_job(datetime(2026, 7, 17).date())
+    job_id = str(job["id"])
+    db.set_archive_job_items(
+        job_id,
+        [
+            {"event_id": "complete", "source_url": "https://example.test/complete"},
+            {"event_id": "failed", "source_url": "https://example.test/failed"},
+        ],
+    )
+    db.update_archive_job_item(
+        job_id,
+        "complete",
+        state="archived",
+        odds_status="complete",
+        score_status="complete",
+        archive_status="complete",
+    )
+    db.update_archive_job_item(
+        job_id,
+        "failed",
+        state="incomplete",
+        odds_status="complete",
+        score_status="failed",
+        archive_status="pending",
+        error_message="Final score missing",
+    )
+    db.finish_archive_job(job_id)
+
+    retried = db.retry_archive_job(job_id)
+    items = {item["event_id"]: item for item in db.list_archive_job_items(job_id)}
+
+    assert retried is not None
+    assert retried["status"] == "pending"
+    assert items["complete"]["state"] == "archived"
+    assert items["complete"]["archive_status"] == "complete"
+    assert items["failed"]["state"] == "discovered"
+    assert items["failed"]["odds_status"] == "complete"
+    assert items["failed"]["score_status"] == "pending"
+    assert items["failed"]["error_message"] is None
+
+
+def test_maintenance_job_persists_progress_and_result(tmp_path: Path) -> None:
+    db = Database(tmp_path / "maintenance_job.duckdb")
+    job = db.create_maintenance_job("recompute_signals", {"archive_played": True})
+    job_id = str(job["id"])
+
+    db.update_maintenance_job(job_id, status="running", phase="recomputing_signals", current=1, total=2)
+    db.update_maintenance_job(
+        job_id,
+        status="completed",
+        phase="complete",
+        current=2,
+        total=2,
+        result={"signals": 7},
+    )
+    saved = db.get_maintenance_job(job_id)
+
+    assert saved is not None
+    assert saved["status"] == "completed"
+    assert saved["payload"] == {"archive_played": True}
+    assert saved["result"] == {"signals": 7}
+    assert db.resumable_maintenance_jobs() == []

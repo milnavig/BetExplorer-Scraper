@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import re
-from threading import Lock
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any
-
-from docx import Document
 
 if TYPE_CHECKING:
     from .database import Database
 
-
-NUMBER_RE = re.compile(r"^\d+(?:\.\d+)?$")
 SCORE_RE = re.compile(r"^(\d+)\s*[-:]\s*(\d+)\.?$")
 NEIGHBOR_TOLERANCE = 0.05
-ONE_DRAW_MIN_SAMPLE = 2
 
 
 def normalize_odds(value: float | str | None) -> float | None:
@@ -82,91 +77,137 @@ class HistoricalDocxImporter:
     def __init__(self, database: Database) -> None:
         self.database = database
 
-    def import_roots(self, roots: list[Path]) -> dict[str, int]:
+    def import_roots(
+        self,
+        roots: list[Path],
+        *,
+        replace_active: bool = False,
+        source_name: str = "Historical database folder",
+        source_kind: str = "folder",
+        content_hash: str | None = None,
+    ) -> dict[str, object]:
+        active_batch = self.database.active_historical_batch()
+        if (
+            not replace_active
+            and active_batch
+            and active_batch.get("source_kind") in {"zip", "legacy"}
+        ):
+            return {
+                "files_seen": 0,
+                "files_imported": 0,
+                "records_imported": 0,
+                "warnings": 0,
+                "batch_id": active_batch["id"],
+                "activated": False,
+                "skipped": "active client database is already selected",
+            }
+        if (
+            replace_active
+            and content_hash
+            and active_batch
+            and active_batch.get("content_hash") == content_hash
+        ):
+            return {
+                "files_seen": int(active_batch.get("files") or 0),
+                "files_imported": 0,
+                "records_imported": 0,
+                "warnings": int(active_batch.get("warnings") or 0),
+                "batch_id": active_batch["id"],
+                "activated": False,
+                "content_hash": content_hash,
+            }
+
         files_seen = 0
-        files_imported = 0
-        records_imported = 0
-        warning_count = 0
+        discovered_files: list[dict[str, object]] = []
+        seen_logical_files: set[str] = set()
         for root in roots:
             if not root.exists():
                 continue
             for dataset_dir, dataset in _dataset_directories(root):
                 for path in sorted(dataset_dir.rglob("*.docx")):
+                    logical_source_file = f"{dataset}/{path.relative_to(dataset_dir).as_posix()}"
+                    if logical_source_file in seen_logical_files:
+                        continue
+                    seen_logical_files.add(logical_source_file)
                     files_seen += 1
                     fingerprint = _file_fingerprint(path)
-                    if self.database.historical_file_is_current(str(path), fingerprint):
-                        continue
-                    records, warnings = self._parse_file(path, dataset)
-                    self.database.replace_historical_records(str(path), records)
-                    self.database.record_historical_import_file(str(path), dataset, fingerprint, len(records), len(warnings))
-                    files_imported += 1
-                    records_imported += len(records)
-                    warning_count += len(warnings)
+                    discovered_files.append(
+                        {
+                            "path": path,
+                            "source_file": logical_source_file,
+                            "dataset": dataset,
+                            "fingerprint": fingerprint,
+                        }
+                    )
+
+        if not discovered_files:
+            return {
+                "files_seen": files_seen,
+                "files_imported": 0,
+                "records_imported": 0,
+                "warnings": 0,
+                "batch_id": active_batch["id"] if active_batch else None,
+                "activated": False,
+            }
+
+        normalized_hash = content_hash or _dataset_fingerprint(discovered_files)
+        if active_batch and active_batch.get("content_hash") == normalized_hash:
+            return {
+                "files_seen": files_seen,
+                "files_imported": 0,
+                "records_imported": 0,
+                "warnings": int(active_batch.get("warnings") or 0),
+                "batch_id": active_batch["id"],
+                "activated": False,
+                "content_hash": normalized_hash,
+            }
+
+        parsed_files: list[dict[str, object]] = []
+        for file in discovered_files:
+            records, warnings = self._parse_file(
+                Path(file["path"]),
+                str(file["dataset"]),
+                str(file["source_file"]),
+            )
+            parsed_files.append(
+                {
+                    "source_file": file["source_file"],
+                    "dataset": file["dataset"],
+                    "fingerprint": file["fingerprint"],
+                    "records": records,
+                    "warnings": warnings,
+                }
+            )
+        activation = self.database.replace_active_historical_dataset(
+            source_name=source_name,
+            source_kind=source_kind,
+            content_hash=normalized_hash,
+            files=parsed_files,
+        )
+        activated = bool(activation["activated"])
+        records_imported = sum(len(file["records"]) for file in parsed_files) if activated else 0
+        warning_count = sum(len(file["warnings"]) for file in parsed_files)
         return {
             "files_seen": files_seen,
-            "files_imported": files_imported,
+            "files_imported": len(parsed_files) if activated else 0,
             "records_imported": records_imported,
             "warnings": warning_count,
+            "batch_id": activation["batch_id"],
+            "activated": activated,
+            "content_hash": normalized_hash,
         }
 
-    def _parse_file(self, path: Path, dataset: str) -> tuple[list[dict[str, Any]], list[str]]:
-        document = Document(str(path))
-        records: list[dict[str, Any]] = []
-        warnings: list[str] = []
-        query_odds: tuple[float, float, float] | None = None
-        source_home_bucket = normalize_odds(path.parent.name)
-        source_away_file = None if path.stem.lower() == "odds" else normalize_odds(path.stem)
+    def _parse_file(
+        self,
+        path: Path,
+        dataset: str,
+        logical_source_file: str,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        from .historical_parser import block_records, parse_historical_docx
 
-        for table_index, table in enumerate(document.tables):
-            for row_index, row in enumerate(table.rows):
-                cells = [_cell_text(cell.text) for cell in row.cells[:5]]
-                if not any(cells):
-                    continue
-                odds = _row_odds(cells)
-                full_time_score = normalize_score(cells[3] if len(cells) > 3 else "")
-                half_time_score = normalize_score(cells[4] if len(cells) > 4 else "")
-                has_score = full_time_score is not None
-
-                if odds and not has_score:
-                    query_odds = odds
-                    continue
-                if odds and has_score:
-                    effective_query = query_odds or odds
-                    records.append(
-                        _record(
-                            dataset,
-                            str(path),
-                            source_home_bucket,
-                            source_away_file,
-                            effective_query,
-                            odds,
-                            full_time_score,
-                            half_time_score,
-                            "parsed",
-                            None,
-                        )
-                    )
-                    continue
-                if has_score and query_odds:
-                    records.append(
-                        _record(
-                            dataset,
-                            str(path),
-                            source_home_bucket,
-                            source_away_file,
-                            query_odds,
-                            (None, None, None),
-                            full_time_score,
-                            half_time_score,
-                            "inherited_odds",
-                            None,
-                        )
-                    )
-                    continue
-                warning = f"{path}:{table_index + 1}:{row_index + 1}: unparsed row"
-                warnings.append(warning)
-
-        return records, warnings
+        blocks, parse_warnings = parse_historical_docx(path, dataset, logical_source_file)
+        records = [record for block in blocks for record in block_records(block)]
+        return records, [warning.message() for warning in parse_warnings]
 
 
 class HistoricalSignalAutoRefresh:
@@ -176,11 +217,14 @@ class HistoricalSignalAutoRefresh:
         self.roots = roots
         self._lock = Lock()
 
-    def refresh(self, reason: str) -> dict[str, int]:
+    def refresh(self, reason: str) -> dict[str, object]:
         with self._lock:
             import_result = self.importer.import_roots(self.roots)
             archive_result = self.database.archive_played_matches()
-            recompute_result = self.database.recompute_historical_signals()
+            if reason == "startup" and not import_result.get("activated"):
+                recompute_result = {"matches_evaluated": 0, "signals": 0}
+            else:
+                recompute_result = self.database.recompute_historical_signals()
             result = {
                 **import_result,
                 **archive_result,
@@ -188,36 +232,6 @@ class HistoricalSignalAutoRefresh:
             }
             self.database.log("info", "historical", "auto_refresh_completed", details={"reason": reason, **result})
             return result
-
-
-def _record(
-    dataset: str,
-    source_file: str,
-    source_home_bucket: float | None,
-    source_away_file: float | None,
-    query_odds: tuple[float, float, float],
-    historical_odds: tuple[float | None, float | None, float | None],
-    full_time_score: str,
-    half_time_score: str | None,
-    parse_status: str,
-    parse_warning: str | None,
-) -> dict[str, Any]:
-    return {
-        "dataset": dataset,
-        "source_file": source_file,
-        "source_home_bucket": source_home_bucket,
-        "source_away_file": source_away_file,
-        "query_home_odds": query_odds[0],
-        "query_draw_odds": query_odds[1],
-        "query_away_odds": query_odds[2],
-        "historical_home_odds": historical_odds[0],
-        "historical_draw_odds": historical_odds[1],
-        "historical_away_odds": historical_odds[2],
-        "full_time_score": full_time_score,
-        "half_time_score": half_time_score,
-        "parse_status": parse_status,
-        "parse_warning": parse_warning,
-    }
 
 
 def _dataset_directories(root: Path) -> list[tuple[Path, str]]:
@@ -233,25 +247,21 @@ def _dataset_directories(root: Path) -> list[tuple[Path, str]]:
 
 
 def _file_fingerprint(path: Path) -> str:
-    stat = path.stat()
     digest = hashlib.sha256()
-    digest.update(str(path.resolve()).encode("utf-8"))
-    digest.update(str(stat.st_size).encode("ascii"))
-    digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
     return digest.hexdigest()
 
 
-def _cell_text(value: str) -> str:
-    return " ".join(value.replace("\n", " ").strip().split())
-
-
-def _row_odds(cells: list[str]) -> tuple[float, float, float] | None:
-    if len(cells) < 3:
-        return None
-    values = [normalize_odds(cells[index]) for index in range(3)]
-    if any(value is None for value in values):
-        return None
-    return values[0], values[1], values[2]  # type: ignore[return-value]
+def _dataset_fingerprint(files: list[dict[str, object]]) -> str:
+    digest = hashlib.sha256()
+    for file in sorted(files, key=lambda item: str(item["source_file"])):
+        digest.update(str(file["source_file"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(file["fingerprint"]).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _parse_score(score: str) -> tuple[int, int] | None:

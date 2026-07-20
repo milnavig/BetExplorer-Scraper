@@ -10,7 +10,7 @@ def test_get_settings_resolves_relative_paths_from_project_root(monkeypatch) -> 
 
     settings = get_settings()
 
-    assert settings.database_path == PROJECT_ROOT / "data" / "betexplorer.duckdb"
+    assert settings.database_path == PROJECT_ROOT / "data" / "betexplorer_rebuilt.duckdb"
     assert settings.raw_snapshot_dir == PROJECT_ROOT / "data" / "raw_snapshots"
     assert settings.export_dir == PROJECT_ROOT / "data" / "exports"
     assert settings.log_dir == PROJECT_ROOT / "data" / "logs"
