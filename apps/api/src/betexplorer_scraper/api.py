@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import hashlib
 import re
 import zipfile
 from contextlib import asynccontextmanager, suppress
@@ -21,7 +20,7 @@ from .capture import CaptureService
 from .config import get_settings
 from .database import Database
 from .exporter import export_final_odds, export_played_match_archive
-from .historical import HistoricalDocxImporter, HistoricalSignalAutoRefresh
+from .historical import HistoricalDocxImporter, HistoricalSignalAutoRefresh, is_word_lock_file
 
 settings = get_settings()
 database = Database(settings.database_path, timezone_offset=settings.betexplorer_timezone_offset)
@@ -118,7 +117,7 @@ async def _run_maintenance_job(job_id: str) -> None:
             filename = str(payload.get("filename") or upload_path.name)
             zip_bytes = await asyncio.to_thread(upload_path.read_bytes)
             database.update_maintenance_job(job_id, phase="extracting", current=1)
-            import_root = await asyncio.to_thread(_extract_docx_zip, zip_bytes, filename)
+            import_root, extraction_skipped = await asyncio.to_thread(_extract_docx_zip, zip_bytes, filename)
             database.update_maintenance_job(job_id, phase="importing_docx", current=2)
             result = await asyncio.to_thread(
                 historical_importer.import_roots,
@@ -126,8 +125,19 @@ async def _run_maintenance_job(job_id: str) -> None:
                 replace_active=True,
                 source_name=filename,
                 source_kind="zip",
-                content_hash=hashlib.sha256(zip_bytes).hexdigest(),
             )
+            result["files_skipped"] = int(result.get("files_skipped") or 0) + len(extraction_skipped)
+            result["warnings"] = int(result.get("warnings") or 0) + len(extraction_skipped)
+            result["skipped_files"] = [
+                *list(result.get("skipped_files") or []),
+                *[
+                    {
+                        "source_file": path,
+                        "reason": "Microsoft Word temporary lock file",
+                    }
+                    for path in extraction_skipped
+                ],
+            ]
             database.update_maintenance_job(job_id, phase="recomputing_signals", current=3)
             archive = await asyncio.to_thread(database.archive_played_matches)
             recompute = await asyncio.to_thread(database.recompute_historical_signals)
@@ -487,7 +497,7 @@ def maintenance_job(job_id: str) -> dict[str, object]:
     return job
 
 
-def _extract_docx_zip(payload: bytes, filename: str) -> Path:
+def _extract_docx_zip(payload: bytes, filename: str) -> tuple[Path, list[str]]:
     zip_buffer = io.BytesIO(payload)
     if not zipfile.is_zipfile(zip_buffer):
         raise HTTPException(status_code=400, detail="Uploaded file is not a valid ZIP archive")
@@ -496,9 +506,13 @@ def _extract_docx_zip(payload: bytes, filename: str) -> Path:
     import_root.mkdir(parents=True, exist_ok=True)
     root_resolved = import_root.resolve()
     extracted = 0
+    skipped_files: list[str] = []
     with zipfile.ZipFile(zip_buffer) as archive:
         for info in archive.infolist():
             if info.is_dir() or not info.filename.lower().endswith(".docx"):
+                continue
+            if is_word_lock_file(info.filename):
+                skipped_files.append(info.filename)
                 continue
             relative_path = Path(info.filename)
             if relative_path.is_absolute() or ".." in relative_path.parts:
@@ -511,8 +525,11 @@ def _extract_docx_zip(payload: bytes, filename: str) -> Path:
                 destination.write(source.read())
             extracted += 1
     if extracted == 0:
-        raise HTTPException(status_code=400, detail="ZIP archive does not contain DOCX files")
-    return import_root
+        raise HTTPException(
+            status_code=400,
+            detail="ZIP archive does not contain usable DOCX files; Microsoft Word temporary files are ignored",
+        )
+    return import_root, skipped_files
 
 
 def _historical_import_roots(import_root: Path) -> list[Path]:

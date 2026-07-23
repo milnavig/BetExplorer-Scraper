@@ -338,6 +338,7 @@ type SignalRecomputeResult = {
 type HistoricalImportResult = {
   files_seen: number;
   files_imported: number;
+  files_skipped: number;
   records_imported: number;
   warnings: number;
   recompute_matches_evaluated: number;
@@ -431,6 +432,7 @@ export default function Dashboard() {
   const [requiredOnly, setRequiredOnly] = useState(false);
   const [lastRun, setLastRun] = useState<CaptureRunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
   const [maintenanceMessage, setMaintenanceMessage] = useState<string | null>(null);
   const [isLoadingMatches, setIsLoadingMatches] = useState(false);
   const [isPending, startTransition] = useTransition();
@@ -801,6 +803,7 @@ export default function Dashboard() {
   const runCapture = () => {
     startTransition(async () => {
       setError(null);
+      setImportNotice(null);
       try {
         const result = await api<CaptureRunResult>("/api/capture/run-once", {
           method: "POST",
@@ -924,6 +927,13 @@ export default function Dashboard() {
           throw new Error(job.last_error || "Historical ZIP import failed");
         }
         await refreshHistoricalSignalState();
+        if (job.result) {
+          const skipped = job.result.files_skipped || 0;
+          setImportNotice(
+            `Historical database imported: ${job.result.records_imported} records from ${job.result.files_imported} DOCX files` +
+              (skipped > 0 ? `; ${skipped} temporary or unreadable files skipped.` : "."),
+          );
+        }
       } catch (nextError) {
         setError(
           nextError instanceof Error
@@ -1115,6 +1125,7 @@ export default function Dashboard() {
         </header>
 
         {error ? <div className="error">{error}</div> : null}
+        {importNotice ? <div className="import-notice">{importNotice}</div> : null}
         {maintenanceMessage ? (
           <div className="busy-banner" role="status">
             <Loader2 className="spin" size={16} />

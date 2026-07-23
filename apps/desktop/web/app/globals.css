@@ -604,6 +604,16 @@ small {
   border-radius: 6px;
 }
 
+.import-notice {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid #9ad5bd;
+  background: #eefaf5;
+  color: #176344;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
 .run-result {
   display: flex;
   flex-wrap: wrap;

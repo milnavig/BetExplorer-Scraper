@@ -167,6 +167,8 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w") as archive:
         archive.writestr("SAMPLE_DATABASE/Odds/2.00/ODDS.docx", docx_buffer.getvalue())
+        archive.writestr("SAMPLE_DATABASE/Odds/2.00/~$4.00.docx", b"word-lock-file")
+        archive.writestr("SAMPLE_DATABASE/Odds/2.00/4.25.docx", b"not-a-docx-package")
 
     with TestClient(api.app) as client:
         response = client.post(
@@ -178,7 +180,10 @@ def test_historical_import_zip_extracts_docx_database_and_recomputes(monkeypatch
         signals = client.get("/api/signals")
 
     assert response.status_code == 200
-    assert job["result"]["files_seen"] == 1
+    assert job["result"]["files_seen"] == 2
+    assert job["result"]["files_imported"] == 1
+    assert job["result"]["files_skipped"] == 2
+    assert job["result"]["warnings"] == 2
     assert job["result"]["records_imported"] == 1
     assert job["result"]["recompute_signals"] == 2
     assert Path(job["result"]["import_root"]).exists()

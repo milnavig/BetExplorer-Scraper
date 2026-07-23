@@ -167,6 +167,73 @@ def test_historical_importer_separates_usable_odds_dataset(tmp_path: Path) -> No
     assert db.list_historical_records()[0]["dataset"] == "Usable Odds"
 
 
+def test_historical_importer_skips_word_lock_and_unreadable_docx_files(tmp_path: Path) -> None:
+    root = tmp_path / "SAMPLE_DATABASE"
+    odds_root = root / "Odds" / "2.00"
+    _write_docx(
+        odds_root / "ODDS.docx",
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.05", "3.45", "3.10", "1-0", "0-0"],
+        ],
+    )
+    (odds_root / "~$ODDS.docx").write_bytes(b"word-lock-file")
+    (odds_root / "4.25.docx").write_bytes(b"not-a-docx-package")
+    db = Database(tmp_path / "resilient_import.duckdb")
+
+    result = HistoricalDocxImporter(db).import_roots(
+        [root],
+        replace_active=True,
+        source_name="mixed.zip",
+        source_kind="zip",
+    )
+
+    assert result["activated"] is True
+    assert result["files_seen"] == 2
+    assert result["files_imported"] == 1
+    assert result["files_skipped"] == 2
+    assert result["warnings"] == 2
+    assert result["records_imported"] == 1
+    assert len(result["skipped_files"]) == 2
+    assert [row["full_time_score"] for row in db.list_historical_records()] == ["1-0"]
+
+
+def test_historical_importer_keeps_active_database_when_every_docx_is_unreadable(tmp_path: Path) -> None:
+    valid_root = tmp_path / "valid" / "SAMPLE_DATABASE"
+    invalid_root = tmp_path / "invalid" / "SAMPLE_DATABASE"
+    _write_docx(
+        valid_root / "Odds" / "2.00" / "ODDS.docx",
+        [
+            ["2.00", "3.40", "3.00", "", ""],
+            ["2.05", "3.45", "3.10", "1-0", "0-0"],
+        ],
+    )
+    invalid_path = invalid_root / "Odds" / "2.00" / "4.25.docx"
+    invalid_path.parent.mkdir(parents=True, exist_ok=True)
+    invalid_path.write_bytes(b"not-a-docx-package")
+    db = Database(tmp_path / "preserve_active.duckdb")
+    importer = HistoricalDocxImporter(db)
+    importer.import_roots(
+        [valid_root],
+        replace_active=True,
+        source_name="valid.zip",
+        source_kind="zip",
+    )
+
+    result = importer.import_roots(
+        [invalid_root],
+        replace_active=True,
+        source_name="invalid.zip",
+        source_kind="zip",
+    )
+
+    assert result["activated"] is False
+    assert result["files_imported"] == 0
+    assert result["files_skipped"] == 1
+    assert [row["full_time_score"] for row in db.list_historical_records()] == ["1-0"]
+    assert db.historical_import_status()["active_batch"]["source_name"] == "valid.zip"
+
+
 def test_historical_import_replaces_active_batch_and_same_content_is_idempotent(tmp_path: Path) -> None:
     first_root = tmp_path / "first" / "SAMPLE_DATABASE"
     second_root = tmp_path / "second" / "SAMPLE_DATABASE"

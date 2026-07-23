@@ -13,6 +13,10 @@ SCORE_RE = re.compile(r"^(\d+)\s*[-:]\s*(\d+)\.?$")
 NEIGHBOR_TOLERANCE = 0.05
 
 
+def is_word_lock_file(path: str | Path) -> bool:
+    return Path(path).name.startswith("~$")
+
+
 def normalize_odds(value: float | str | None) -> float | None:
     if value is None:
         return None
@@ -95,6 +99,7 @@ class HistoricalDocxImporter:
             return {
                 "files_seen": 0,
                 "files_imported": 0,
+                "files_skipped": 0,
                 "records_imported": 0,
                 "warnings": 0,
                 "batch_id": active_batch["id"],
@@ -110,6 +115,7 @@ class HistoricalDocxImporter:
             return {
                 "files_seen": int(active_batch.get("files") or 0),
                 "files_imported": 0,
+                "files_skipped": 0,
                 "records_imported": 0,
                 "warnings": int(active_batch.get("warnings") or 0),
                 "batch_id": active_batch["id"],
@@ -118,6 +124,7 @@ class HistoricalDocxImporter:
             }
 
         files_seen = 0
+        skipped_files: list[dict[str, str]] = []
         discovered_files: list[dict[str, object]] = []
         seen_logical_files: set[str] = set()
         for root in roots:
@@ -125,6 +132,14 @@ class HistoricalDocxImporter:
                 continue
             for dataset_dir, dataset in _dataset_directories(root):
                 for path in sorted(dataset_dir.rglob("*.docx")):
+                    if is_word_lock_file(path):
+                        skipped_files.append(
+                            {
+                                "source_file": path.relative_to(dataset_dir).as_posix(),
+                                "reason": "Microsoft Word temporary lock file",
+                            }
+                        )
+                        continue
                     logical_source_file = f"{dataset}/{path.relative_to(dataset_dir).as_posix()}"
                     if logical_source_file in seen_logical_files:
                         continue
@@ -144,10 +159,12 @@ class HistoricalDocxImporter:
             return {
                 "files_seen": files_seen,
                 "files_imported": 0,
+                "files_skipped": len(skipped_files),
                 "records_imported": 0,
-                "warnings": 0,
+                "warnings": len(skipped_files),
                 "batch_id": active_batch["id"] if active_batch else None,
                 "activated": False,
+                "skipped_files": skipped_files,
             }
 
         normalized_hash = content_hash or _dataset_fingerprint(discovered_files)
@@ -155,20 +172,31 @@ class HistoricalDocxImporter:
             return {
                 "files_seen": files_seen,
                 "files_imported": 0,
+                "files_skipped": len(skipped_files),
                 "records_imported": 0,
-                "warnings": int(active_batch.get("warnings") or 0),
+                "warnings": int(active_batch.get("warnings") or 0) + len(skipped_files),
                 "batch_id": active_batch["id"],
                 "activated": False,
                 "content_hash": normalized_hash,
+                "skipped_files": skipped_files,
             }
 
         parsed_files: list[dict[str, object]] = []
         for file in discovered_files:
-            records, warnings = self._parse_file(
-                Path(file["path"]),
-                str(file["dataset"]),
-                str(file["source_file"]),
-            )
+            try:
+                records, warnings = self._parse_file(
+                    Path(file["path"]),
+                    str(file["dataset"]),
+                    str(file["source_file"]),
+                )
+            except Exception as exc:
+                skipped_files.append(
+                    {
+                        "source_file": str(file["source_file"]),
+                        "reason": f"Unreadable DOCX: {type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
             parsed_files.append(
                 {
                     "source_file": file["source_file"],
@@ -178,6 +206,18 @@ class HistoricalDocxImporter:
                     "warnings": warnings,
                 }
             )
+        if not parsed_files:
+            return {
+                "files_seen": files_seen,
+                "files_imported": 0,
+                "files_skipped": len(skipped_files),
+                "records_imported": 0,
+                "warnings": len(skipped_files),
+                "batch_id": active_batch["id"] if active_batch else None,
+                "activated": False,
+                "content_hash": normalized_hash,
+                "skipped_files": skipped_files,
+            }
         activation = self.database.replace_active_historical_dataset(
             source_name=source_name,
             source_kind=source_kind,
@@ -186,15 +226,17 @@ class HistoricalDocxImporter:
         )
         activated = bool(activation["activated"])
         records_imported = sum(len(file["records"]) for file in parsed_files) if activated else 0
-        warning_count = sum(len(file["warnings"]) for file in parsed_files)
+        warning_count = sum(len(file["warnings"]) for file in parsed_files) + len(skipped_files)
         return {
             "files_seen": files_seen,
             "files_imported": len(parsed_files) if activated else 0,
+            "files_skipped": len(skipped_files),
             "records_imported": records_imported,
             "warnings": warning_count,
             "batch_id": activation["batch_id"],
             "activated": activated,
             "content_hash": normalized_hash,
+            "skipped_files": skipped_files,
         }
 
     def _parse_file(
